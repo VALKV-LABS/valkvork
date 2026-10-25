@@ -1,0 +1,191 @@
+syntax = "proto3";
+package valkvork.v1;
+
+service AdminService {
+  rpc Apply(ApplyRequest) returns (ApplyResponse);
+  rpc Plan(ApplyRequest) returns (PlanResponse);
+  rpc DeleteService(DeleteServiceRequest) returns (DeleteServiceResponse);
+  rpc GetService(GetServiceRequest) returns (ServiceDetail);
+  rpc ListServices(ListServicesRequest) returns (ListServicesResponse);
+  rpc ListWorkloads(ListWorkloadsRequest) returns (ListWorkloadsResponse);
+  rpc ListNodes(ListNodesRequest) returns (ListNodesResponse);
+  rpc DrainNode(DrainNodeRequest) returns (DrainNodeResponse);
+  rpc UndrainNode(UndrainNodeRequest) returns (UndrainNodeResponse);
+  rpc ScaleService(ScaleServiceRequest) returns (ScaleServiceResponse);
+  rpc ListEvents(ListEventsRequest) returns (ListEventsResponse);
+}
+
+message ApplyRequest {
+  string manifest_toml = 1;
+}
+
+message ApplyResponse {
+  string service_id = 1;
+  uint64 version = 2;
+  string change = 3;  // created | unchanged | scale-only | policy-only | replacing
+  repeated string warnings = 4;
+}
+
+message PlanResponse {
+  string service_id = 1;
+  uint64 version = 2;
+  string change = 3;  // created | unchanged | scale-only | policy-only | replacing
+  bool feasible = 4;
+  string reason = 5;
+  repeated string warnings = 6;
+}
+
+message DeleteServiceRequest {
+  string service_id = 1;
+}
+
+message DeleteServiceResponse {
+  bool accepted = 1;
+  string error = 2;
+}
+
+message GetServiceRequest {
+  string service_id = 1;
+}
+
+message ServiceDetail {
+  string service_id = 1;
+  uint64 version = 2;
+  string spec_toml = 3;
+  string status = 4;  // ACTIVE | DEGRADED | DELETING
+  string rollout_status = 5;  // NONE | IN_PROGRESS | HALTED
+  uint32 target_replicas = 6;
+  uint32 running_replicas = 7;
+  uint32 pending_replicas = 8;
+  uint32 failed_replicas = 9;
+  repeated WorkloadSummary workloads = 10;
+  repeated ScalingEvent scaling_events = 11;
+  uint64 created_at = 12;
+  uint64 updated_at = 13;
+}
+
+message WorkloadSummary {
+  string workload_id = 1;
+  string node_id = 2;
+  string status = 3;
+  string status_reason = 4;
+  uint32 restart_count = 5;
+  uint64 created_at = 6;
+  uint64 started_at = 7;
+  uint64 updated_at = 8;
+}
+
+message ScalingEvent {
+  uint64 event_id = 1;
+  uint32 from_replicas = 2;
+  uint32 to_replicas = 3;
+  double metric_value = 4;
+  string reason = 5;
+  uint64 created_at = 6;
+}
+
+message ListServicesRequest {
+  string service_id = 1;  // optional filter
+}
+
+message ListServicesResponse {
+  repeated ServiceSummary services = 1;
+}
+
+message ServiceSummary {
+  string service_id = 1;
+  uint64 version = 2;
+  string image = 3;
+  string status = 4;
+  uint32 target_replicas = 5;
+  uint32 running_replicas = 6;
+  double cpu_utilization = 7;
+  uint64 created_at = 8;
+}
+
+message ListWorkloadsRequest {
+  string service_id = 1;  // optional filter
+  string node_id = 2;      // optional filter
+  string status = 3;      // optional filter
+}
+
+message ListWorkloadsResponse {
+  repeated WorkloadSummary workloads = 1;
+}
+
+message ListNodesRequest {
+  string node_id = 1;     // optional filter
+  string node_class = 2;  // optional filter
+}
+
+message ListNodesResponse {
+  repeated NodeSummary nodes = 1;
+}
+
+message NodeSummary {
+  string node_id = 1;
+  string hostname = 2;
+  string ip_address = 3;
+  string node_class = 4;
+  string status = 5;      // HEALTHY | UNHEALTHY
+  bool draining = 6;
+  uint32 allocatable_cpu_millicores = 7;
+  uint64 allocatable_memory_bytes = 8;
+  uint32 used_cpu_millicores = 9;
+  uint64 used_memory_bytes = 10;
+  uint32 workload_count = 11;
+  uint64 last_heartbeat_at = 12;
+  string agent_version = 13;
+  string runtime = 14;
+  repeated string host_volumes = 15;
+}
+
+message DrainNodeRequest {
+  string node_id = 1;
+}
+
+message DrainNodeResponse {
+  bool accepted = 1;
+  string error = 2;
+}
+
+message UndrainNodeRequest {
+  string node_id = 1;
+}
+
+message UndrainNodeResponse {
+  bool accepted = 1;
+  string error = 2;
+}
+
+message ScaleServiceRequest {
+  string service_id = 1;
+  uint32 replicas = 2;
+}
+
+message ScaleServiceResponse {
+  string service_id = 1;
+  uint32 old_replicas = 2;
+  uint32 new_replicas = 3;
+  string error = 4;
+}
+
+message ListEventsRequest {
+  string kind = 1;        // optional filter: NODE | WORKLOAD | DEPLOY | SCALE | AUDIT
+  uint64 since = 2;       // optional: timestamp filter
+  uint64 limit = 3;       // optional: max number of events
+}
+
+message ListEventsResponse {
+  repeated ClusterEvent events = 1;
+}
+
+message ClusterEvent {
+  uint64 event_id = 1;
+  string kind = 2;        // NODE | WORKLOAD | DEPLOY | SCALE | AUDIT
+  string subject_type = 3; // node | service | workload
+  string subject_id = 4;
+  string message = 5;
+  string actor = 6;       // controller | cli | ui:<session-id>
+  uint64 created_at = 7;
+}

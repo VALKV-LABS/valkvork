@@ -1,0 +1,122 @@
+syntax = "proto3";
+package valkvork.v1;
+
+// Agent-initiated, long-lived bidirectional stream.
+// First AgentMessage MUST be Register.
+service AgentService {
+  rpc Connect(stream AgentMessage) returns (stream ControllerMessage);
+}
+
+message AgentMessage {
+  oneof msg {
+    Register register = 1;
+    Heartbeat heartbeat = 2;
+    CommandResult command_result = 3;
+  }
+}
+
+message ControllerMessage {
+  oneof msg {
+    RegisterAck register_ack = 1;
+    StartWorkload start_workload = 2;
+    StopWorkload stop_workload = 3;
+  }
+}
+
+message Register {
+  string node_id = 1;                   // UUIDv5 of /etc/machine-id
+  string join_token = 2;
+  string hostname = 3;
+  string ip_address = 4;
+  string node_class = 5;
+  string agent_version = 6;             // semver
+  uint32 allocatable_cpu_millicores = 7; // capacity minus [reserved]
+  uint64 allocatable_memory_bytes = 8;
+  repeated string host_volumes = 9;
+  repeated WorkloadStatus inventory = 10; // every Valkvork container on the host
+  string runtime = 11;                  // driver/version, e.g. "docker/27.3.1"
+}
+
+message RegisterAck {
+  bool accepted = 1;
+  string reject_reason = 2;
+  uint32 heartbeat_interval_ms = 3;    // default 2000
+}
+
+message Heartbeat {
+  uint64 seq = 1;
+  double node_cpu_usage_percent = 2;
+  uint64 node_used_memory_bytes = 3;
+  repeated WorkloadStatus workloads = 4;
+}
+
+enum WorkloadState {
+  WORKLOAD_STATE_UNSPECIFIED = 0;
+  WORKLOAD_STATE_STARTING = 1;         // pulling / creating
+  WORKLOAD_STATE_RUNNING = 2;
+  WORKLOAD_STATE_RESTARTING = 3;       // local restart policy in progress
+  WORKLOAD_STATE_STOPPED = 4;          // stopped on request
+  WORKLOAD_STATE_FAILED = 5;           // see reason
+}
+
+message WorkloadStatus {
+  string workload_id = 1;
+  string service_id = 2;
+  uint64 service_version = 3;
+  string container_id = 4;
+  WorkloadState state = 5;
+  string reason = 6;                   // EXITED, OOM_KILLED, IMAGE_PULL_FAILED, EPHEMERAL_DISK_EXCEEDED, ...
+  int32 exit_code = 7;
+  uint32 restart_count = 8;
+  uint32 cpu_usage_millicores = 9;     // average since previous heartbeat
+  uint64 memory_used_bytes = 10;
+  uint64 disk_used_bytes = 11;
+}
+
+message StartWorkload {
+  string command_id = 1;
+  string workload_id = 2;
+  string service_id = 3;
+  uint64 service_version = 4;
+  string image = 5;
+  uint32 cpu_millicores = 6;
+  uint64 memory_bytes = 7;
+  uint64 disk_bytes = 8;
+  map<string, string> env = 9;
+  repeated PortMapping ports = 10;
+  repeated VolumeMount volumes = 11;
+  RestartPolicy restart = 12;
+  uint32 kill_timeout_seconds = 13;
+}
+
+message PortMapping {
+  string name = 1;
+  uint32 container_port = 2;
+  uint32 host_port = 3;
+}
+
+message VolumeMount {
+  string type = 1;
+  string source = 2;
+  string target = 3;
+  bool read_only = 4;
+}
+
+message RestartPolicy {
+  uint32 attempts = 1;
+  uint32 interval_seconds = 2;
+  uint32 delay_seconds = 3;
+}
+
+message StopWorkload {
+  string command_id = 1;
+  string workload_id = 2;
+  uint32 kill_timeout_seconds = 3;
+}
+
+message CommandResult {
+  string command_id = 1;
+  string workload_id = 2;
+  bool accepted = 3;
+  string error = 4;
+}
