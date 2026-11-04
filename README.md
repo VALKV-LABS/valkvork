@@ -12,8 +12,10 @@ Valkvork is a lightweight workload orchestrator and autoscaler written in Rust, 
 - Rolling updates on spec change
 - CPU-based horizontal autoscaling with cooldown
 - Basic storage: ephemeral disk limits and node-local host volumes
-- Built-in web UI
-- Production deployment on AWS (GCP equivalent)
+- Built-in web UI *(not implemented yet)*
+- Production deployment on AWS via the [goldenimage](https://github.com/VALKV-LABS/goldenimage) Packer image
+
+See [IMPLEMENTATION_STATUS.md](IMPLEMENTATION_STATUS.md) for what is built and what remains.
 
 ## Architecture
 
@@ -57,7 +59,7 @@ Valkvork is a lightweight workload orchestrator and autoscaler written in Rust, 
 
 | Component | Binary | Responsibilities |
 | :--- | :--- | :--- |
-| Controller | `valkvork-controller` | Admin API, Web UI, SQLite state, reconciler, scheduler, autoscaler |
+| Controller | `valkvork-controller` | Admin API, SQLite state, reconciler, scheduler, autoscaler |
 | Agent | `valkvork-agent` | Stream to controller, container lifecycle, telemetry |
 | CLI | `valkvork` | Operator tool: apply, plan, delete, scale, status, etc. |
 
@@ -65,99 +67,99 @@ Valkvork is a lightweight workload orchestrator and autoscaler written in Rust, 
 
 ### Prerequisites
 
-- Rust 1.70+ (for async traits and other features)
-- Docker Engine 27.0+
-- SQLite 3.39+
-- CMake 3.10+ (for building some dependencies)
-- OpenSSL development libraries (for some dependencies)
+- Rust (stable) and `protoc` (`brew install protobuf` / `apt install protobuf-compiler`)
+- Docker Engine on the worker (spec: 27.0+ with `live-restore`, cgroup v2)
+- On macOS, if linking fails with an SDK error:
+  `export SDKROOT=/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk`
 
 ### Building
 
 ```bash
-# Clone the repository
-git clone https://github.com/valkvlabs/valkvork
-cd valkvork
+cargo build --release          # native binaries in target/release/
+cargo test --workspace         # unit and behaviour tests
 
-# Build in release mode with musl target
-cargo build --release --target x86_64-unknown-linux-musl
+# Static musl binaries for Linux (NFR-03): writes dist/valkvork-controller,
+# dist/valkvork-agent and dist/valkvork
+docker buildx build --platform linux/amd64 --target export --output dist/ .
 ```
 
 ### Configuration
 
-#### Controller
+Every key has a default and unknown keys are rejected. Both binaries accept
+`--check-config` to validate a file (including token and TLS files) and exit.
 
-Create `/etc/valkvork/controller.toml`:
+#### Controller (`/etc/valkvork/controller.toml`)
 
 ```toml
-[agent]
-listen_addr = "0.0.0.0:50051"
+agent_listen_addr = "0.0.0.0:50051"   # agent streams
+admin_listen_addr = "0.0.0.0:50052"   # admin API (CLI)
+tls_cert_file     = "/etc/valkvork/controller.pem"
+tls_key_file      = "/etc/valkvork/controller.key"   # PKCS#8 PEM
+database_path     = "/var/lib/valkvork/db/valkvork.db"
+join_token_file   = "/etc/valkvork/join-token"       # or join_token = "..."
+admin_token_file  = "/etc/valkvork/admin-token"      # or admin_token = "...", >= 32 random bytes
 
-[admin]
-listen_addr = "0.0.0.0:50052"
-
-[database]
-path = "/var/lib/valkvork/db/valkvork.db"
-
-[security]
-join_token = "your-secret-join-token"
-admin_token = "your-secret-admin-token"
-ca_file = "/etc/valkvork/ca.pem"
-cert_file = "/etc/valkvork/cert.pem"
-key_file = "/etc/valkvork/key.pem"
-
-[cluster]
+# Optional tuning (spec defaults shown)
 node_unhealthy_timeout_seconds = 10
-recovery_grace_period_seconds = 30
-heartbeat_interval_ms = 2000
+recovery_grace_period_seconds  = 30
+command_timeout_seconds        = 30
+start_timeout_seconds          = 300
 
 [autoscaler]
-evaluation_interval_seconds = 10
+enabled          = true
 cooldown_seconds = 180
-scale_up_threshold = 1.1
-scale_down_threshold = 0.9
 ```
 
-#### Agent
+Without `tls_cert_file`/`tls_key_file` the controller serves plaintext and
+logs a warning (development only).
 
-Create `/etc/valkvork/agent.toml`:
+#### Agent (`/etc/valkvork/agent.toml`)
 
 ```toml
 controller_endpoint = "https://controlplane.valkvork.internal:50051"
-ca_file = "/etc/valkvork/ca.pem"
-join_token_file = "/etc/valkvork/join-token"
-node_class = "general"
-data_dir = "/var/lib/valkvork"
-runtime = "docker"
-docker_socket = "/var/run/docker.sock"
+ca_file             = "/etc/valkvork/ca.pem"
+join_token_file     = "/etc/valkvork/join-token"
+node_class          = "general"
+data_dir            = "/var/lib/valkvork"
+runtime             = "docker"
+docker_socket       = "/var/run/docker.sock"
+registry_auth_file  = "/etc/valkvork/registry-auth.json"   # optional, Docker config.json format
+# advertise_ip      = "10.0.1.23"                          # default: route towards the controller
 
 [reserved]
-cpu = 0.25
+cpu    = 0.25
 memory = "384MiB"
 
-[[host_volumes]]
-name = "pgdata"
-path = "/data/pgdata"
+[host_volumes.pgdata]
+path      = "/data/pgdata"
 read_only = false
 ```
+
+The agent runs as root: it drives the Docker socket and bind-mounts host
+volumes and the per-workload `/alloc` directory.
 
 ### Running
 
 ```bash
-# Start controller
-valkvork-controller
+valkvork-controller --config /etc/valkvork/controller.toml
+valkvork-agent      --config /etc/valkvork/agent.toml
 
-# Start agent
-valkvork-agent
+export VALKVORK_ADDR=https://controlplane.valkvork.internal:50052
+export VALKVORK_CA_FILE=/etc/valkvork/ca.pem
+export VALKVORK_ADMIN_TOKEN=...
 
-# Apply a manifest
+valkvork plan -f service.toml            # diff + placement check, writes nothing
 valkvork apply -f service.toml
-
-# Check status
-valkvork status
-
-# List nodes
-valkvork node list
+valkvork status [service]
+valkvork workloads [--service S] [--node N] [--status RUNNING]
+valkvork scale service <id> <n>
+valkvork delete service <id>
+valkvork events [--kind NODE|WORKLOAD|DEPLOY|SCALE|AUDIT]
+valkvork node list | drain <id> | undrain <id>
 ```
+
+Add `-o json` for machine-readable output. Exit codes: `0` success, `1`
+server or transport error, `2` validation error.
 
 ## Manifest Examples
 
@@ -209,97 +211,49 @@ target = "/var/lib/postgresql/data"
 ## Project Structure
 
 ```
-valkvork/
-├── Cargo.toml                 # Workspace root
-├── spec.md                    # Full specification
-├── crates/
-│   ├── valkvork-proto/        # gRPC protocol definitions
-│   │   ├── Cargo.toml
-│   │   └── src/
-│   │       ├── lib.rs
-│   │       ├── agent.v1.proto
-│   │       └── admin.v1.proto
-│   │
-│   ├── valkvork-common/       # Shared types and utilities
-│   │   ├── Cargo.toml
-│   │   └── src/
-│   │       ├── lib.rs
-│   │       ├── config.rs
-│   │       ├── errors.rs
-│   │       ├── models.rs
-│   │       ├── tls.rs
-│   │       ├── units.rs
-│   │       └── validation.rs
-│   │
-│   ├── valkvork-controller/   # Controller service
-│   │   ├── Cargo.toml
-│   │   └── src/
-│   │       ├── lib.rs
-│   │       ├── main.rs
-│   │       ├── database.rs
-│   │       ├── server.rs
-│   │       ├── state.rs
-│   │       └── ...
-│   │
-│   ├── valkvork-agent/        # Worker agent
-│   │   ├── Cargo.toml
-│   │   └── src/
-│   │       ├── lib.rs
-│   │       ├── main.rs
-│   │       ├── agent.rs
-│   │       ├── container_runtime.rs
-│   │       ├── heartbeat.rs
-│   │       ├── node.rs
-│   │       └── stream.rs
-│   │
-│   └── valkvork-cli/          # CLI tool
-│       ├── Cargo.toml
-│       └── src/
-│           ├── main.rs
-│           ├── client.rs
-│           └── commands.rs
-│
-└── examples/                 # Example manifests
-    ├── frontend.toml
-    ├── ml-processor.toml
-    └── postgres.toml
+crates/
+├── valkvork-proto/        valkvork.v1 protos (agent stream + AdminService)
+├── valkvork-common/       manifest parsing/validation, config, models, units, TLS helpers
+├── valkvork-controller/
+│   └── src/
+│       ├── core/          the single actor that owns state and the SQLite writer:
+│       │   ├── mod.rs        commit-then-send, dispatcher (command retries)
+│       │   ├── agents.rs     Register/FR-CON-03, heartbeats, node health
+│       │   ├── reconcile.rs  scaling, rollouts, drains, deletes, backoff
+│       │   ├── autoscale.rs  FR-AUT
+│       │   ├── admin.rs      apply/plan/scale/drain + read views
+│       │   └── tests.rs      behaviour tests (no network)
+│       ├── scheduler.rs   spread placement (pure)
+│       ├── db.rs          schema migrations, load, batched commits, read-only history
+│       ├── grpc.rs        AgentService / AdminService adapters, admin auth
+│       └── server.rs      listeners and TLS
+├── valkvork-agent/
+│   └── src/
+│       ├── runtime.rs     ContainerRuntime trait + DockerRuntime (bollard)
+│       ├── supervisor.rs  start/stop, restart policy, adoption, disk limits, telemetry
+│       ├── connection.rs  outbound stream, Register/heartbeat, backoff
+│       ├── identity.rs    node id, hostname, address
+│       └── telemetry.rs   cgroup v2 and /proc readers
+└── valkvork-cli/          `valkvork` binary
 ```
 
 ## Development
 
-### Running Tests
-
 ```bash
-# Unit tests
-cargo test
-
-# Integration tests
-cargo test -- --test-threads=1
-```
-
-### Code Style
-
-```bash
-# Format code
+cargo test --workspace
+cargo clippy --workspace --all-targets
 cargo fmt
-
-# Check linting
-cargo clippy
 ```
 
 ## License
 
 Apache 2.0
 
-## Contributing
-
-See CONTRIBUTING.md
-
 ## Roadmap
 
 - [x] M0: Foundations (proto, TLS, register, heartbeat)
-- [ ] M1: Run workloads (manifests, SQLite, apply/plan/delete, scheduler)
-- [ ] M2: Resilience (health, LOST/replacement, reconnect, recovery)
-- [ ] M3: Change management + UI (updates, drain, autoscaler, events, UI)
-- [ ] M4: Production (Packer, Terraform, runbooks)
+- [x] M1: Run workloads (manifests, SQLite, apply/plan/delete, scheduler, Docker runtime)
+- [x] M2: Resilience (health, LOST/replacement, reconnect rules, recovery grace, adoption, local restarts)
+- [ ] M3: Change management + UI: rolling updates, drain, autoscaler, events, disk limits and host volumes are done; web UI and metrics remain
+- [ ] M4: Production: Packer image in [goldenimage#7](https://github.com/VALKV-LABS/goldenimage/pull/7); Terraform, Litestream and runbooks remain
 - [ ] P2: Native containerd driver, block volumes, mTLS, secrets, etc.

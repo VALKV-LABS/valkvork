@@ -1,574 +1,715 @@
-//! Manifest validation for Valkvork.
+//! Manifest parsing and validation (spec §6.1, §6.2).
 //!
-//! This module implements the validation rules from spec §6.2 for TOML manifests.
+//! Parsing goes through serde structs with `deny_unknown_fields`, so typos are
+//! rejected as `UNKNOWN_FIELD` (VE-06). The result is canonicalised into a
+//! [`ServiceSpec`] and checked against VE-01 … VE-07.
 
-use std::collections::HashSet;
+use crate::errors::{ValidationError, ValidationErrorCode as Code};
+use crate::models::{
+    AutoscaleSpec, PortSpec, RestartPolicy, ServiceSpec, UpdatePolicy, VolumeSpec,
+};
+use crate::units::{parse_duration, parse_size};
 use regex::Regex;
-use crate::models::{ServiceSpec, AutoscaleConfig, PortMapping, VolumeMount};
-use crate::errors::{ValidationError, ValidationErrorCode};
+use serde::Deserialize;
+use std::collections::{BTreeMap, HashSet};
+use std::sync::OnceLock;
 
 // ============================================================================
-// Validation Functions
+// Raw manifest (what the TOML file looks like)
 // ============================================================================
 
-/// Validate a service specification
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawManifest {
+    service: RawService,
+    resources: RawResources,
+    #[serde(default)]
+    constraints: Option<RawConstraints>,
+    #[serde(default)]
+    env: BTreeMap<String, String>,
+    #[serde(default)]
+    ports: Vec<RawPort>,
+    #[serde(default)]
+    volumes: Vec<RawVolume>,
+    #[serde(default)]
+    autoscale: Option<RawAutoscale>,
+    #[serde(default)]
+    update: Option<RawUpdate>,
+    #[serde(default)]
+    restart: Option<RawRestart>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawService {
+    id: String,
+    image: String,
+    replicas: i64,
+    #[serde(default)]
+    kill_timeout: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawResources {
+    cpu: f64,
+    memory: String,
+    #[serde(default)]
+    disk: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawConstraints {
+    #[serde(default)]
+    required_class: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawPort {
+    name: String,
+    container_port: i64,
+    host_port: i64,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawVolume {
+    #[serde(rename = "type")]
+    kind: String,
+    source: String,
+    target: String,
+    #[serde(default)]
+    read_only: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawAutoscale {
+    min_replicas: i64,
+    max_replicas: i64,
+    target_cpu_percent: f64,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawUpdate {
+    #[serde(default)]
+    max_parallel: Option<i64>,
+    #[serde(default)]
+    min_healthy_time: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawRestart {
+    #[serde(default)]
+    attempts: Option<i64>,
+    #[serde(default)]
+    interval: Option<String>,
+    #[serde(default)]
+    delay: Option<String>,
+}
+
+// ============================================================================
+// Public API
+// ============================================================================
+
+/// Result of a successful parse: the canonical spec plus any warnings.
+#[derive(Debug, Clone)]
+pub struct ParsedManifest {
+    pub spec: ServiceSpec,
+    pub warnings: Vec<ValidationError>,
+}
+
+/// Parse and validate a manifest. On failure every error (not warnings) is
+/// returned; nothing is partially accepted.
+pub fn parse_manifest_str(content: &str) -> Result<ParsedManifest, Vec<ValidationError>> {
+    let raw: RawManifest = toml::from_str(content).map_err(|e| vec![toml_error(content, &e)])?;
+
+    let mut issues = Vec::new();
+    let spec = canonicalise(raw, &mut issues);
+    if let Some(spec) = &spec {
+        validate_service_spec_into(spec, &mut issues);
+    }
+
+    let (errors, warnings): (Vec<_>, Vec<_>) = issues.into_iter().partition(|e| !e.is_warning);
+    match spec {
+        Some(spec) if errors.is_empty() => Ok(ParsedManifest { spec, warnings }),
+        _ => Err(errors),
+    }
+}
+
+/// Validate an already-canonical spec (VE-01 … VE-07). Returns errors and
+/// warnings together; check `is_warning`.
 pub fn validate_service_spec(spec: &ServiceSpec) -> Vec<ValidationError> {
-    let mut errors = Vec::new();
-    
-    // VE-01: Resource validation
-    validate_resources(&mut errors, spec);
-    
-    // VE-02: Image reference validation
-    validate_image(&mut errors, &spec.image);
-    
-    // VE-03: Service ID validation
-    validate_service_id(&mut errors, &spec.id);
-    
-    // VE-04: Autoscale validation
-    if let Some(autoscale) = &spec.autoscale {
-        validate_autoscale(&mut errors, autoscale);
-    }
-    
-    // VE-05: Port validation
-    validate_ports(&mut errors, &spec.ports);
-    
-    // VE-06: Unknown fields - this is handled by TOML parser with deny_unknown_fields
-    
-    // VE-07: Volume validation
-    validate_volumes(&mut errors, &spec.volumes);
-    
-    errors
+    let mut out = Vec::new();
+    validate_service_spec_into(spec, &mut out);
+    out
 }
 
-/// Validate resource specifications (VE-01)
-fn validate_resources(errors: &mut Vec<ValidationError>, spec: &ServiceSpec) {
-    // CPU must be > 0
-    if spec.cpu_millicores == 0 {
-        errors.push(ValidationError::new(
-            ValidationErrorCode::InvalidResourceSpec,
-            "resources.cpu",
-            "CPU must be greater than 0"
-        ));
+// ============================================================================
+// Canonicalisation
+// ============================================================================
+
+fn duration_field(
+    path: &str,
+    v: Option<&str>,
+    default: u32,
+    out: &mut Vec<ValidationError>,
+) -> u32 {
+    match v {
+        None => default,
+        Some(s) => match parse_duration(s) {
+            Ok(secs) if secs <= u32::MAX as u64 => secs as u32,
+            _ => {
+                out.push(ValidationError::new(
+                    Code::InvalidResourceSpec,
+                    path,
+                    &format!("invalid duration {s:?} (use e.g. \"10s\", \"5m\")"),
+                ));
+                default
+            }
+        },
     }
-    
-    // Memory must be >= 4 MiB (4 * 1024 * 1024 bytes)
-    if spec.memory_bytes < 4 * 1024 * 1024 {
-        errors.push(ValidationError::new(
-            ValidationErrorCode::InvalidResourceSpec,
-            "resources.memory",
-            "Memory must be at least 4 MiB"
-        ));
+}
+
+fn size_field(path: &str, s: &str, out: &mut Vec<ValidationError>) -> u64 {
+    match parse_size(s) {
+        Ok(b) => b.as_u64(),
+        Err(_) => {
+            out.push(ValidationError::new(
+                Code::InvalidResourceSpec,
+                path,
+                &format!("invalid size {s:?} (use IEC units, e.g. \"512MiB\")"),
+            ));
+            0
+        }
     }
-    
-    // Disk must be > 0
-    if spec.disk_bytes == 0 {
-        errors.push(ValidationError::new(
-            ValidationErrorCode::InvalidResourceSpec,
-            "resources.disk",
-            "Disk must be greater than 0"
-        ));
-    }
-    
-    // Replicas must be >= 0
-    if spec.replicas < 0 {
-        // Note: replicas is u32, so this can't happen, but for completeness
-        errors.push(ValidationError::new(
-            ValidationErrorCode::InvalidResourceSpec,
+}
+
+fn canonicalise(raw: RawManifest, out: &mut Vec<ValidationError>) -> Option<ServiceSpec> {
+    let mut ok = true;
+
+    if raw.service.replicas < 0 || raw.service.replicas > u32::MAX as i64 {
+        out.push(ValidationError::new(
+            Code::InvalidResourceSpec,
             "service.replicas",
-            "Replicas must be >= 0"
+            "replicas must be >= 0",
         ));
+        ok = false;
     }
-}
-
-/// Validate image reference (VE-02)
-fn validate_image(errors: &mut Vec<ValidationError>, image: &str) {
-    // Valid OCI reference: [domain/]repo[:tag|@digest]
-    // This is a simplified validation
-    
-    let valid_pattern = Regex::new(r"^[a-z0-9\-\.]+(/[a-z0-9\-\._]+)*(:[a-zA-Z0-9\-\._]+|@sha256:[a-f0-9]{64})?$").unwrap();
-    
-    if !valid_pattern.is_match(image) {
-        errors.push(ValidationError::new(
-            ValidationErrorCode::InvalidImageRef,
-            "service.image",
-            &format!("Invalid OCI reference: {}", image)
+    if raw.resources.cpu <= 0.0 || !raw.resources.cpu.is_finite() {
+        out.push(ValidationError::new(
+            Code::InvalidResourceSpec,
+            "resources.cpu",
+            "cpu must be > 0",
         ));
+        ok = false;
     }
-    
-    // Check if tag is missing (implies :latest)
-    if !image.contains(':') && !image.contains('@') {
-        errors.push(ValidationError::warning(
-            ValidationErrorCode::InvalidImageRef,
-            "service.image",
-            "No tag specified, defaults to :latest. Consider pinning to a specific tag or digest."
-        ));
-    }
-}
 
-/// Validate service ID (VE-03)
-/// Must match: ^[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?$
-fn validate_service_id(errors: &mut Vec<ValidationError>, id: &str) {
-    let valid_pattern = Regex::new(r"^[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?$").unwrap();
-    
-    if !valid_pattern.is_match(id) {
-        errors.push(ValidationError::new(
-            ValidationErrorCode::InvalidServiceId,
-            "service.id",
-            &format!(
-                "Invalid service ID: {}. Must match: ^[a-z0-9]([-a-z0-9]{{0,61}}[a-z0-9])?$",
-                id
-            )
-        ));
-    }
-}
-
-/// Validate autoscale configuration (VE-04)
-fn validate_autoscale(errors: &mut Vec<ValidationError>, autoscale: &AutoscaleConfig) {
-    // 1 <= min_replicas <= max_replicas
-    if autoscale.min_replicas < 1 {
-        errors.push(ValidationError::new(
-            ValidationErrorCode::InvalidAutoscaleSpec,
-            "autoscale.min_replicas",
-            "min_replicas must be >= 1"
-        ));
-    }
-    
-    if autoscale.max_replicas < autoscale.min_replicas {
-        errors.push(ValidationError::new(
-            ValidationErrorCode::InvalidAutoscaleSpec,
-            "autoscale.max_replicas",
-            "max_replicas must be >= min_replicas"
-        ));
-    }
-    
-    // 0 < target_cpu_percent < 100
-    if autoscale.target_cpu_percent <= 0.0 || autoscale.target_cpu_percent >= 100.0 {
-        errors.push(ValidationError::new(
-            ValidationErrorCode::InvalidAutoscaleSpec,
-            "autoscale.target_cpu_percent",
-            "target_cpu_percent must be > 0 and < 100"
-        ));
-    }
-}
-
-/// Validate port mappings (VE-05)
-fn validate_ports(errors: &mut Vec<ValidationError>, ports: &[PortMapping]) {
-    let mut seen_ports = HashSet::new();
-    
-    for port in ports {
-        // Port numbers must be in 1-65535
-        if port.container_port == 0 || port.container_port > 65535 {
-            errors.push(ValidationError::new(
-                ValidationErrorCode::InvalidPortSpec,
-                "ports.container_port",
-                &format!(
-                    "Container port {} must be between 1 and 65535",
-                    port.container_port
-                )
+    let mut ports = Vec::new();
+    for (i, p) in raw.ports.iter().enumerate() {
+        let in_range = |v: i64| (1..=65535).contains(&v);
+        if !in_range(p.container_port) {
+            out.push(ValidationError::new(
+                Code::InvalidPortSpec,
+                &format!("ports[{i}].container_port"),
+                "port must be in 1-65535",
             ));
+            ok = false;
         }
-        
-        if port.host_port == 0 || port.host_port > 65535 {
-            errors.push(ValidationError::new(
-                ValidationErrorCode::InvalidPortSpec,
-                "ports.host_port",
-                &format!(
-                    "Host port {} must be between 1 and 65535",
-                    port.host_port
-                )
+        if !in_range(p.host_port) {
+            out.push(ValidationError::new(
+                Code::InvalidPortSpec,
+                &format!("ports[{i}].host_port"),
+                "port must be in 1-65535",
             ));
+            ok = false;
         }
-        
-        // Host ports must be unique within the manifest
-        if !seen_ports.insert(port.host_port) {
-            errors.push(ValidationError::new(
-                ValidationErrorCode::InvalidPortSpec,
-                "ports.host_port",
-                &format!("Duplicate host port: {}", port.host_port)
-            ));
-        }
-        
-        // Warn if host_port < 1024
-        if port.host_port < 1024 {
-            errors.push(ValidationError::warning(
-                ValidationErrorCode::InvalidPortSpec,
-                "ports.host_port",
-                &format!("Host port {} is < 1024. Consider using a higher port.", port.host_port)
-            ));
-        }
-    }
-}
-
-/// Validate volume mounts (VE-07)
-fn validate_volumes(errors: &mut Vec<ValidationError>, volumes: &[VolumeMount]) {
-    let mut seen_targets = HashSet::new();
-    
-    for volume in volumes {
-        // Type must be known (MVP: only "host" is valid)
-        if volume.r#type != "host" {
-            errors.push(ValidationError::new(
-                ValidationErrorCode::InvalidVolumeSpec,
-                "volumes.type",
-                &format!("Unknown volume type: {}. MVP only supports 'host'.", volume.r#type)
-            ));
-        }
-        
-        // Target must be absolute path
-        if !volume.target.starts_with('/') {
-            errors.push(ValidationError::new(
-                ValidationErrorCode::InvalidVolumeSpec,
-                "volumes.target",
-                &format!("Volume target '{}' must be an absolute path", volume.target)
-            ));
-        }
-        
-        // Source must be non-empty
-        if volume.source.is_empty() {
-            errors.push(ValidationError::new(
-                ValidationErrorCode::InvalidVolumeSpec,
-                "volumes.source",
-                "Volume source must be specified"
-            ));
-        }
-        
-        // Targets must be unique
-        if !seen_targets.insert(&volume.target) {
-            errors.push(ValidationError::new(
-                ValidationErrorCode::InvalidVolumeSpec,
-                "volumes.target",
-                &format!("Duplicate volume target: {}", volume.target)
-            ));
-        }
-    }
-}
-
-// ============================================================================
-// Manifest Parsing
-// ============================================================================
-
-use toml;
-use std::path::Path;
-use std::fs;
-
-/// Parse a TOML manifest file into a ServiceSpec
-pub fn parse_manifest(path: &Path) -> Result<ServiceSpec, Vec<ValidationError>> {
-    let content = fs::read_to_string(path).map_err(|e| {
-        vec![ValidationError::new(
-            ValidationErrorCode::UnknownField,
-            "",
-            &format!("Failed to read manifest: {}", e)
-        )]
-    })?;
-    
-    parse_manifest_str(&content)
-}
-
-/// Parse a TOML manifest string into a ServiceSpec
-pub fn parse_manifest_str(content: &str) -> Result<ServiceSpec, Vec<ValidationError>> {
-    let value: toml::Value = toml::from_str(content).map_err(|e| {
-        vec![ValidationError::new(
-            ValidationErrorCode::UnknownField,
-            "",
-            &format!("TOML parse error: {}", e)
-        )]
-    })?;
-    
-    // Convert TOML value to ServiceSpec
-    let spec = from_toml_value(&value).map_err(|e| {
-        vec![ValidationError::new(
-            ValidationErrorCode::UnknownField,
-            "",
-            &format!("Manifest conversion error: {}", e)
-        )]
-    })?;
-    
-    // Validate the spec
-    let errors = validate_service_spec(&spec);
-    
-    if errors.iter().any(|e| !e.is_warning) {
-        Err(errors)
-    } else {
-        Ok(spec)
-    }
-}
-
-/// Convert TOML value to ServiceSpec
-fn from_toml_value(value: &toml::Value) -> Result<ServiceSpec, String> {
-    let mut spec = ServiceSpec::default();
-    
-    // Extract service table
-    let service_table = value.get("service")
-        .ok_or("Missing [service] table")?
-        .as_table()
-        .ok_or("service must be a table")?;
-    
-    spec.id = service_table.get("id")
-        .ok_or("Missing service.id")?
-        .as_str()
-        .ok_or("service.id must be a string")?
-        .to_string();
-    
-    spec.image = service_table.get("image")
-        .ok_or("Missing service.image")?
-        .as_str()
-        .ok_or("service.image must be a string")?
-        .to_string();
-    
-    spec.replicas = service_table.get("replicas")
-        .map(|v| v.as_integer().unwrap_or(1) as u32)
-        .unwrap_or(1);
-    
-    spec.kill_timeout_seconds = service_table.get("kill_timeout")
-        .map(|v| parse_duration_from_toml(v))
-        .unwrap_or(10);
-    
-    // Extract resources table
-    if let Some(resources_table) = value.get("resources").and_then(|v| v.as_table()) {
-        spec.cpu_millicores = resources_table.get("cpu")
-            .map(|v| (v.as_float().unwrap_or(0.0) * 1000.0).ceil() as u32)
-            .unwrap_or(100);
-        
-        spec.memory_bytes = resources_table.get("memory")
-            .map(|v| parse_size_from_toml(v))
-            .unwrap_or(128 * 1024 * 1024);
-        
-        spec.disk_bytes = resources_table.get("disk")
-            .map(|v| parse_size_from_toml(v))
-            .unwrap_or(1 * 1024 * 1024 * 1024);
-    }
-    
-    // Extract constraints table
-    if let Some(constraints_table) = value.get("constraints").and_then(|v| v.as_table()) {
-        spec.required_class = constraints_table.get("required_class")
-            .map(|v| v.as_str().unwrap_or("").to_string());
-    }
-    
-    // Extract env table
-    if let Some(env_table) = value.get("env").and_then(|v| v.as_table()) {
-        for (key, value) in env_table {
-            spec.env.insert(key.to_string(), value.as_str().unwrap_or("").to_string());
-        }
-    }
-    
-    // Extract ports array
-    if let Some(ports_array) = value.get("ports").and_then(|v| v.as_array()) {
-        for port_value in ports_array {
-            if let Some(port_table) = port_value.as_table() {
-                let port = PortMapping {
-                    name: port_table.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string(),
-                    container_port: port_table.get("container_port").and_then(|v| v.as_integer()).unwrap_or(0) as u16,
-                    host_port: port_table.get("host_port").and_then(|v| v.as_integer()).unwrap_or(0) as u16,
-                };
-                spec.ports.push(port);
-            }
-        }
-    }
-    
-    // Extract volumes array
-    if let Some(volumes_array) = value.get("volumes").and_then(|v| v.as_array()) {
-        for volume_value in volumes_array {
-            if let Some(volume_table) = volume_value.as_table() {
-                let volume = VolumeMount {
-                    r#type: volume_table.get("type").and_then(|v| v.as_str()).unwrap_or("host").to_string(),
-                    source: volume_table.get("source").and_then(|v| v.as_str()).unwrap_or("").to_string(),
-                    target: volume_table.get("target").and_then(|v| v.as_str()).unwrap_or("").to_string(),
-                    read_only: volume_table.get("read_only").and_then(|v| v.as_bool()).unwrap_or(false),
-                };
-                spec.volumes.push(volume);
-            }
-        }
-    }
-    
-    // Extract autoscale table
-    if let Some(autoscale_table) = value.get("autoscale").and_then(|v| v.as_table()) {
-        spec.autoscale = Some(AutoscaleConfig {
-            min_replicas: autoscale_table.get("min_replicas").and_then(|v| v.as_integer()).unwrap_or(1) as u32,
-            max_replicas: autoscale_table.get("max_replicas").and_then(|v| v.as_integer()).unwrap_or(10) as u32,
-            target_cpu_percent: autoscale_table.get("target_cpu_percent").and_then(|v| v.as_float()).unwrap_or(75.0),
+        ports.push(PortSpec {
+            name: p.name.clone(),
+            container_port: p.container_port.clamp(0, 65535) as u16,
+            host_port: p.host_port.clamp(0, 65535) as u16,
         });
     }
-    
-    // Extract update table
-    if let Some(update_table) = value.get("update").and_then(|v| v.as_table()) {
-        spec.update.max_parallel = update_table.get("max_parallel").and_then(|v| v.as_integer()).unwrap_or(1) as u32;
-        spec.update.min_healthy_time_seconds = update_table.get("min_healthy_time")
-            .map(|v| parse_duration_from_toml(v))
-            .unwrap_or(10);
-    }
-    
-    // Extract restart table
-    if let Some(restart_table) = value.get("restart").and_then(|v| v.as_table()) {
-        spec.restart.attempts = restart_table.get("attempts").and_then(|v| v.as_integer()).unwrap_or(3) as u32;
-        spec.restart.interval_seconds = restart_table.get("interval")
-            .map(|v| parse_duration_from_toml(v))
-            .unwrap_or(300);
-        spec.restart.delay_seconds = restart_table.get("delay")
-            .map(|v| parse_duration_from_toml(v))
-            .unwrap_or(5);
-    }
-    
-    Ok(spec)
-}
 
-/// Parse duration from TOML value
-fn parse_duration_from_toml(value: &toml::Value) -> u64 {
-    if let Some(s) = value.as_str() {
-        crate::units::parse_duration(s).unwrap_or(0)
-    } else if let Some(i) = value.as_integer() {
-        i as u64
-    } else {
-        0
-    }
-}
-
-/// Parse size from TOML value
-fn parse_size_from_toml(value: &toml::Value) -> u64 {
-    if let Some(s) = value.as_str() {
-        crate::units::parse_size(s).unwrap_or(0).as_u64()
-    } else if let Some(i) = value.as_integer() {
-        i as u64
-    } else {
-        0
-    }
-}
-
-/// Serialize ServiceSpec to TOML string
-pub fn spec_to_toml(spec: &ServiceSpec) -> String {
-    let mut table = toml::value::Table::new();
-    
-    // Service table
-    let mut service_table = toml::value::Table::new();
-    service_table.insert("id".to_string(), toml::Value::String(spec.id.clone()));
-    service_table.insert("image".to_string(), toml::Value::String(spec.image.clone()));
-    service_table.insert("replicas".to_string(), toml::Value::Integer(spec.replicas as i64));
-    service_table.insert("kill_timeout".to_string(), toml::Value::String(format!("{}s", spec.kill_timeout_seconds)));
-    table.insert("service".to_string(), toml::Value::Table(service_table));
-    
-    // Resources table
-    let mut resources_table = toml::value::Table::new();
-    resources_table.insert("cpu".to_string(), toml::Value::Float(spec.cpu_millicores as f64 / 1000.0));
-    resources_table.insert("memory".to_string(), toml::Value::String(format!("{}MiB", spec.memory_bytes / (1024 * 1024))));
-    resources_table.insert("disk".to_string(), toml::Value::String(format!("{}GiB", spec.disk_bytes / (1024 * 1024 * 1024))));
-    table.insert("resources".to_string(), toml::Value::Table(resources_table));
-    
-    // Constraints table
-    if let Some(class) = &spec.required_class {
-        let mut constraints_table = toml::value::Table::new();
-        constraints_table.insert("required_class".to_string(), toml::Value::String(class.clone()));
-        table.insert("constraints".to_string(), toml::Value::Table(constraints_table));
-    }
-    
-    // Env table
-    if !spec.env.is_empty() {
-        let mut env_table = toml::value::Table::new();
-        for (key, value) in &spec.env {
-            env_table.insert(key.clone(), toml::Value::String(value.clone()));
+    let autoscale = raw.autoscale.map(|a| {
+        if a.min_replicas < 1 || a.max_replicas < a.min_replicas || a.max_replicas > u32::MAX as i64
+        {
+            out.push(ValidationError::new(
+                Code::InvalidAutoscaleSpec,
+                "autoscale.min_replicas",
+                "require 1 <= min_replicas <= max_replicas",
+            ));
+            ok = false;
         }
-        table.insert("env".to_string(), toml::Value::Table(env_table));
+        AutoscaleSpec {
+            min_replicas: a.min_replicas.max(0) as u32,
+            max_replicas: a.max_replicas.max(0) as u32,
+            target_cpu_percent: a.target_cpu_percent,
+        }
+    });
+
+    let update = match raw.update {
+        None => UpdatePolicy::default(),
+        Some(u) => {
+            let max_parallel = u.max_parallel.unwrap_or(1);
+            if max_parallel < 1 || max_parallel > u32::MAX as i64 {
+                out.push(ValidationError::new(
+                    Code::InvalidResourceSpec,
+                    "update.max_parallel",
+                    "max_parallel must be >= 1",
+                ));
+                ok = false;
+            }
+            UpdatePolicy {
+                max_parallel: max_parallel.max(1) as u32,
+                min_healthy_time_seconds: duration_field(
+                    "update.min_healthy_time",
+                    u.min_healthy_time.as_deref(),
+                    10,
+                    out,
+                ),
+            }
+        }
+    };
+
+    let restart = match raw.restart {
+        None => RestartPolicy::default(),
+        Some(r) => {
+            let attempts = r.attempts.unwrap_or(3);
+            if attempts < 0 || attempts > u32::MAX as i64 {
+                out.push(ValidationError::new(
+                    Code::InvalidResourceSpec,
+                    "restart.attempts",
+                    "attempts must be >= 0",
+                ));
+                ok = false;
+            }
+            RestartPolicy {
+                attempts: attempts.max(0) as u32,
+                interval_seconds: duration_field(
+                    "restart.interval",
+                    r.interval.as_deref(),
+                    300,
+                    out,
+                ),
+                delay_seconds: duration_field("restart.delay", r.delay.as_deref(), 5, out),
+            }
+        }
+    };
+
+    let spec = ServiceSpec {
+        id: raw.service.id,
+        image: normalise_image(&raw.service.image),
+        replicas: raw.service.replicas.max(0) as u32,
+        kill_timeout_seconds: duration_field(
+            "service.kill_timeout",
+            raw.service.kill_timeout.as_deref(),
+            10,
+            out,
+        ),
+        cpu_millicores: (raw.resources.cpu.max(0.0) * 1000.0).ceil() as u32,
+        memory_bytes: size_field("resources.memory", &raw.resources.memory, out),
+        disk_bytes: match raw.resources.disk.as_deref() {
+            Some(d) => size_field("resources.disk", d, out),
+            None => 1 << 30,
+        },
+        required_class: raw
+            .constraints
+            .and_then(|c| c.required_class)
+            .filter(|c| !c.is_empty()),
+        env: raw.env,
+        ports,
+        volumes: raw
+            .volumes
+            .into_iter()
+            .map(|v| VolumeSpec {
+                kind: v.kind,
+                source: v.source,
+                target: v.target,
+                read_only: v.read_only,
+            })
+            .collect(),
+        autoscale,
+        update,
+        restart,
+    };
+    ok.then_some(spec)
+}
+
+/// Images without a tag or digest default to `:latest` (VE-02). The canonical
+/// form makes this explicit so the hash is stable.
+fn normalise_image(image: &str) -> String {
+    let image = image.trim();
+    if image.contains('@') || last_path_segment(image).contains(':') {
+        image.to_string()
+    } else {
+        format!("{image}:latest")
     }
-    
-    // Ports array
-    if !spec.ports.is_empty() {
-        let ports: Vec<toml::Value> = spec.ports.iter().map(|port| {
-            let mut port_table = toml::value::Table::new();
-            port_table.insert("name".to_string(), toml::Value::String(port.name.clone()));
-            port_table.insert("container_port".to_string(), toml::Value::Integer(port.container_port as i64));
-            port_table.insert("host_port".to_string(), toml::Value::Integer(port.host_port as i64));
-            toml::Value::Table(port_table)
-        }).collect();
-        table.insert("ports".to_string(), toml::Value::Array(ports));
+}
+
+fn last_path_segment(image: &str) -> &str {
+    image.rsplit('/').next().unwrap_or(image)
+}
+
+fn toml_error(content: &str, e: &toml::de::Error) -> ValidationError {
+    let msg = e.message().to_string();
+    // The table the error is in: the last `[header]` before the error span.
+    let table = e
+        .span()
+        .and_then(|span| {
+            content[..span.start.min(content.len())]
+                .lines()
+                .rev()
+                .map(str::trim)
+                .find(|l| l.starts_with('['))
+                .map(|h| h.trim_matches(|c| c == '[' || c == ']').trim().to_string())
+        })
+        .unwrap_or_default();
+    let path = |field: &str| {
+        if table.is_empty() {
+            field.to_string()
+        } else {
+            format!("{table}.{field}")
+        }
+    };
+    // serde reports unknown keys as "unknown field `x`, expected one of ...".
+    if let Some(rest) = msg.strip_prefix("unknown field `") {
+        let field = rest.split('`').next().unwrap_or("");
+        // Unknown top-level tables are reported at their own header.
+        let p = if table == field {
+            field.to_string()
+        } else {
+            path(field)
+        };
+        return ValidationError::new(Code::UnknownField, &p, &msg);
     }
-    
-    // Volumes array
-    if !spec.volumes.is_empty() {
-        let volumes: Vec<toml::Value> = spec.volumes.iter().map(|volume| {
-            let mut volume_table = toml::value::Table::new();
-            volume_table.insert("type".to_string(), toml::Value::String(volume.r#type.clone()));
-            volume_table.insert("source".to_string(), toml::Value::String(volume.source.clone()));
-            volume_table.insert("target".to_string(), toml::Value::String(volume.target.clone()));
-            volume_table.insert("read_only".to_string(), toml::Value::Boolean(volume.read_only));
-            toml::Value::Table(volume_table)
-        }).collect();
-        table.insert("volumes".to_string(), toml::Value::Array(volumes));
+    if msg.starts_with("missing field") {
+        let field = msg.split('`').nth(1).unwrap_or("");
+        return ValidationError::new(Code::UnknownField, &path(field), &msg);
     }
-    
-    // Autoscale table
-    if let Some(autoscale) = &spec.autoscale {
-        let mut autoscale_table = toml::value::Table::new();
-        autoscale_table.insert("min_replicas".to_string(), toml::Value::Integer(autoscale.min_replicas as i64));
-        autoscale_table.insert("max_replicas".to_string(), toml::Value::Integer(autoscale.max_replicas as i64));
-        autoscale_table.insert("target_cpu_percent".to_string(), toml::Value::Float(autoscale.target_cpu_percent));
-        table.insert("autoscale".to_string(), toml::Value::Table(autoscale_table));
+    ValidationError::new(
+        Code::UnknownField,
+        &table,
+        &format!("TOML parse error: {e}"),
+    )
+}
+
+// ============================================================================
+// Validation rules
+// ============================================================================
+
+fn service_id_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| Regex::new(r"^[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?$").unwrap())
+}
+
+fn image_re() -> &'static Regex {
+    // [registry[:port]/]path[:tag][@sha256:digest]
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(
+            r"^([a-zA-Z0-9.-]+(:[0-9]+)?/)?[a-z0-9]+([._-][a-z0-9]+)*(/[a-z0-9]+([._-]+[a-z0-9]+)*)*(:[A-Za-z0-9_][A-Za-z0-9_.-]{0,127})?(@sha256:[a-f0-9]{64})?$",
+        )
+        .unwrap()
+    })
+}
+
+fn validate_service_spec_into(spec: &ServiceSpec, out: &mut Vec<ValidationError>) {
+    // VE-03
+    if !service_id_re().is_match(&spec.id) {
+        out.push(ValidationError::new(
+            Code::InvalidServiceId,
+            "service.id",
+            &format!(
+                "{:?} must match ^[a-z0-9]([-a-z0-9]{{0,61}}[a-z0-9])?$",
+                spec.id
+            ),
+        ));
     }
-    
-    // Update table
-    let mut update_table = toml::value::Table::new();
-    update_table.insert("max_parallel".to_string(), toml::Value::Integer(spec.update.max_parallel as i64));
-    update_table.insert("min_healthy_time".to_string(), toml::Value::String(format!("{}s", spec.update.min_healthy_time_seconds)));
-    table.insert("update".to_string(), toml::Value::Table(update_table));
-    
-    // Restart table
-    let mut restart_table = toml::value::Table::new();
-    restart_table.insert("attempts".to_string(), toml::Value::Integer(spec.restart.attempts as i64));
-    restart_table.insert("interval".to_string(), toml::Value::String(format!("{}s", spec.restart.interval_seconds)));
-    restart_table.insert("delay".to_string(), toml::Value::String(format!("{}s", spec.restart.delay_seconds)));
-    table.insert("restart".to_string(), toml::Value::Table(restart_table));
-    
-    toml::to_string(&toml::Value::Table(table)).unwrap_or_default()
+
+    // VE-01
+    if spec.cpu_millicores == 0 {
+        out.push(ValidationError::new(
+            Code::InvalidResourceSpec,
+            "resources.cpu",
+            "cpu must be > 0",
+        ));
+    }
+    if spec.memory_bytes < 4 << 20 {
+        out.push(ValidationError::new(
+            Code::InvalidResourceSpec,
+            "resources.memory",
+            "memory must be >= 4MiB",
+        ));
+    }
+    if spec.disk_bytes == 0 {
+        out.push(ValidationError::new(
+            Code::InvalidResourceSpec,
+            "resources.disk",
+            "disk must be > 0",
+        ));
+    }
+
+    // VE-02
+    if !image_re().is_match(&spec.image) {
+        out.push(ValidationError::new(
+            Code::InvalidImageRef,
+            "service.image",
+            &format!("{:?} is not a valid OCI reference", spec.image),
+        ));
+    } else if spec.image.ends_with(":latest") {
+        out.push(ValidationError::warning(
+            Code::InvalidImageRef,
+            "service.image",
+            "image uses :latest; re-applying it will not pull a newer image. Pin a tag or digest.",
+        ));
+    }
+
+    // VE-04
+    if let Some(a) = &spec.autoscale {
+        if a.min_replicas < 1 || a.max_replicas < a.min_replicas {
+            out.push(ValidationError::new(
+                Code::InvalidAutoscaleSpec,
+                "autoscale.min_replicas",
+                "require 1 <= min_replicas <= max_replicas",
+            ));
+        }
+        if !(a.target_cpu_percent > 0.0 && a.target_cpu_percent < 100.0) {
+            out.push(ValidationError::new(
+                Code::InvalidAutoscaleSpec,
+                "autoscale.target_cpu_percent",
+                "target_cpu_percent must be > 0 and < 100",
+            ));
+        }
+    }
+
+    // VE-05
+    let mut seen = HashSet::new();
+    for (i, p) in spec.ports.iter().enumerate() {
+        if p.container_port == 0 {
+            out.push(ValidationError::new(
+                Code::InvalidPortSpec,
+                &format!("ports[{i}].container_port"),
+                "port must be in 1-65535",
+            ));
+        }
+        if p.host_port == 0 {
+            out.push(ValidationError::new(
+                Code::InvalidPortSpec,
+                &format!("ports[{i}].host_port"),
+                "port must be in 1-65535",
+            ));
+        } else if !seen.insert(p.host_port) {
+            out.push(ValidationError::new(
+                Code::InvalidPortSpec,
+                &format!("ports[{i}].host_port"),
+                &format!("duplicate host_port {}", p.host_port),
+            ));
+        } else if p.host_port < 1024 {
+            out.push(ValidationError::warning(
+                Code::InvalidPortSpec,
+                &format!("ports[{i}].host_port"),
+                &format!("host_port {} is a privileged port (< 1024)", p.host_port),
+            ));
+        }
+    }
+
+    // VE-07
+    let mut targets = HashSet::new();
+    for (i, v) in spec.volumes.iter().enumerate() {
+        if v.kind != "host" {
+            out.push(ValidationError::new(
+                Code::InvalidVolumeSpec,
+                &format!("volumes[{i}].type"),
+                &format!(
+                    "unknown volume type {:?}; only \"host\" is supported",
+                    v.kind
+                ),
+            ));
+        }
+        if v.source.is_empty() {
+            out.push(ValidationError::new(
+                Code::InvalidVolumeSpec,
+                &format!("volumes[{i}].source"),
+                "source is required",
+            ));
+        }
+        if !v.target.starts_with('/') {
+            out.push(ValidationError::new(
+                Code::InvalidVolumeSpec,
+                &format!("volumes[{i}].target"),
+                "target must be an absolute path",
+            ));
+        } else if !targets.insert(v.target.as_str()) {
+            out.push(ValidationError::new(
+                Code::InvalidVolumeSpec,
+                &format!("volumes[{i}].target"),
+                &format!("duplicate target {}", v.target),
+            ));
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    
-    #[test]
-    fn test_parse_valid_manifest() {
-        let toml = r#"
+
+    const VALID: &str = r#"
 [service]
-id = "test-service"
-image = "nginx:latest"
+id       = "frontend-web"
+image    = "docker.io/library/nginx:1.27.2-alpine-slim"
 replicas = 3
 
 [resources]
-cpu = 0.5
+cpu    = 0.5
 memory = "512MiB"
 
 [constraints]
 required_class = "general"
 
 [[ports]]
-name = "http"
+name           = "http"
 container_port = 80
-host_port = 8080
+host_port      = 8080
 
 [env]
-ENV_VAR = "value"
-        "#;
-        
-        let result = parse_manifest_str(toml);
-        assert!(result.is_ok());
-        let spec = result.unwrap();
-        
-        assert_eq!(spec.id, "test-service");
-        assert_eq!(spec.image, "nginx:latest");
-        assert_eq!(spec.replicas, 3);
-        assert_eq!(spec.cpu_millicores, 500);
-        assert_eq!(spec.memory_bytes, 512 * 1024 * 1024);
-        assert_eq!(spec.required_class, Some("general".to_string()));
-        assert_eq!(spec.ports.len(), 1);
-        assert_eq!(spec.ports[0].name, "http");
-        assert_eq!(spec.ports[0].container_port, 80);
-        assert_eq!(spec.ports[0].host_port, 8080);
-        assert_eq!(spec.env.get("ENV_VAR"), Some(&"value".to_string()));
+A = "1"
+
+[autoscale]
+min_replicas       = 3
+max_replicas       = 10
+target_cpu_percent = 75
+"#;
+
+    fn err_code(toml: &str) -> (Code, String) {
+        let e = parse_manifest_str(toml).unwrap_err();
+        (e[0].code.clone(), e[0].field_path.clone())
     }
-    
+
     #[test]
-    fn test_validate_service_id() {
-        let mut spec = ServiceSpec::default();
-        spec.id = "invalid!id".to_string();
-        
-        let errors = validate_service_spec(&spec);
-        assert!(!errors.is_empty());
-        assert_eq!(errors[0].code, ValidationErrorCode::InvalidServiceId);
+    fn parses_spec_example() {
+        let p = parse_manifest_str(VALID).unwrap();
+        assert_eq!(p.spec.id, "frontend-web");
+        assert_eq!(p.spec.cpu_millicores, 500);
+        assert_eq!(p.spec.memory_bytes, 512 << 20);
+        assert_eq!(p.spec.disk_bytes, 1 << 30);
+        assert_eq!(p.spec.required_class.as_deref(), Some("general"));
+        assert_eq!(p.spec.ports[0].host_port, 8080);
+        assert_eq!(p.spec.autoscale.as_ref().unwrap().max_replicas, 10);
+        assert!(p.warnings.is_empty());
+    }
+
+    #[test]
+    fn cpu_rounds_up() {
+        let m = VALID.replace("cpu    = 0.5", "cpu    = 0.0001");
+        assert_eq!(parse_manifest_str(&m).unwrap().spec.cpu_millicores, 1);
+    }
+
+    #[test]
+    fn missing_tag_warns_and_normalises() {
+        let m = VALID.replace("nginx:1.27.2-alpine-slim", "nginx");
+        let p = parse_manifest_str(&m).unwrap();
+        assert_eq!(p.spec.image, "docker.io/library/nginx:latest");
+        assert_eq!(p.warnings[0].code, Code::InvalidImageRef);
+    }
+
+    #[test]
+    fn registry_with_port_is_valid() {
+        let m = VALID.replace(
+            "docker.io/library/nginx:1.27.2-alpine-slim",
+            "registry.local:5000/team/app:1.0",
+        );
+        assert!(parse_manifest_str(&m).is_ok());
+    }
+
+    #[test]
+    fn ve01_resources() {
+        assert_eq!(
+            err_code(&VALID.replace("\"512MiB\"", "\"1MiB\"")).0,
+            Code::InvalidResourceSpec
+        );
+        assert_eq!(
+            err_code(&VALID.replace("cpu    = 0.5", "cpu    = 0.0")).0,
+            Code::InvalidResourceSpec
+        );
+        assert_eq!(
+            err_code(&VALID.replace("replicas = 3", "replicas = -1")).0,
+            Code::InvalidResourceSpec
+        );
+    }
+
+    #[test]
+    fn ve02_image() {
+        assert_eq!(
+            err_code(&VALID.replace("docker.io/library/nginx:1.27.2-alpine-slim", "Bad Image!")).0,
+            Code::InvalidImageRef
+        );
+    }
+
+    #[test]
+    fn ve03_service_id() {
+        assert_eq!(
+            err_code(&VALID.replace("frontend-web", "Frontend_Web")),
+            (Code::InvalidServiceId, "service.id".into())
+        );
+    }
+
+    #[test]
+    fn ve04_autoscale() {
+        assert_eq!(
+            err_code(&VALID.replace("max_replicas       = 10", "max_replicas       = 1")).0,
+            Code::InvalidAutoscaleSpec
+        );
+        assert_eq!(
+            err_code(&VALID.replace("target_cpu_percent = 75", "target_cpu_percent = 100")).0,
+            Code::InvalidAutoscaleSpec
+        );
+    }
+
+    #[test]
+    fn ve05_ports() {
+        let dup =
+            format!("{VALID}\n[[ports]]\nname = \"x\"\ncontainer_port = 81\nhost_port = 8080\n");
+        assert_eq!(
+            err_code(&dup),
+            (Code::InvalidPortSpec, "ports[1].host_port".into())
+        );
+        assert_eq!(
+            err_code(&VALID.replace("host_port      = 8080", "host_port      = 70000")).0,
+            Code::InvalidPortSpec
+        );
+        let low =
+            parse_manifest_str(&VALID.replace("host_port      = 8080", "host_port      = 80"))
+                .unwrap();
+        assert_eq!(low.warnings[0].code, Code::InvalidPortSpec);
+    }
+
+    #[test]
+    fn ve06_unknown_field() {
+        let (code, path) = err_code(&VALID.replace("replicas = 3", "replicas = 3\nreplica = 3"));
+        assert_eq!(code, Code::UnknownField);
+        assert_eq!(path, "service.replica");
+        assert_eq!(
+            err_code(&format!("{VALID}\n[bogus]\nx = 1\n")),
+            (Code::UnknownField, "bogus".into())
+        );
+        let port_typo = VALID.replace("host_port      = 8080", "hostport = 8080");
+        assert_eq!(
+            err_code(&port_typo),
+            (Code::UnknownField, "ports.hostport".into())
+        );
+    }
+
+    #[test]
+    fn ve07_volumes() {
+        let bad =
+            format!("{VALID}\n[[volumes]]\ntype = \"nfs\"\nsource = \"a\"\ntarget = \"rel\"\n");
+        let errs = parse_manifest_str(&bad).unwrap_err();
+        assert!(errs.iter().all(|e| e.code == Code::InvalidVolumeSpec));
+        assert_eq!(errs.len(), 2);
     }
 }

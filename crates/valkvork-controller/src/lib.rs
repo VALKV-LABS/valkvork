@@ -1,37 +1,13 @@
-//! Valkvork Controller Library
+//! Valkvork controller (spec §5).
 //!
-//! This crate provides the controller implementation for Valkvork.
+//! * [`core`]: the single actor that owns cluster state and the SQLite writer
+//!   connection (FR-CON-01). Reconciler, scheduler calls, dispatcher, health
+//!   checks, rollouts, drains and the autoscaler all run inside it.
+//! * [`grpc`]: thin adapters exposing `AgentService` and `AdminService`.
 
-pub mod admin;
-pub mod autoscaler;
-pub mod cluster;
-pub mod database;
-pub mod dispatcher;
-pub mod events;
-pub mod metrics;
-pub mod node;
-pub mod reconciler;
+pub mod core;
+pub mod db;
+pub mod grpc;
+pub mod model;
 pub mod scheduler;
 pub mod server;
-pub mod service;
-pub mod state;
-pub mod storage;
-pub mod ui;
-pub mod writer;
-
-pub use admin::*;
-pub use autoscaler::*;
-pub use cluster::*;
-pub use database::*;
-pub use dispatcher::*;
-pub use events::*;
-pub use metrics::*;
-pub use node::*;
-pub use reconciler::*;
-pub use scheduler::*;
-pub use server::*;
-pub use service::*;
-pub use state::*;
-pub use storage::*;
-pub use ui::*;
-pub use writer::*;

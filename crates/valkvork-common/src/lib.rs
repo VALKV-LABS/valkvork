@@ -7,10 +7,15 @@ pub mod tls;
 pub mod units;
 pub mod validation;
 
-// Re-export commonly used items
-pub use config::*;
-pub use errors::*;
-pub use models::*;
-pub use tls::*;
-pub use units::*;
-pub use validation::*;
+pub use errors::{ValidationError, ValidationErrorCode, ValkvorkError};
+
+/// Initialise JSON `tracing` logs (NFR-07). `RUST_LOG` controls the level and
+/// defaults to `info`.
+pub fn init_tracing() {
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .json()
+        .try_init();
+}

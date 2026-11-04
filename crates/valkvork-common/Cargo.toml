@@ -8,61 +8,18 @@ description = "Common types and utilities for Valkvork"
 [dependencies]
 valkvork-proto = { path = "../valkvork-proto" }
 
-# Serialization
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-toml = { version = "0.7", features = ["preserve_order"] }
-
-# Async runtime
-tokio = { version = "1.0", features = ["full"] }
-tokio-stream = "0.1"
-
-# Networking
-tonic = "0.10"
-prost = "0.12"
-http = "0.2"
-hyper = "0.14"
-
-# TLS
-rustls = { version = "0.21", features = ["dangerous_configuration"] }
-tokio-rustls = "0.24"
-rcgen = "0.11"
-
-# UUID
-uuid = { version = "1.4", features = ["v4", "v5", "serde"] }
-
-# Time
+toml = "0.7"
+tonic = { version = "0.10", features = ["tls"] }
+uuid = { version = "1.4", features = ["v4", "v5", "v7", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }
-
-# Logging
+thiserror = "1.0"
+regex = "1.10"
+sha2 = "0.10"
+hex = "0.4"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
-
-# Error handling
-thiserror = "1.0"
-anyhow = "1.0"
-
-# Collections
-hashbrown = "0.14"
-dashmap = "5.5"
-
-# File system
-dirs = "4.0"
-
-# Parsing
-nom = "7.1"
-
-# Regex
-regex = "1.10"
-
-# Random
-rand = "0.8"
-
-# PEM file parsing
-rustls-pemfile = "1.0"
-
-# Native certs
-rustls-native-certs = "0.6"
 
 [dev-dependencies]
 tempfile = "3.8"

@@ -3,9 +3,9 @@
 //! This module provides types and functions for converting between human-readable
 //! units (like "512MiB") and machine-friendly integers (like bytes or millicores).
 
+use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::str::FromStr;
-use serde::{Serialize, Deserialize};
 use thiserror::Error;
 
 /// Error type for unit parsing failures.
@@ -28,18 +28,18 @@ impl Millicores {
     pub const fn new(value: u32) -> Self {
         Self(value)
     }
-    
+
     pub const fn as_u32(&self) -> u32 {
         self.0
     }
-    
+
     /// Convert from cores (float) to millicores, rounding up.
     pub fn from_cores(cores: f64) -> Self {
         // Round up to nearest millicore
         let millicores = (cores * 1000.0).ceil() as u32;
         Self(millicores)
     }
-    
+
     pub fn to_cores(&self) -> f64 {
         self.0 as f64 / 1000.0
     }
@@ -59,19 +59,19 @@ impl Bytes {
     pub const fn new(value: u64) -> Self {
         Self(value)
     }
-    
+
     pub const fn as_u64(&self) -> u64 {
         self.0
     }
-    
+
     pub fn to_kib(&self) -> u64 {
         self.0 / 1024
     }
-    
+
     pub fn to_mib(&self) -> u64 {
         self.0 / (1024 * 1024)
     }
-    
+
     pub fn to_gib(&self) -> u64 {
         self.0 / (1024 * 1024 * 1024)
     }
@@ -103,7 +103,7 @@ pub enum SizeUnit {
 
 impl FromStr for SizeUnit {
     type Err = UnitParseError;
-    
+
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s.trim().to_lowercase().as_str() {
             "" | "b" | "bytes" => Ok(SizeUnit::Bytes),
@@ -116,31 +116,26 @@ impl FromStr for SizeUnit {
     }
 }
 
-/// Parse a size string like "512MiB" or "1GiB" into Bytes.
+/// Parse a size string like "512MiB" or "1GiB" into Bytes. A bare number is
+/// bytes.
 pub fn parse_size(s: &str) -> Result<Bytes, UnitParseError> {
     let s = s.trim();
-    
-    // Try to find the unit at the end
-    let unit_start = s.chars().position(|c| c.is_alphabetic()).ok_or_else(|| {
-        UnitParseError::InvalidFormat(s.to_string())
-    })?;
-    
+    let unit_start = s.find(|c: char| c.is_alphabetic()).unwrap_or(s.len());
     let (num_str, unit_str) = s.split_at(unit_start);
-    let num: u64 = num_str.parse().map_err(|_| {
-        UnitParseError::InvalidValue(num_str.to_string())
-    })?;
-    
-    let unit: SizeUnit = unit_str.parse()?;
-    
-    let bytes = match unit {
-        SizeUnit::Bytes => num,
-        SizeUnit::KiB => num * 1024,
-        SizeUnit::MiB => num * 1024 * 1024,
-        SizeUnit::GiB => num * 1024 * 1024 * 1024,
-        SizeUnit::TiB => num * 1024 * 1024 * 1024 * 1024,
+    let num: u64 = num_str
+        .trim()
+        .parse()
+        .map_err(|_| UnitParseError::InvalidValue(format!("{s:?} (expected e.g. \"512MiB\")")))?;
+    let multiplier: u64 = match unit_str.parse::<SizeUnit>()? {
+        SizeUnit::Bytes => 1,
+        SizeUnit::KiB => 1 << 10,
+        SizeUnit::MiB => 1 << 20,
+        SizeUnit::GiB => 1 << 30,
+        SizeUnit::TiB => 1 << 40,
     };
-    
-    Ok(Bytes(bytes))
+    num.checked_mul(multiplier)
+        .map(Bytes)
+        .ok_or_else(|| UnitParseError::InvalidValue(s.to_string()))
 }
 
 /// Parse a CPU specification (cores as float) into Millicores.
@@ -151,27 +146,28 @@ pub fn parse_cpu(cores: f64) -> Millicores {
 /// Parse duration string like "10s", "5m", "1h" into seconds.
 pub fn parse_duration(s: &str) -> Result<u64, UnitParseError> {
     let s = s.trim().to_lowercase();
-    
+
     if s.ends_with('s') {
-        let num: u64 = s.trim_end_matches('s').parse().map_err(|_| {
-            UnitParseError::InvalidValue(s)
-        })?;
+        let num: u64 = s
+            .trim_end_matches('s')
+            .parse()
+            .map_err(|_| UnitParseError::InvalidValue(s))?;
         Ok(num)
     } else if s.ends_with('m') {
-        let num: u64 = s.trim_end_matches('m').parse().map_err(|_| {
-            UnitParseError::InvalidValue(s)
-        })?;
+        let num: u64 = s
+            .trim_end_matches('m')
+            .parse()
+            .map_err(|_| UnitParseError::InvalidValue(s))?;
         Ok(num * 60)
     } else if s.ends_with('h') {
-        let num: u64 = s.trim_end_matches('h').parse().map_err(|_| {
-            UnitParseError::InvalidValue(s)
-        })?;
+        let num: u64 = s
+            .trim_end_matches('h')
+            .parse()
+            .map_err(|_| UnitParseError::InvalidValue(s))?;
         Ok(num * 3600)
     } else {
         // Assume seconds if no unit
-        let num: u64 = s.parse().map_err(|_| {
-            UnitParseError::InvalidValue(s)
-        })?;
+        let num: u64 = s.parse().map_err(|_| UnitParseError::InvalidValue(s))?;
         Ok(num)
     }
 }
@@ -179,7 +175,7 @@ pub fn parse_duration(s: &str) -> Result<u64, UnitParseError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    
+
     #[test]
     fn test_parse_size() {
         assert_eq!(parse_size("512MiB").unwrap(), Bytes(512 * 1024 * 1024));
@@ -188,14 +184,14 @@ mod tests {
         assert_eq!(parse_size("1024").unwrap(), Bytes(1024));
         assert_eq!(parse_size("1024B").unwrap(), Bytes(1024));
     }
-    
+
     #[test]
     fn test_parse_cpu() {
         assert_eq!(parse_cpu(0.5).as_u32(), 500);
         assert_eq!(parse_cpu(1.0).as_u32(), 1000);
         assert_eq!(parse_cpu(2.5).as_u32(), 2500);
     }
-    
+
     #[test]
     fn test_parse_duration() {
         assert_eq!(parse_duration("10s").unwrap(), 10);

@@ -33,6 +33,11 @@ message PlanResponse {
   bool feasible = 4;
   string reason = 5;
   repeated string warnings = 6;
+  repeated string diff = 7;       // field-level changes, e.g. "image: a -> b"
+  uint32 to_place = 8;            // workloads the change needs placed
+  uint32 placeable = 9;           // of those, how many fit right now
+  uint32 target_replicas = 10;
+  uint32 max_parallel = 11;
 }
 
 message DeleteServiceRequest {
@@ -73,6 +78,8 @@ message WorkloadSummary {
   uint64 created_at = 6;
   uint64 started_at = 7;
   uint64 updated_at = 8;
+  string service_id = 9;
+  uint64 service_version = 10;
 }
 
 message ScalingEvent {

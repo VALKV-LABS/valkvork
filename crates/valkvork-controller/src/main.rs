@@ -1,58 +1,50 @@
-//! Valkvork Controller
-//!
-//! Main entry point for the valkvork-controller binary.
+//! `valkvork-controller --config /etc/valkvork/controller.toml`
 
+use clap::Parser;
 use std::path::PathBuf;
-use valkvork_common::config::{load_controller_config, ControllerConfig};
-use valkvork_common::errors::ValkvorkError;
-use valkvork_controller::server::run_server;
-use tracing::{info, error, debug};
+use valkvork_common::config::ControllerConfig;
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Initialize tracing
-    init_tracing();
-    
-    info!("Starting Valkvork Controller");
-    
-    // Load configuration
-    let config_path = std::env::var("VALKVORK_CONTROLLER_CONFIG")
-        .unwrap_or_else(|_| "/etc/valkvork/controller.toml".to_string());
-    
-    let config = match load_controller_config(&PathBuf::from(config_path)) {
-        Ok(config) => config,
-        Err(e) => {
-            error!("Failed to load config: {}", e);
-            return Err(e.into());
-        }
-    };
-    
-    debug!("Configuration loaded: agent_listen={}, admin_listen={}", 
-           config.agent_listen_addr, config.admin_listen_addr);
-    
-    // Validate configuration
-    if config.join_token.is_empty() {
-        error!("Join token must be configured");
-        return Err("Join token must be configured".into());
-    }
-    
-    if config.admin_token.is_empty() {
-        error!("Admin token must be configured");
-        return Err("Admin token must be configured".into());
-    }
-    
-    // Run server
-    if let Err(e) = run_server(config).await {
-        error!("Server failed: {}", e);
-        return Err(e.into());
-    }
-    
-    Ok(())
+#[derive(Parser)]
+#[command(
+    name = "valkvork-controller",
+    version,
+    about = "Valkvork control plane"
+)]
+struct Args {
+    /// Path to controller.toml
+    #[arg(
+        long,
+        env = "VALKVORK_CONTROLLER_CONFIG",
+        default_value = "/etc/valkvork/controller.toml"
+    )]
+    config: PathBuf,
+    /// Validate the configuration (including token files) and exit
+    #[arg(long)]
+    check_config: bool,
 }
 
-fn init_tracing() {
-    tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
-        .json()
-        .init();
+#[tokio::main]
+async fn main() {
+    valkvork_common::init_tracing();
+    let args = Args::parse();
+    let result = match ControllerConfig::load(&args.config) {
+        Ok(cfg) if args.check_config => check(&cfg),
+        Ok(cfg) => valkvork_controller::server::run(cfg).await,
+        Err(e) => Err(e),
+    };
+    if let Err(e) = result {
+        tracing::error!(error = %e, "controller exiting");
+        eprintln!("valkvork-controller: {e}");
+        std::process::exit(1);
+    }
+}
+
+fn check(cfg: &ControllerConfig) -> Result<(), valkvork_common::ValkvorkError> {
+    cfg.resolve_join_token()?;
+    cfg.resolve_admin_token()?;
+    if let (Some(cert), Some(key)) = (&cfg.tls_cert_file, &cfg.tls_key_file) {
+        valkvork_common::tls::server_tls_config(cert, key)?;
+    }
+    println!("configuration OK");
+    Ok(())
 }

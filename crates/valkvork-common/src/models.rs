@@ -1,317 +1,77 @@
-//! Core data models for Valkvork.
+//! Core data models shared by the controller, agent and CLI.
 //!
-//! This module contains the primary data structures used throughout Valkvork,
-//! including services, workloads, nodes, and their states.
+//! Units follow spec §2.6: CPU in integer millicores, sizes in bytes,
+//! durations in seconds, timestamps in Unix epoch milliseconds.
 
-use crate::units::{Bytes, Millicores};
-use chrono::{DateTime, Utc};
-use serde::{Serialize, Deserialize};
-use std::collections::HashMap;
-use uuid::Uuid;
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use std::collections::BTreeMap;
+use std::fmt;
+use std::str::FromStr;
 
-// ============================================================================
-// Node Models
-// ============================================================================
+/// Current wall-clock time in Unix epoch milliseconds.
+pub fn now_ms() -> i64 {
+    chrono::Utc::now().timestamp_millis()
+}
 
-/// Node status
+/// Generates `as_str`, `Display` and `FromStr` for a fieldless enum whose
+/// variants map to fixed strings (the values stored in SQLite and on the wire).
+macro_rules! string_enum {
+    ($name:ident { $($variant:ident => $s:expr),+ $(,)? }) => {
+        impl $name {
+            pub fn as_str(&self) -> &'static str {
+                match self { $($name::$variant => $s),+ }
+            }
+        }
+        impl fmt::Display for $name {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str(self.as_str())
+            }
+        }
+        impl FromStr for $name {
+            type Err = String;
+            fn from_str(s: &str) -> Result<Self, Self::Err> {
+                match s {
+                    $($s => Ok($name::$variant),)+
+                    other => Err(format!("invalid {}: {}", stringify!($name), other)),
+                }
+            }
+        }
+    };
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum NodeStatus {
     Healthy,
     Unhealthy,
 }
+string_enum!(NodeStatus { Healthy => "HEALTHY", Unhealthy => "UNHEALTHY" });
 
-impl Default for NodeStatus {
-    fn default() -> Self {
-        NodeStatus::Healthy
-    }
-}
-
-impl From<&str> for NodeStatus {
-    fn from(s: &str) -> Self {
-        match s.to_lowercase().as_str() {
-            "healthy" => NodeStatus::Healthy,
-            _ => NodeStatus::Unhealthy,
-        }
-    }
-}
-
-impl std::fmt::Display for NodeStatus {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            NodeStatus::Healthy => write!(f, "HEALTHY"),
-            NodeStatus::Unhealthy => write!(f, "UNHEALTHY"),
-        }
-    }
-}
-
-/// Node information
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Node {
-    pub node_id: String,
-    pub hostname: String,
-    pub ip_address: String,
-    pub node_class: String,
-    pub agent_version: String,
-    pub runtime: String,
-    pub allocatable_cpu_millicores: u32,
-    pub allocatable_memory_bytes: u64,
-    pub host_volumes: Vec<String>,
-    pub status: NodeStatus,
-    pub draining: bool,
-    pub last_heartbeat_at: DateTime<Utc>,
-    pub created_at: DateTime<Utc>,
-    pub updated_at: DateTime<Utc>,
-}
-
-impl Node {
-    pub fn new(
-        node_id: String,
-        hostname: String,
-        ip_address: String,
-        node_class: String,
-        agent_version: String,
-        runtime: String,
-        allocatable_cpu_millicores: u32,
-        allocatable_memory_bytes: u64,
-        host_volumes: Vec<String>,
-    ) -> Self {
-        let now = Utc::now();
-        Self {
-            node_id,
-            hostname,
-            ip_address,
-            node_class,
-            agent_version,
-            runtime,
-            allocatable_cpu_millicores,
-            allocatable_memory_bytes,
-            host_volumes,
-            status: NodeStatus::Healthy,
-            draining: false,
-            last_heartbeat_at: now,
-            created_at: now,
-            updated_at: now,
-        }
-    }
-    
-    /// Check if node is eligible for scheduling
-    pub fn is_eligible(&self) -> bool {
-        !self.draining && self.status == NodeStatus::Healthy
-    }
-    
-    /// Calculate allocated CPU ratio (0.0 to 1.0)
-    pub fn cpu_alloc_ratio(&self, allocated_millicores: u32) -> f64 {
-        allocated_millicores as f64 / self.allocatable_cpu_millicores as f64
-    }
-    
-    /// Calculate allocated memory ratio (0.0 to 1.0)
-    pub fn memory_alloc_ratio(&self, allocated_bytes: u64) -> f64 {
-        allocated_bytes as f64 / self.allocatable_memory_bytes as f64
-    }
-}
-
-// ============================================================================
-// Service Models
-// ============================================================================
-
-/// Service status
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum ServiceStatus {
     Active,
     Degraded,
     Deleting,
 }
+string_enum!(ServiceStatus { Active => "ACTIVE", Degraded => "DEGRADED", Deleting => "DELETING" });
 
-impl Default for ServiceStatus {
-    fn default() -> Self {
-        ServiceStatus::Active
-    }
-}
-
-/// Rollout status
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum RolloutStatus {
     None,
     InProgress,
     Halted,
 }
+string_enum!(RolloutStatus { None => "NONE", InProgress => "IN_PROGRESS", Halted => "HALTED" });
 
-impl Default for RolloutStatus {
-    fn default() -> Self {
-        RolloutStatus::None
-    }
-}
-
-/// Restart policy configuration
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RestartPolicy {
-    pub attempts: u32,
-    pub interval_seconds: u64,
-    pub delay_seconds: u64,
-}
-
-impl Default for RestartPolicy {
-    fn default() -> Self {
-        Self {
-            attempts: 3,
-            interval_seconds: 300, // 5 minutes
-            delay_seconds: 5,
-        }
-    }
-}
-
-/// Update configuration
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct UpdateConfig {
-    pub max_parallel: u32,
-    pub min_healthy_time_seconds: u64,
-}
-
-impl Default for UpdateConfig {
-    fn default() -> Self {
-        Self {
-            max_parallel: 1,
-            min_healthy_time_seconds: 10,
-        }
-    }
-}
-
-/// Autoscaling configuration
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct AutoscaleConfig {
-    pub min_replicas: u32,
-    pub max_replicas: u32,
-    pub target_cpu_percent: f64,
-}
-
-/// Port mapping
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PortMapping {
-    pub name: String,
-    pub container_port: u16,
-    pub host_port: u16,
-}
-
-/// Volume mount
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct VolumeMount {
-    pub r#type: String,
-    pub source: String,
-    pub target: String,
-    pub read_only: bool,
-}
-
-/// Service specification (from manifest)
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ServiceSpec {
-    pub id: String,
-    pub image: String,
-    pub replicas: u32,
-    pub kill_timeout_seconds: u32,
-    pub cpu_millicores: u32,
-    pub memory_bytes: u64,
-    pub disk_bytes: u64,
-    pub required_class: Option<String>,
-    pub env: HashMap<String, String>,
-    pub ports: Vec<PortMapping>,
-    pub volumes: Vec<VolumeMount>,
-    pub autoscale: Option<AutoscaleConfig>,
-    pub update: UpdateConfig,
-    pub restart: RestartPolicy,
-}
-
-impl Default for ServiceSpec {
-    fn default() -> Self {
-        Self {
-            id: String::new(),
-            image: String::new(),
-            replicas: 1,
-            kill_timeout_seconds: 10,
-            cpu_millicores: 100,
-            memory_bytes: 128 * 1024 * 1024, // 128 MiB
-            disk_bytes: 1 * 1024 * 1024 * 1024, // 1 GiB
-            required_class: None,
-            env: HashMap::new(),
-            ports: Vec::new(),
-            volumes: Vec::new(),
-            autoscale: None,
-            update: UpdateConfig::default(),
-            restart: RestartPolicy::default(),
-        }
-    }
-}
-
-/// Service entity with metadata
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Service {
-    pub service_id: String,
-    pub version: u64,
-    pub spec: ServiceSpec,
-    pub spec_hash: String,
-    pub status: ServiceStatus,
-    pub rollout_status: RolloutStatus,
-    pub target_replicas: u32,
-    pub min_replicas: Option<u32>,
-    pub max_replicas: Option<u32>,
-    pub target_cpu_percent: Option<f64>,
-    pub last_scaled_at: Option<DateTime<Utc>>,
-    pub created_at: DateTime<Utc>,
-    pub updated_at: DateTime<Utc>,
-}
-
-impl Service {
-    pub fn new(spec: ServiceSpec) -> Self {
-        let now = Utc::now();
-        Self {
-            service_id: spec.id.clone(),
-            version: 1,
-            spec,
-            spec_hash: String::new(),
-            status: ServiceStatus::Active,
-            rollout_status: RolloutStatus::None,
-            target_replicas: 1,
-            min_replicas: None,
-            max_replicas: None,
-            target_cpu_percent: None,
-            last_scaled_at: None,
-            created_at: now,
-            updated_at: now,
-        }
-    }
-    
-    pub fn autoscale_enabled(&self) -> bool {
-        self.spec.autoscale.is_some()
-    }
-    
-    pub fn bump_version(&mut self) {
-        self.version += 1;
-    }
-}
-
-// ============================================================================
-// Workload Models
-// ============================================================================
-
-/// Workload desired state
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum DesiredState {
     Run,
     Stop,
 }
+string_enum!(DesiredState { Run => "RUN", Stop => "STOP" });
 
-impl Default for DesiredState {
-    fn default() -> Self {
-        DesiredState::Run
-    }
-}
-
-/// Workload status
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+/// Workload status (spec §3.1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum WorkloadStatus {
     Pending,
     Assigned,
@@ -321,77 +81,23 @@ pub enum WorkloadStatus {
     Stopped,
     Failed,
 }
-
-impl Default for WorkloadStatus {
-    fn default() -> Self {
-        WorkloadStatus::Pending
-    }
-}
+string_enum!(WorkloadStatus {
+    Pending => "PENDING",
+    Assigned => "ASSIGNED",
+    Running => "RUNNING",
+    Stopping => "STOPPING",
+    Lost => "LOST",
+    Stopped => "STOPPED",
+    Failed => "FAILED",
+});
 
 impl WorkloadStatus {
     pub fn is_terminal(&self) -> bool {
         matches!(self, WorkloadStatus::Stopped | WorkloadStatus::Failed)
     }
-    
-    pub fn is_running(&self) -> bool {
-        matches!(self, WorkloadStatus::Running)
-    }
 }
 
-/// Workload entity
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Workload {
-    pub workload_id: String,
-    pub service_id: String,
-    pub service_version: u64,
-    pub node_id: Option<String>,
-    pub container_id: Option<String>,
-    pub desired_state: DesiredState,
-    pub status: WorkloadStatus,
-    pub status_reason: Option<String>,
-    pub replaces_workload_id: Option<String>,
-    pub restart_count: u32,
-    pub created_at: DateTime<Utc>,
-    pub started_at: Option<DateTime<Utc>>,
-    pub updated_at: DateTime<Utc>,
-}
-
-impl Workload {
-    pub fn new(service_id: String, service_version: u64) -> Self {
-        let now = Utc::now();
-        Self {
-            workload_id: Uuid::new_v7().to_string(),
-            service_id,
-            service_version,
-            node_id: None,
-            container_id: None,
-            desired_state: DesiredState::Run,
-            status: WorkloadStatus::Pending,
-            status_reason: None,
-            replaces_workload_id: None,
-            restart_count: 0,
-            created_at: now,
-            started_at: None,
-            updated_at: now,
-        }
-    }
-    
-    pub fn is_terminal(&self) -> bool {
-        self.status.is_terminal()
-    }
-    
-    pub fn is_live(&self) -> bool {
-        self.desired_state == DesiredState::Run && !self.is_terminal()
-    }
-}
-
-// ============================================================================
-// Event Models
-// ============================================================================
-
-/// Event kinds
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum EventKind {
     Node,
     Workload,
@@ -399,149 +105,239 @@ pub enum EventKind {
     Scale,
     Audit,
 }
+string_enum!(EventKind {
+    Node => "NODE",
+    Workload => "WORKLOAD",
+    Deploy => "DEPLOY",
+    Scale => "SCALE",
+    Audit => "AUDIT",
+});
 
-/// Subject types
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum SubjectType {
     Node,
     Service,
     Workload,
 }
+string_enum!(SubjectType { Node => "node", Service => "service", Workload => "workload" });
 
-/// Cluster event
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ClusterEvent {
-    pub event_id: i64,
-    pub kind: EventKind,
-    pub subject_type: SubjectType,
-    pub subject_id: String,
-    pub message: String,
-    pub actor: String,
-    pub created_at: DateTime<Utc>,
+// ============================================================================
+// Service specification (canonical, validated manifest)
+// ============================================================================
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RestartPolicy {
+    pub attempts: u32,
+    pub interval_seconds: u32,
+    pub delay_seconds: u32,
 }
 
-impl ClusterEvent {
-    pub fn new(
-        kind: EventKind,
-        subject_type: SubjectType,
-        subject_id: String,
-        message: String,
-        actor: String,
-    ) -> Self {
+impl Default for RestartPolicy {
+    fn default() -> Self {
         Self {
-            event_id: 0, // Will be set by DB
-            kind,
-            subject_type,
-            subject_id,
-            message,
-            actor,
-            created_at: Utc::now(),
+            attempts: 3,
+            interval_seconds: 300,
+            delay_seconds: 5,
         }
     }
 }
 
-/// Scaling event
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ScalingEvent {
-    pub event_id: i64,
-    pub service_id: String,
-    pub from_replicas: u32,
-    pub to_replicas: u32,
-    pub metric_value: f64,
-    pub reason: String,
-    pub created_at: DateTime<Utc>,
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct UpdatePolicy {
+    pub max_parallel: u32,
+    pub min_healthy_time_seconds: u32,
 }
 
-impl ScalingEvent {
-    pub fn new(
-        service_id: String,
-        from_replicas: u32,
-        to_replicas: u32,
-        metric_value: f64,
-        reason: String,
-    ) -> Self {
+impl Default for UpdatePolicy {
+    fn default() -> Self {
         Self {
-            event_id: 0,
-            service_id,
-            from_replicas,
-            to_replicas,
-            metric_value,
-            reason,
-            created_at: Utc::now(),
+            max_parallel: 1,
+            min_healthy_time_seconds: 10,
         }
     }
 }
 
-// ============================================================================
-// Health and Metrics
-// ============================================================================
-
-/// Node health info for heartbeats
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct NodeHealth {
-    pub cpu_usage_percent: f64,
-    pub memory_used_bytes: u64,
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AutoscaleSpec {
+    pub min_replicas: u32,
+    pub max_replicas: u32,
+    pub target_cpu_percent: f64,
 }
 
-/// Workload health info from agent
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct WorkloadHealth {
-    pub workload_id: String,
-    pub service_id: String,
-    pub service_version: u64,
-    pub container_id: String,
-    pub state: WorkloadStatus,
-    pub reason: Option<String>,
-    pub exit_code: Option<i32>,
-    pub restart_count: u32,
-    pub cpu_usage_millicores: u32,
-    pub memory_used_bytes: u64,
-    pub disk_used_bytes: Option<u64>,
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PortSpec {
+    pub name: String,
+    pub container_port: u16,
+    pub host_port: u16,
 }
 
-// ============================================================================
-// Commands
-// ============================================================================
-
-/// Command types sent from controller to agent
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum AgentCommand {
-    StartWorkload(StartWorkloadCommand),
-    StopWorkload(StopWorkloadCommand),
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VolumeSpec {
+    #[serde(rename = "type")]
+    pub kind: String,
+    pub source: String,
+    pub target: String,
+    pub read_only: bool,
 }
 
-/// Start workload command
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct StartWorkloadCommand {
-    pub command_id: String,
-    pub workload_id: String,
-    pub service_id: String,
-    pub service_version: u64,
+/// Canonical form of a validated manifest. Field order and `BTreeMap` make the
+/// JSON serialisation deterministic, which `spec_hash` relies on (FR-MAN-02).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ServiceSpec {
+    pub id: String,
     pub image: String,
+    pub replicas: u32,
+    pub kill_timeout_seconds: u32,
     pub cpu_millicores: u32,
     pub memory_bytes: u64,
     pub disk_bytes: u64,
-    pub env: HashMap<String, String>,
-    pub ports: Vec<PortMapping>,
-    pub volumes: Vec<VolumeMount>,
+    pub required_class: Option<String>,
+    pub env: BTreeMap<String, String>,
+    pub ports: Vec<PortSpec>,
+    pub volumes: Vec<VolumeSpec>,
+    pub autoscale: Option<AutoscaleSpec>,
+    pub update: UpdatePolicy,
     pub restart: RestartPolicy,
-    pub kill_timeout_seconds: u32,
 }
 
-/// Stop workload command
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct StopWorkloadCommand {
-    pub command_id: String,
-    pub workload_id: String,
-    pub kill_timeout_seconds: u32,
+/// Classification of the difference between a stored spec and a new one
+/// (FR-MAN-02).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChangeKind {
+    Created,
+    Unchanged,
+    ScaleOnly,
+    PolicyOnly,
+    Replacing,
+}
+string_enum!(ChangeKind {
+    Created => "created",
+    Unchanged => "unchanged",
+    ScaleOnly => "scale-only",
+    PolicyOnly => "policy-only",
+    Replacing => "replacing",
+});
+
+impl ServiceSpec {
+    pub fn canonical_json(&self) -> String {
+        serde_json::to_string(self).expect("ServiceSpec serialises")
+    }
+
+    /// SHA-256 of the canonical JSON form, hex encoded.
+    pub fn spec_hash(&self) -> String {
+        hex::encode(Sha256::digest(self.canonical_json().as_bytes()))
+    }
+
+    /// True when every replacement-requiring field (spec §3.3) is equal.
+    pub fn same_replacement_fields(&self, other: &ServiceSpec) -> bool {
+        self.image == other.image
+            && self.cpu_millicores == other.cpu_millicores
+            && self.memory_bytes == other.memory_bytes
+            && self.disk_bytes == other.disk_bytes
+            && self.required_class == other.required_class
+            && self.env == other.env
+            && self.ports == other.ports
+            && self.volumes == other.volumes
+            && self.restart == other.restart
+            && self.kill_timeout_seconds == other.kill_timeout_seconds
+    }
+
+    /// Classify `new` against `self` (the stored spec), ignoring live target
+    /// replicas; the caller handles manual-scale drift.
+    pub fn classify_change(&self, new: &ServiceSpec) -> ChangeKind {
+        if !self.same_replacement_fields(new) {
+            ChangeKind::Replacing
+        } else if self.autoscale != new.autoscale || self.update != new.update {
+            ChangeKind::PolicyOnly
+        } else if self.replicas != new.replicas {
+            ChangeKind::ScaleOnly
+        } else {
+            ChangeKind::Unchanged
+        }
+    }
+
+    /// Human-readable field-level diff, used by `plan` output.
+    pub fn diff_lines(&self, new: &ServiceSpec) -> Vec<String> {
+        let mut out = Vec::new();
+        macro_rules! cmp {
+            ($label:expr, $a:expr, $b:expr) => {
+                if $a != $b {
+                    out.push(format!("{}: {:?} → {:?}", $label, $a, $b));
+                }
+            };
+        }
+        cmp!("image", self.image, new.image);
+        cmp!("replicas", self.replicas, new.replicas);
+        cmp!(
+            "kill_timeout_seconds",
+            self.kill_timeout_seconds,
+            new.kill_timeout_seconds
+        );
+        cmp!("cpu_millicores", self.cpu_millicores, new.cpu_millicores);
+        cmp!("memory_bytes", self.memory_bytes, new.memory_bytes);
+        cmp!("disk_bytes", self.disk_bytes, new.disk_bytes);
+        cmp!("required_class", self.required_class, new.required_class);
+        cmp!("env", self.env, new.env);
+        cmp!("ports", self.ports, new.ports);
+        cmp!("volumes", self.volumes, new.volumes);
+        cmp!("autoscale", self.autoscale, new.autoscale);
+        cmp!("update", self.update, new.update);
+        cmp!("restart", self.restart, new.restart);
+        out
+    }
 }
 
-/// Command result from agent
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CommandResult {
-    pub command_id: String,
-    pub workload_id: String,
-    pub accepted: bool,
-    pub error: Option<String>,
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn spec() -> ServiceSpec {
+        ServiceSpec {
+            id: "web".into(),
+            image: "nginx:1.27".into(),
+            replicas: 1,
+            kill_timeout_seconds: 10,
+            cpu_millicores: 500,
+            memory_bytes: 512 << 20,
+            disk_bytes: 1 << 30,
+            required_class: None,
+            env: BTreeMap::new(),
+            ports: vec![],
+            volumes: vec![],
+            autoscale: None,
+            update: UpdatePolicy::default(),
+            restart: RestartPolicy::default(),
+        }
+    }
+
+    #[test]
+    fn hash_is_stable_and_sensitive() {
+        let a = spec();
+        let mut b = spec();
+        assert_eq!(a.spec_hash(), b.spec_hash());
+        b.replicas = 2;
+        assert_ne!(a.spec_hash(), b.spec_hash());
+    }
+
+    #[test]
+    fn classify() {
+        let a = spec();
+        let mut b = spec();
+        assert_eq!(a.classify_change(&b), ChangeKind::Unchanged);
+        b.replicas = 3;
+        assert_eq!(a.classify_change(&b), ChangeKind::ScaleOnly);
+        b.update.max_parallel = 2;
+        assert_eq!(a.classify_change(&b), ChangeKind::PolicyOnly);
+        b.image = "nginx:1.28".into();
+        assert_eq!(a.classify_change(&b), ChangeKind::Replacing);
+    }
+
+    #[test]
+    fn status_round_trip() {
+        for s in [
+            "PENDING", "ASSIGNED", "RUNNING", "STOPPING", "LOST", "STOPPED", "FAILED",
+        ] {
+            assert_eq!(s.parse::<WorkloadStatus>().unwrap().as_str(), s);
+        }
+    }
 }

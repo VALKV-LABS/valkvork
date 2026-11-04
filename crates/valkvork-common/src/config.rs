@@ -1,92 +1,57 @@
-//! Configuration types for Valkvork components.
+//! Configuration files for the controller and agent.
 //!
-//! This module provides configuration structures for the controller, agent, and CLI.
+//! Every field has a default so that a minimal file works; unknown keys are
+//! rejected so typos fail loudly at startup.
 
+use crate::errors::ValkvorkError;
+use crate::units::parse_size;
+use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::net::SocketAddr;
-use std::path::PathBuf;
-use serde::{Serialize, Deserialize};
-use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 
 // ============================================================================
-// Shared Configuration
+// Controller
 // ============================================================================
 
-/// TLS configuration
+/// `/etc/valkvork/controller.toml`
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TlsConfig {
-    pub enabled: bool,
-    pub cert_file: Option<PathBuf>,
-    pub key_file: Option<PathBuf>,
-    pub ca_file: Option<PathBuf>,
-    pub client_auth: bool,
-}
-
-impl Default for TlsConfig {
-    fn default() -> Self {
-        Self {
-            enabled: true,
-            cert_file: None,
-            key_file: None,
-            ca_file: None,
-            client_auth: false,
-        }
-    }
-}
-
-// ============================================================================
-// Controller Configuration
-// ============================================================================
-
-/// Controller configuration
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
 pub struct ControllerConfig {
-    /// Address to listen on for agent connections (gRPC)
+    /// Agent stream listener (FR-SEC-05: reachable from worker subnets only).
     pub agent_listen_addr: SocketAddr,
-    
-    /// Address to listen on for admin API and UI
+    /// Admin API / UI listener.
     pub admin_listen_addr: SocketAddr,
-    
-    /// TLS configuration for agent connections
-    pub agent_tls: TlsConfig,
-    
-    /// TLS configuration for admin API
-    pub admin_tls: TlsConfig,
-    
-    /// Path to SQLite database
+
+    /// Server certificate and key (PEM). When both are unset the controller
+    /// serves plaintext and logs a warning; only acceptable for development.
+    pub tls_cert_file: Option<PathBuf>,
+    pub tls_key_file: Option<PathBuf>,
+
     pub database_path: PathBuf,
-    
-    /// Join token for agent authentication
-    pub join_token: String,
-    
-    /// Admin token for CLI/UI authentication
-    pub admin_token: String,
-    
-    /// Node unhealthy timeout in seconds
+
+    /// Join token for agents (FR-SEC-01). `join_token_file` wins when set.
+    pub join_token: Option<String>,
+    pub join_token_file: Option<PathBuf>,
+    /// Admin bearer token (FR-SEC-03). `admin_token_file` wins when set.
+    pub admin_token: Option<String>,
+    pub admin_token_file: Option<PathBuf>,
+
+    /// FR-CON-02
     pub node_unhealthy_timeout_seconds: u64,
-    
-    /// Recovery grace period in seconds
+    /// FR-CON-04
     pub recovery_grace_period_seconds: u64,
-    
-    /// Heartbeat interval in milliseconds (for agents)
-    pub heartbeat_interval_ms: u64,
-    
-    /// Command timeout in seconds
+    pub heartbeat_interval_ms: u32,
+    /// FR-CON-09: resend a command once if not acked within this time.
     pub command_timeout_seconds: u64,
-    
-    /// Start timeout in seconds
+    /// FR-CON-09: ASSIGNED workloads must be RUNNING within this time.
     pub start_timeout_seconds: u64,
-    
-    /// UI configuration
-    pub ui: UiConfig,
-    
-    /// Metrics configuration
-    pub metrics: MetricsConfig,
-    
-    /// Autoscaler configuration
+    /// FR-CON-05 reconcile tick.
+    pub reconcile_interval_seconds: u64,
+    /// FR-CON-01: in-memory heartbeat times are flushed this often.
+    pub heartbeat_flush_interval_seconds: u64,
+
     pub autoscaler: AutoscalerConfig,
-    
-    /// Scheduler configuration
-    pub scheduler: SchedulerConfig,
 }
 
 impl Default for ControllerConfig {
@@ -94,66 +59,56 @@ impl Default for ControllerConfig {
         Self {
             agent_listen_addr: "0.0.0.0:50051".parse().unwrap(),
             admin_listen_addr: "0.0.0.0:50052".parse().unwrap(),
-            agent_tls: TlsConfig::default(),
-            admin_tls: TlsConfig::default(),
+            tls_cert_file: None,
+            tls_key_file: None,
             database_path: PathBuf::from("/var/lib/valkvork/db/valkvork.db"),
-            join_token: String::new(),
-            admin_token: String::new(),
+            join_token: None,
+            join_token_file: None,
+            admin_token: None,
+            admin_token_file: None,
             node_unhealthy_timeout_seconds: 10,
             recovery_grace_period_seconds: 30,
             heartbeat_interval_ms: 2000,
             command_timeout_seconds: 30,
-            start_timeout_seconds: 300, // 5 minutes
-            ui: UiConfig::default(),
-            metrics: MetricsConfig::default(),
+            start_timeout_seconds: 300,
+            reconcile_interval_seconds: 5,
+            heartbeat_flush_interval_seconds: 30,
             autoscaler: AutoscalerConfig::default(),
-            scheduler: SchedulerConfig::default(),
         }
     }
 }
 
-/// UI configuration
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct UiConfig {
-    pub enabled: bool,
-    pub assets_path: Option<PathBuf>,
-}
+impl ControllerConfig {
+    pub fn load(path: &Path) -> Result<Self, ValkvorkError> {
+        load_toml(path)
+    }
 
-impl Default for UiConfig {
-    fn default() -> Self {
-        Self {
-            enabled: true,
-            assets_path: None,
-        }
+    pub fn resolve_join_token(&self) -> Result<String, ValkvorkError> {
+        resolve_secret(
+            "join_token",
+            self.join_token.as_deref(),
+            self.join_token_file.as_deref(),
+        )
+    }
+
+    pub fn resolve_admin_token(&self) -> Result<String, ValkvorkError> {
+        resolve_secret(
+            "admin_token",
+            self.admin_token.as_deref(),
+            self.admin_token_file.as_deref(),
+        )
     }
 }
 
-/// Metrics configuration
+/// Autoscaler tuning (FR-AUT). Defaults are the spec values.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct MetricsConfig {
-    pub enabled: bool,
-    pub listen_addr: SocketAddr,
-}
-
-impl Default for MetricsConfig {
-    fn default() -> Self {
-        Self {
-            enabled: true,
-            listen_addr: "0.0.0.0:9400".parse().unwrap(),
-        }
-    }
-}
-
-/// Autoscaler configuration
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
 pub struct AutoscalerConfig {
     pub enabled: bool,
     pub evaluation_interval_seconds: u64,
+    pub window_seconds: u64,
+    pub sustain_seconds: u64,
     pub cooldown_seconds: u64,
-    pub scale_up_threshold: f64,  // multiplier (e.g., 1.1 = 10% above target)
-    pub scale_down_threshold: f64, // multiplier (e.g., 0.9 = 10% below target)
-    pub min_replicas: u32,
-    pub max_replicas: u32,
 }
 
 impl Default for AutoscalerConfig {
@@ -161,91 +116,80 @@ impl Default for AutoscalerConfig {
         Self {
             enabled: true,
             evaluation_interval_seconds: 10,
-            cooldown_seconds: 180, // 3 minutes
-            scale_up_threshold: 1.1,
-            scale_down_threshold: 0.9,
-            min_replicas: 1,
-            max_replicas: 100,
-        }
-    }
-}
-
-/// Scheduler configuration
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SchedulerConfig {
-    pub max_parallel: u32,
-    pub min_healthy_time_seconds: u64,
-}
-
-impl Default for SchedulerConfig {
-    fn default() -> Self {
-        Self {
-            max_parallel: 1,
-            min_healthy_time_seconds: 10,
+            window_seconds: 60,
+            sustain_seconds: 120,
+            cooldown_seconds: 180,
         }
     }
 }
 
 // ============================================================================
-// Agent Configuration
+// Agent
 // ============================================================================
 
-/// Agent configuration
+/// `/etc/valkvork/agent.toml` (spec §10.2).
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
 pub struct AgentConfig {
-    /// Controller endpoint (e.g., "https://controlplane.valkvork.internal:50051")
+    /// `https://host:50051` (TLS, verified against `ca_file`) or `http://`
+    /// for development.
     pub controller_endpoint: String,
-    
-    /// CA certificate file path
-    pub ca_file: PathBuf,
-    
-    /// Join token file path
+    pub ca_file: Option<PathBuf>,
+    /// TLS server name to verify; defaults to the endpoint host.
+    pub tls_domain: Option<String>,
     pub join_token_file: PathBuf,
-    
-    /// Node class
     pub node_class: String,
-    
-    /// Data directory
     pub data_dir: PathBuf,
-    
-    /// Runtime driver
     pub runtime: String,
-    
-    /// Docker socket path (if runtime is docker)
-    pub docker_socket: Option<PathBuf>,
-    
-    /// Reserved resources
+    pub docker_socket: PathBuf,
+    /// Docker config-format credentials (FR-AGE-04).
+    pub registry_auth_file: PathBuf,
+    /// Overrides the auto-detected address reported in `Register`.
+    pub advertise_ip: Option<String>,
     pub reserved: ReservedResources,
-    
-    /// Host volumes
-    pub host_volumes: HashMap<String, HostVolume>,
-    
-    /// Registry authentication
-    pub registry_auth: Option<RegistryAuth>,
+    pub host_volumes: BTreeMap<String, HostVolume>,
 }
 
 impl Default for AgentConfig {
     fn default() -> Self {
         Self {
-            controller_endpoint: String::new(),
-            ca_file: PathBuf::from("/etc/valkvork/ca.pem"),
+            controller_endpoint: "https://controlplane.valkvork.internal:50051".to_string(),
+            ca_file: Some(PathBuf::from("/etc/valkvork/ca.pem")),
+            tls_domain: None,
             join_token_file: PathBuf::from("/etc/valkvork/join-token"),
-            node_class: "default".to_string(),
+            node_class: "general".to_string(),
             data_dir: PathBuf::from("/var/lib/valkvork"),
             runtime: "docker".to_string(),
-            docker_socket: Some(PathBuf::from("/var/run/docker.sock")),
+            docker_socket: PathBuf::from("/var/run/docker.sock"),
+            registry_auth_file: PathBuf::from("/etc/valkvork/registry-auth.json"),
+            advertise_ip: None,
             reserved: ReservedResources::default(),
-            host_volumes: HashMap::new(),
-            registry_auth: None,
+            host_volumes: BTreeMap::new(),
         }
     }
 }
 
-/// Reserved resources configuration
+impl AgentConfig {
+    pub fn load(path: &Path) -> Result<Self, ValkvorkError> {
+        let cfg: Self = load_toml(path)?;
+        if cfg.runtime != "docker" {
+            return Err(ValkvorkError::Config(format!(
+                "runtime {:?} is not supported (only \"docker\" in this release)",
+                cfg.runtime
+            )));
+        }
+        parse_size(&cfg.reserved.memory)
+            .map_err(|e| ValkvorkError::Config(format!("reserved.memory: {e}")))?;
+        Ok(cfg)
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
 pub struct ReservedResources {
+    /// Cores kept back for the OS, dockerd and the agent.
     pub cpu: f64,
-    pub memory: String, // e.g., "384MiB"
+    pub memory: String,
 }
 
 impl Default for ReservedResources {
@@ -257,100 +201,89 @@ impl Default for ReservedResources {
     }
 }
 
-/// Host volume configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct HostVolume {
     pub path: PathBuf,
+    #[serde(default)]
     pub read_only: bool,
 }
 
-/// Registry authentication configuration
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RegistryAuth {
-    pub username: String,
-    pub password: String,
-}
-
 // ============================================================================
-// CLI Configuration
+// Helpers
 // ============================================================================
 
-/// CLI configuration
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CliConfig {
-    /// Controller endpoint
-    pub controller_endpoint: String,
-    
-    /// Admin token
-    pub admin_token: Option<String>,
-    
-    /// TLS configuration
-    pub tls: TlsConfig,
-    
-    /// Output format
-    pub output_format: String,
-    
-    /// Verbose mode
-    pub verbose: bool,
+fn load_toml<T: serde::de::DeserializeOwned>(path: &Path) -> Result<T, ValkvorkError> {
+    let content = std::fs::read_to_string(path)
+        .map_err(|e| ValkvorkError::Config(format!("cannot read {}: {e}", path.display())))?;
+    toml::from_str(&content).map_err(|e| ValkvorkError::Config(format!("{}: {e}", path.display())))
 }
 
-impl Default for CliConfig {
-    fn default() -> Self {
-        Self {
-            controller_endpoint: "https://localhost:50052".to_string(),
-            admin_token: None,
-            tls: TlsConfig::default(),
-            output_format: "table".to_string(),
-            verbose: false,
-        }
+fn resolve_secret(
+    name: &str,
+    inline: Option<&str>,
+    file: Option<&Path>,
+) -> Result<String, ValkvorkError> {
+    let value = match (file, inline) {
+        (Some(path), _) => std::fs::read_to_string(path)
+            .map_err(|e| {
+                ValkvorkError::Config(format!("cannot read {name} file {}: {e}", path.display()))
+            })?
+            .trim()
+            .to_string(),
+        (None, Some(v)) => v.trim().to_string(),
+        (None, None) => String::new(),
+    };
+    if value.is_empty() {
+        return Err(ValkvorkError::Config(format!(
+            "{name} (or {name}_file) must be set"
+        )));
     }
+    Ok(value)
 }
 
-// ============================================================================
-// Configuration loading
-// ============================================================================
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-use std::fs;
-use std::io::Read;
-use crate::errors::{ConfigError, ValkvorkError};
+    #[test]
+    fn agent_spec_example_parses() {
+        let cfg: AgentConfig = toml::from_str(
+            r#"
+controller_endpoint = "https://controlplane.valkvork.internal:50051"
+ca_file             = "/etc/valkvork/ca.pem"
+join_token_file     = "/etc/valkvork/join-token"
+node_class          = "general"
+data_dir            = "/var/lib/valkvork"
+runtime             = "docker"
+docker_socket       = "/var/run/docker.sock"
 
-/// Load controller configuration from TOML file
-pub fn load_controller_config(path: &PathBuf) -> Result<ControllerConfig, ValkvorkError> {
-    let content = fs::read_to_string(path)?;
-    let config: ControllerConfig = toml::from_str(&content)?;
-    Ok(config)
-}
+[reserved]
+cpu    = 0.25
+memory = "384MiB"
 
-/// Load agent configuration from TOML file
-pub fn load_agent_config(path: &PathBuf) -> Result<AgentConfig, ValkvorkError> {
-    let content = fs::read_to_string(path)?;
-    let config: AgentConfig = toml::from_str(&content)?;
-    Ok(config)
-}
-
-/// Load CLI configuration from environment or config file
-pub fn load_cli_config() -> Result<CliConfig, ValkvorkError> {
-    // Try to load from ~/.config/valkvork/config.toml
-    let home = std::env::var("HOME").unwrap_or_default();
-    let config_path = PathBuf::from(format!("{}/.config/valkvork/config.toml", home));
-    
-    if config_path.exists() {
-        let content = fs::read_to_string(&config_path)?;
-        let config: CliConfig = toml::from_str(&content)?;
-        Ok(config)
-    } else {
-        Ok(CliConfig::default())
+[host_volumes.pgdata]
+path      = "/data/pgdata"
+read_only = false
+"#,
+        )
+        .unwrap();
+        assert_eq!(
+            cfg.host_volumes["pgdata"].path,
+            PathBuf::from("/data/pgdata")
+        );
     }
-}
 
-/// Load join token from file
-pub fn load_join_token(path: &PathBuf) -> Result<String, ValkvorkError> {
-    let token = fs::read_to_string(path)?;
-    Ok(token.trim().to_string())
-}
+    #[test]
+    fn controller_minimal_parses() {
+        let cfg: ControllerConfig =
+            toml::from_str("join_token = \"j\"\nadmin_token = \"a\"\n").unwrap();
+        assert_eq!(cfg.node_unhealthy_timeout_seconds, 10);
+        assert_eq!(cfg.resolve_join_token().unwrap(), "j");
+    }
 
-/// Load admin token from file
-pub fn load_admin_token(path: &PathBuf) -> Result<String, ValkvorkError> {
-    let token = fs::read_to_string(path)?;
-    Ok(token.trim().to_string())
+    #[test]
+    fn unknown_key_rejected() {
+        assert!(toml::from_str::<ControllerConfig>("bogus = 1").is_err());
+    }
 }
