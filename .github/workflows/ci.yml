@@ -86,5 +86,5 @@ jobs:
         run: |
           for bin in dist/valkvork-controller dist/valkvork-agent dist/valkvork; do
             file "$bin"
-            file "$bin" | grep -q 'statically linked' || { echo "$bin is not statically linked"; exit 1; }
+            file "$bin" | grep -qE 'statically linked|static-pie linked' || { echo "$bin is not statically linked"; exit 1; }
           done
