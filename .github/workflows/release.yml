@@ -1,0 +1,268 @@
+name: Release
+
+# Every push to main publishes both images as `edge`, which also keeps the
+# build cache warm for releases.
+#
+# Pushing a tag vX.Y.Z (matching the crate versions) publishes both images for
+# amd64 and arm64 as X.Y.Z, X.Y and latest, and creates a GitHub release with
+# static binaries as valkvork-X.Y.Z-linux-<x86_64|aarch64>.tar.gz, the layout
+# the golden image installer downloads (valkvork_download_url). CI runs first,
+# unless it already passed on main for the tagged commit.
+#
+# Images:
+#   valkvlabs/valkvork-controller   controller + valkvork CLI
+#   valkvlabs/valkvork-agent        agent + valkvork CLI
+#
+# Requires two repository secrets:
+#   DOCKERHUB_USERNAME — Docker Hub username (valkvlabs)
+#   DOCKERHUB_TOKEN    — Docker Hub access token (hub.docker.com → Account Settings → Security)
+
+on:
+  push:
+    branches: [main]
+    tags:
+      - 'v[0-9]+.[0-9]+.[0-9]+'
+
+permissions:
+  contents: read
+
+jobs:
+  # ── Gate: all CI checks must pass before a release ───────────────────────────
+  ci-status:
+    name: Check CI on main
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-24.04
+    permissions:
+      actions: read
+    outputs:
+      passed: ${{ steps.check.outputs.passed }}
+    steps:
+      - name: Look for a passing run of this commit
+        id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          count=$(gh run list --repo "$GITHUB_REPOSITORY" --workflow ci.yml \
+            --branch main --event push --commit "$GITHUB_SHA" --status success \
+            --json databaseId --jq length)
+          echo "passed=$([ "$count" -gt 0 ] && echo true || echo false)" >> "$GITHUB_OUTPUT"
+
+  ci:
+    name: CI
+    needs: ci-status
+    if: ${{ needs.ci-status.result == 'success' && needs.ci-status.outputs.passed != 'true' }}
+    uses: ./.github/workflows/ci.yml
+
+  # The tag must match the crate versions: binaries report it in --version and
+  # the golden image installer checks it.
+  version:
+    name: Check tag matches crate versions
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Compare
+        run: |
+          want="${GITHUB_REF_NAME#v}"
+          for manifest in crates/*/Cargo.toml; do
+            have=$(sed -n 's/^version = "\(.*\)"$/\1/p' "$manifest" | head -1)
+            if [ "$have" != "$want" ]; then
+              echo "$manifest has version $have, tag is $want"
+              exit 1
+            fi
+          done
+
+  # ── Images ────────────────────────────────────────────────────────────────────
+  # Each platform builds on its own hardware, because compiling Rust under
+  # emulation takes hours. Both images and the raw binaries come from the same
+  # build stage, so the second and third builds reuse the first.
+  build:
+    name: Build ${{ matrix.arch }}
+    needs: [ci-status, ci, version]
+    if: ${{ !cancelled() && needs.ci-status.result != 'failure' && (needs.ci.result == 'success' || needs.ci.result == 'skipped') && (needs.version.result == 'success' || needs.version.result == 'skipped') }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            uname: x86_64
+            runner: ubuntu-24.04
+          - arch: arm64
+            uname: aarch64
+            runner: ubuntu-24.04-arm
+    env:
+      # The build record is not an archive the publish job can unpack, and
+      # nothing here reads it.
+      DOCKER_BUILD_RECORD_UPLOAD: "false"
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Image labels
+        id: labels
+        run: |
+          version="${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || format('edge-{0}', github.sha) }}"
+          {
+            echo 'value<<EOF'
+            echo "org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}"
+            echo "org.opencontainers.image.revision=${{ github.sha }}"
+            echo "org.opencontainers.image.version=$version"
+            echo "org.opencontainers.image.licenses=Apache-2.0"
+            echo EOF
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Build and push the controller by digest
+        id: controller
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          target: controller
+          platforms: linux/${{ matrix.arch }}
+          labels: ${{ steps.labels.outputs.value }}
+          outputs: type=image,name=valkvlabs/valkvork-controller,push-by-digest=true,name-canonical=true,push=true
+          cache-from: type=gha,scope=valkvork-${{ matrix.arch }}
+          cache-to: type=gha,scope=valkvork-${{ matrix.arch }},mode=max
+
+      - name: Build and push the agent by digest
+        id: agent
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          target: agent
+          platforms: linux/${{ matrix.arch }}
+          labels: ${{ steps.labels.outputs.value }}
+          outputs: type=image,name=valkvlabs/valkvork-agent,push-by-digest=true,name-canonical=true,push=true
+          cache-from: type=gha,scope=valkvork-${{ matrix.arch }}
+
+      - name: Export the binaries
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          target: export
+          platforms: linux/${{ matrix.arch }}
+          outputs: type=local,dest=dist
+          # Keep dist/ to the binaries (no provenance.json attestation file).
+          provenance: false
+          cache-from: type=gha,scope=valkvork-${{ matrix.arch }}
+
+      - name: Record the digests and package the binaries
+        run: |
+          mkdir -p digests
+          echo "${{ steps.controller.outputs.digest }}" > "digests/valkvork-controller-${{ matrix.arch }}"
+          echo "${{ steps.agent.outputs.digest }}" > "digests/valkvork-agent-${{ matrix.arch }}"
+          for bin in dist/valkvork-controller dist/valkvork-agent dist/valkvork; do
+            file "$bin" | grep -qE 'statically linked|static-pie linked' || { echo "$bin is not statically linked"; exit 1; }
+          done
+          version="${GITHUB_REF_NAME#v}"
+          [ "$GITHUB_REF_TYPE" = tag ] || version="edge"
+          mkdir -p tarballs
+          tar -C dist -czf "tarballs/valkvork-${version}-linux-${{ matrix.uname }}.tar.gz" \
+            valkvork-controller valkvork-agent valkvork
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: digests-${{ matrix.arch }}
+          path: digests/*
+          retention-days: 1
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: binaries-${{ matrix.arch }}
+          path: tarballs/*
+          retention-days: 7
+
+  publish:
+    name: Publish images
+    needs: build
+    if: ${{ !cancelled() && needs.build.result == 'success' }}
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: digests-*
+          path: digests
+          merge-multiple: true
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Join the platforms under one tag
+        run: |
+          if [ "$GITHUB_REF_TYPE" = tag ]; then
+            version="${GITHUB_REF_NAME#v}"
+            tags="$version ${version%.*} latest"
+          else
+            tags=edge
+          fi
+          for component in valkvork-controller valkvork-agent; do
+            image="valkvlabs/$component"
+            sources=""
+            for arch in amd64 arm64; do
+              sources="$sources $image@$(cat "digests/$component-$arch")"
+            done
+            args=""
+            for tag in $tags; do args="$args -t $image:$tag"; done
+            # shellcheck disable=SC2086
+            docker buildx imagetools create $args $sources
+            docker buildx imagetools inspect "$image:${tags%% *}"
+          done
+
+  # ── GitHub release ────────────────────────────────────────────────────────────
+  github-release:
+    name: Create GitHub Release
+    needs: publish
+    if: ${{ !cancelled() && needs.publish.result == 'success' && startsWith(github.ref, 'refs/tags/') }}
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: binaries-*
+          path: release
+          merge-multiple: true
+
+      - name: Checksums and notes
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          (cd release && sha256sum -- *.tar.gz > SHA256SUMS)
+          {
+            echo "## Docker images"
+            echo
+            echo '```'
+            echo "docker pull valkvlabs/valkvork-controller:$version"
+            echo "docker pull valkvlabs/valkvork-agent:$version"
+            echo '```'
+            echo
+            echo "## Static binaries"
+            echo
+            echo "\`valkvork-$version-linux-x86_64.tar.gz\` and \`valkvork-$version-linux-aarch64.tar.gz\`"
+            echo "contain \`valkvork-controller\`, \`valkvork-agent\` and \`valkvork\`. For the golden image:"
+            echo
+            echo '```'
+            echo "packer build -var orchestrator=valkvork -var valkvork_version=$version \\"
+            echo "  -var valkvork_download_url=${{ github.server_url }}/${{ github.repository }}/releases/download/$GITHUB_REF_NAME ."
+            echo '```'
+          } > notes.md
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          body_path: notes.md
+          generate_release_notes: true
+          files: |
+            release/*.tar.gz
+            release/SHA256SUMS

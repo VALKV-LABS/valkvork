@@ -1,0 +1,25 @@
+[package]
+name = "valkvork-common"
+version = "0.1.0"
+edition = "2021"
+authors = ["Valkvork Team"]
+description = "Common types and utilities for Valkvork"
+
+[dependencies]
+valkvork-proto = { path = "../valkvork-proto" }
+
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+toml = "0.7"
+tonic = { version = "0.10", features = ["tls"] }
+uuid = { version = "1.4", features = ["v4", "v5", "v7", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+thiserror = "1.0"
+regex = "1.10"
+sha2 = "0.10"
+hex = "0.4"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+
+[dev-dependencies]
+tempfile = "3.8"

@@ -1,0 +1,289 @@
+//! Configuration files for the controller and agent.
+//!
+//! Every field has a default so that a minimal file works; unknown keys are
+//! rejected so typos fail loudly at startup.
+
+use crate::errors::ValkvorkError;
+use crate::units::parse_size;
+use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
+use std::net::SocketAddr;
+use std::path::{Path, PathBuf};
+
+// ============================================================================
+// Controller
+// ============================================================================
+
+/// `/etc/valkvork/controller.toml`
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ControllerConfig {
+    /// Agent stream listener (FR-SEC-05: reachable from worker subnets only).
+    pub agent_listen_addr: SocketAddr,
+    /// Admin API / UI listener.
+    pub admin_listen_addr: SocketAddr,
+
+    /// Server certificate and key (PEM). When both are unset the controller
+    /// serves plaintext and logs a warning; only acceptable for development.
+    pub tls_cert_file: Option<PathBuf>,
+    pub tls_key_file: Option<PathBuf>,
+
+    pub database_path: PathBuf,
+
+    /// Join token for agents (FR-SEC-01). `join_token_file` wins when set.
+    pub join_token: Option<String>,
+    pub join_token_file: Option<PathBuf>,
+    /// Admin bearer token (FR-SEC-03). `admin_token_file` wins when set.
+    pub admin_token: Option<String>,
+    pub admin_token_file: Option<PathBuf>,
+
+    /// FR-CON-02
+    pub node_unhealthy_timeout_seconds: u64,
+    /// FR-CON-04
+    pub recovery_grace_period_seconds: u64,
+    pub heartbeat_interval_ms: u32,
+    /// FR-CON-09: resend a command once if not acked within this time.
+    pub command_timeout_seconds: u64,
+    /// FR-CON-09: ASSIGNED workloads must be RUNNING within this time.
+    pub start_timeout_seconds: u64,
+    /// FR-CON-05 reconcile tick.
+    pub reconcile_interval_seconds: u64,
+    /// FR-CON-01: in-memory heartbeat times are flushed this often.
+    pub heartbeat_flush_interval_seconds: u64,
+
+    pub autoscaler: AutoscalerConfig,
+}
+
+impl Default for ControllerConfig {
+    fn default() -> Self {
+        Self {
+            agent_listen_addr: "0.0.0.0:50051".parse().unwrap(),
+            admin_listen_addr: "0.0.0.0:50052".parse().unwrap(),
+            tls_cert_file: None,
+            tls_key_file: None,
+            database_path: PathBuf::from("/var/lib/valkvork/db/valkvork.db"),
+            join_token: None,
+            join_token_file: None,
+            admin_token: None,
+            admin_token_file: None,
+            node_unhealthy_timeout_seconds: 10,
+            recovery_grace_period_seconds: 30,
+            heartbeat_interval_ms: 2000,
+            command_timeout_seconds: 30,
+            start_timeout_seconds: 300,
+            reconcile_interval_seconds: 5,
+            heartbeat_flush_interval_seconds: 30,
+            autoscaler: AutoscalerConfig::default(),
+        }
+    }
+}
+
+impl ControllerConfig {
+    pub fn load(path: &Path) -> Result<Self, ValkvorkError> {
+        load_toml(path)
+    }
+
+    pub fn resolve_join_token(&self) -> Result<String, ValkvorkError> {
+        resolve_secret(
+            "join_token",
+            self.join_token.as_deref(),
+            self.join_token_file.as_deref(),
+        )
+    }
+
+    pub fn resolve_admin_token(&self) -> Result<String, ValkvorkError> {
+        resolve_secret(
+            "admin_token",
+            self.admin_token.as_deref(),
+            self.admin_token_file.as_deref(),
+        )
+    }
+}
+
+/// Autoscaler tuning (FR-AUT). Defaults are the spec values.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct AutoscalerConfig {
+    pub enabled: bool,
+    pub evaluation_interval_seconds: u64,
+    pub window_seconds: u64,
+    pub sustain_seconds: u64,
+    pub cooldown_seconds: u64,
+}
+
+impl Default for AutoscalerConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            evaluation_interval_seconds: 10,
+            window_seconds: 60,
+            sustain_seconds: 120,
+            cooldown_seconds: 180,
+        }
+    }
+}
+
+// ============================================================================
+// Agent
+// ============================================================================
+
+/// `/etc/valkvork/agent.toml` (spec §10.2).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct AgentConfig {
+    /// `https://host:50051` (TLS, verified against `ca_file`) or `http://`
+    /// for development.
+    pub controller_endpoint: String,
+    pub ca_file: Option<PathBuf>,
+    /// TLS server name to verify; defaults to the endpoint host.
+    pub tls_domain: Option<String>,
+    pub join_token_file: PathBuf,
+    pub node_class: String,
+    pub data_dir: PathBuf,
+    pub runtime: String,
+    pub docker_socket: PathBuf,
+    /// Docker config-format credentials (FR-AGE-04).
+    pub registry_auth_file: PathBuf,
+    /// Overrides the auto-detected address reported in `Register`.
+    pub advertise_ip: Option<String>,
+    pub reserved: ReservedResources,
+    pub host_volumes: BTreeMap<String, HostVolume>,
+}
+
+impl Default for AgentConfig {
+    fn default() -> Self {
+        Self {
+            controller_endpoint: "https://controlplane.valkvork.internal:50051".to_string(),
+            ca_file: Some(PathBuf::from("/etc/valkvork/ca.pem")),
+            tls_domain: None,
+            join_token_file: PathBuf::from("/etc/valkvork/join-token"),
+            node_class: "general".to_string(),
+            data_dir: PathBuf::from("/var/lib/valkvork"),
+            runtime: "docker".to_string(),
+            docker_socket: PathBuf::from("/var/run/docker.sock"),
+            registry_auth_file: PathBuf::from("/etc/valkvork/registry-auth.json"),
+            advertise_ip: None,
+            reserved: ReservedResources::default(),
+            host_volumes: BTreeMap::new(),
+        }
+    }
+}
+
+impl AgentConfig {
+    pub fn load(path: &Path) -> Result<Self, ValkvorkError> {
+        let cfg: Self = load_toml(path)?;
+        if cfg.runtime != "docker" {
+            return Err(ValkvorkError::Config(format!(
+                "runtime {:?} is not supported (only \"docker\" in this release)",
+                cfg.runtime
+            )));
+        }
+        parse_size(&cfg.reserved.memory)
+            .map_err(|e| ValkvorkError::Config(format!("reserved.memory: {e}")))?;
+        Ok(cfg)
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ReservedResources {
+    /// Cores kept back for the OS, dockerd and the agent.
+    pub cpu: f64,
+    pub memory: String,
+}
+
+impl Default for ReservedResources {
+    fn default() -> Self {
+        Self {
+            cpu: 0.25,
+            memory: "384MiB".to_string(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HostVolume {
+    pub path: PathBuf,
+    #[serde(default)]
+    pub read_only: bool,
+}
+
+// ============================================================================
+// Helpers
+// ============================================================================
+
+fn load_toml<T: serde::de::DeserializeOwned>(path: &Path) -> Result<T, ValkvorkError> {
+    let content = std::fs::read_to_string(path)
+        .map_err(|e| ValkvorkError::Config(format!("cannot read {}: {e}", path.display())))?;
+    toml::from_str(&content).map_err(|e| ValkvorkError::Config(format!("{}: {e}", path.display())))
+}
+
+fn resolve_secret(
+    name: &str,
+    inline: Option<&str>,
+    file: Option<&Path>,
+) -> Result<String, ValkvorkError> {
+    let value = match (file, inline) {
+        (Some(path), _) => std::fs::read_to_string(path)
+            .map_err(|e| {
+                ValkvorkError::Config(format!("cannot read {name} file {}: {e}", path.display()))
+            })?
+            .trim()
+            .to_string(),
+        (None, Some(v)) => v.trim().to_string(),
+        (None, None) => String::new(),
+    };
+    if value.is_empty() {
+        return Err(ValkvorkError::Config(format!(
+            "{name} (or {name}_file) must be set"
+        )));
+    }
+    Ok(value)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn agent_spec_example_parses() {
+        let cfg: AgentConfig = toml::from_str(
+            r#"
+controller_endpoint = "https://controlplane.valkvork.internal:50051"
+ca_file             = "/etc/valkvork/ca.pem"
+join_token_file     = "/etc/valkvork/join-token"
+node_class          = "general"
+data_dir            = "/var/lib/valkvork"
+runtime             = "docker"
+docker_socket       = "/var/run/docker.sock"
+
+[reserved]
+cpu    = 0.25
+memory = "384MiB"
+
+[host_volumes.pgdata]
+path      = "/data/pgdata"
+read_only = false
+"#,
+        )
+        .unwrap();
+        assert_eq!(
+            cfg.host_volumes["pgdata"].path,
+            PathBuf::from("/data/pgdata")
+        );
+    }
+
+    #[test]
+    fn controller_minimal_parses() {
+        let cfg: ControllerConfig =
+            toml::from_str("join_token = \"j\"\nadmin_token = \"a\"\n").unwrap();
+        assert_eq!(cfg.node_unhealthy_timeout_seconds, 10);
+        assert_eq!(cfg.resolve_join_token().unwrap(), "j");
+    }
+
+    #[test]
+    fn unknown_key_rejected() {
+        assert!(toml::from_str::<ControllerConfig>("bogus = 1").is_err());
+    }
+}
