@@ -150,6 +150,8 @@ jobs:
           target: export
           platforms: linux/${{ matrix.arch }}
           outputs: type=local,dest=dist
+          # Keep dist/ to the binaries (no provenance.json attestation file).
+          provenance: false
           cache-from: type=gha,scope=valkvork-${{ matrix.arch }}
 
       - name: Record the digests and package the binaries
@@ -157,7 +159,7 @@ jobs:
           mkdir -p digests
           echo "${{ steps.controller.outputs.digest }}" > "digests/valkvork-controller-${{ matrix.arch }}"
           echo "${{ steps.agent.outputs.digest }}" > "digests/valkvork-agent-${{ matrix.arch }}"
-          for bin in dist/*; do
+          for bin in dist/valkvork-controller dist/valkvork-agent dist/valkvork; do
             file "$bin" | grep -q 'statically linked' || { echo "$bin is not statically linked"; exit 1; }
           done
           version="${GITHUB_REF_NAME#v}"
