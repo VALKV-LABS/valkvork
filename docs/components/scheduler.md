@@ -49,6 +49,10 @@ NO_NODE: host volume pgdata missing on 3
 
 It is retried on every pass, so it is placed as soon as capacity appears. Unplaced workloads are counted in `valkvork_pending_unplaced_workloads{class}`, the signal for adding nodes (spec §10.4).
 
+## Pinning and Volumes in Practice
+
+Node class is the only placement label, and host volumes pin a service to the nodes that declare them. [placement-and-storage.md](../placement-and-storage.md) shows how to pin to one VM, and what happens to a host-volume service when its node fails.
+
 ## Static Host Ports
 
 Workloads use Docker's bridge network with static host-port mappings (FR-NET-01). A node can run only one workload per host port, so a service with a `host_port` can have at most one replica per eligible node. `plan` reports this as `placement: 1/3 workloads placeable` before you apply.

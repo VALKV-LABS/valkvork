@@ -17,3 +17,9 @@ What is not built yet. The rest of the [spec](spec.md)'s MVP scope is implemente
    workloads STOPPED. The spec does not define this yet.
 8. **Docker daemon settings in the golden image** to match FR-AGE-01: the `local` log driver
    (the image uses `json-file`) and `native.cgroupdriver=systemd` set explicitly.
+9. **Updates for services on a single-node host volume.** Rolling updates and drains start the new
+   workload before stopping the old one (FR-CON-07), so a service whose host volume exists on one
+   node can never complete a rollout (the replacement stays PENDING), and start-first would briefly
+   run two processes on one data directory. Add a stop-first update order (for example
+   `[update] order = "stop-first"`, or automatic for writable host volumes). Until then: delete and
+   re-apply. See docs/placement-and-storage.md.

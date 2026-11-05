@@ -1,0 +1,32 @@
+# Postgres with its data on the "pgdata" host volume (spec §6.3).
+#
+# Host volumes are node-local. Keep replicas = 1, and declare [host_volumes.pgdata]
+# on exactly one node (or pin with required_class): if two nodes declared it, a
+# replacement after a node failure could start on the other node with an empty
+# data directory. If the node dies, the workload waits until it returns and is
+# then re-adopted with its data. Valkvork does not move or reattach disks.
+[service]
+id           = "postgres-main"
+image        = "docker.io/library/postgres:16.4"
+replicas     = 1
+kill_timeout = "60s"         # let Postgres shut down cleanly
+
+[resources]
+cpu    = 1.0
+memory = "1GiB"
+
+[[ports]]
+name           = "postgres"
+container_port = 5432
+host_port      = 15432
+
+[[volumes]]
+type   = "host"
+source = "pgdata"
+target = "/var/lib/postgresql/data"
+
+[env]
+# Development only: manifests are stored in plaintext, so never put a real
+# password here (FR-SEC-04). This lets local clients connect without one.
+POSTGRES_HOST_AUTH_METHOD = "trust"
+PGDATA                    = "/var/lib/postgresql/data/pgdata"

@@ -81,6 +81,7 @@ Every key, the validation rules and how changes roll out: [docs/components/manif
 |---|---|
 | [architecture.md](docs/architecture.md) | Processes, ports, where state lives, each operation step by step, failure behaviour |
 | [components/](docs/components/index.md) | Controller core, state store, reconciler, scheduler, node health, autoscaler, admin API, web UI, metrics, agent, agent stream, supervisor, container runtime, manifests, CLI, configuration, security |
+| [placement-and-storage.md](docs/placement-and-storage.md) | Pinning services to nodes, host volumes, and what happens to data on node failure |
 | [local-development.md](docs/local-development.md) | Running a cluster on your machine |
 | [deployment.md](docs/deployment.md) | Artefacts and releases, the golden image, systemd, the production layout, upgrades |
 | [spec.md](spec.md) | The product and technical specification; requirement IDs such as `FR-CON-03` refer to it |

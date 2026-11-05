@@ -38,6 +38,7 @@
 
 | Doc | Covers |
 |-----|--------|
+| [placement-and-storage.md](../placement-and-storage.md) | Node classes and pinning, host volumes, what happens to data when a node fails |
 | [local-development.md](../local-development.md) | `make dev-up`: a controller and an agent on your machine against local Docker |
 | [deployment.md](../deployment.md) | Static binaries, images, the golden image, systemd units, production layout |
 | [NEXT_STEPS.md](../../NEXT_STEPS.md) | What is not built yet |

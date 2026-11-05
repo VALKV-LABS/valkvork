@@ -49,6 +49,9 @@ curl -s http://localhost:18080/          # nginx from examples/web.toml
 | Drain | Nodes page → Drain, or `valkvork node drain <id>` | on one node replacements cannot be placed, so workloads stay put and show `NO_NODE` replacements until you undrain |
 | Validation | `valkvork plan -f` on a manifest with a typo | exit code 2 and the field path, for example `UNKNOWN_FIELD at service.replica` |
 | Events and audit | Events page, or `valkvork events --kind AUDIT` | every UI and CLI action, with actor `cli` or `ui:<session>` |
+| Host volumes | `valkvork apply -f examples/static-site.toml`, then `curl http://localhost:18081/` | nginx serves `.dev/volumes/site/`; edits on the host show up at once |
+| Data across workloads | [placement-and-storage.md](placement-and-storage.md#try-it-locally) | a Postgres row survives deleting and re-applying the service |
+| Pinning | `valkvork apply -f examples/pinned.toml` | PENDING with `NO_NODE: no healthy nodes in class db`, until you run `VALKVORK_DEV_NODE_CLASS=db make dev-up` |
 | Metrics | `curl -s http://127.0.0.1:9400/metrics`, `curl -s http://127.0.0.1:9401/metrics` | controller and agent Prometheus series |
 
 ## Managing the dev cluster
@@ -64,6 +67,8 @@ curl -s http://localhost:18080/          # nginx from examples/web.toml
 `dev-reset` only removes containers whose `/alloc` directory is under this
 repository's `.dev/data`; Valkvork containers from anything else on the same
 Docker are left alone.
+
+`make dev-up` declares the host volumes `site` and `pgdata` (in `.dev/volumes/`) and node class `general`. Change them with `VALKVORK_DEV_HOST_VOLUMES` (comma separated) and `VALKVORK_DEV_NODE_CLASS`, then `make dev-down && make dev-up`.
 
 Ports default to 50051 (agents), 50052 (admin API and UI), 9400 and 9401
 (metrics). Override them with `VALKVORK_DEV_AGENT_PORT`,

@@ -1,0 +1,24 @@
+# nginx serving files from the "site" host volume, read-only.
+#
+# Placed only on nodes whose agent.toml declares [host_volumes.site]. The data
+# is that node's directory: it does not follow the workload to another node.
+# With `make dev-up` the volume is .dev/volumes/site/.
+[service]
+id       = "static-site"
+image    = "docker.io/library/nginx:1.27-alpine"
+replicas = 1
+
+[resources]
+cpu    = 0.1
+memory = "32MiB"
+
+[[ports]]
+name           = "http"
+container_port = 80
+host_port      = 18081
+
+[[volumes]]
+type      = "host"
+source    = "site"                       # name from [host_volumes.site] in agent.toml
+target    = "/usr/share/nginx/html"
+read_only = true

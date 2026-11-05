@@ -15,6 +15,10 @@ ADMIN_PORT="${VALKVORK_DEV_ADMIN_PORT:-50052}"
 AGENT_PORT="${VALKVORK_DEV_AGENT_PORT:-50051}"
 METRICS_PORT="${VALKVORK_DEV_METRICS_PORT:-9400}"
 AGENT_METRICS_PORT="${VALKVORK_DEV_AGENT_METRICS_PORT:-9401}"
+# The agent's node_class, matched by manifests' [constraints] required_class.
+NODE_CLASS="${VALKVORK_DEV_NODE_CLASS:-general}"
+# Host volumes to declare, comma separated; each is a directory .dev/volumes/<name>.
+HOST_VOLUMES="${VALKVORK_DEV_HOST_VOLUMES:-site,pgdata}"
 
 log() { printf '\033[1m==>\033[0m %s\n' "$*"; }
 die() { printf 'error: %s\n' "$*" >&2; exit 1; }
@@ -80,7 +84,7 @@ EOF
 controller_endpoint = "https://localhost:$AGENT_PORT"
 ca_file             = "$DEV/tls/ca.pem"
 join_token_file     = "$DEV/join-token"
-node_class          = "general"
+node_class          = "$NODE_CLASS"
 data_dir            = "$DEV/data"
 docker_socket       = "$(docker_socket)"
 registry_auth_file  = "$DEV/registry-auth.json"
@@ -90,6 +94,21 @@ metrics_listen_addr = "127.0.0.1:$AGENT_METRICS_PORT"
 cpu    = 0.5
 memory = "512MiB"
 EOF
+
+  # Host volumes (FR-STO-02). Under .dev/ so a Docker VM (Colima, Docker
+  # Desktop) can see them, because the agent bind-mounts them by host path.
+  local vol
+  IFS=',' read -ra vols <<< "$HOST_VOLUMES"
+  for vol in "${vols[@]}"; do
+    [ -n "$vol" ] || continue
+    [[ "$vol" =~ ^[a-z0-9_-]+$ ]] || die "invalid host volume name '$vol'"
+    mkdir -p "$DEV/volumes/$vol"
+    printf '\n[host_volumes.%s]\npath      = "%s"\nread_only = false\n' "$vol" "$DEV/volumes/$vol" >> "$DEV/agent.toml"
+  done
+  # Content for examples/static-site.toml, written once so edits survive.
+  if [ -d "$DEV/volumes/site" ] && [ ! -f "$DEV/volumes/site/index.html" ]; then
+    printf '<!doctype html><title>Valkvork</title><h1>Served from the "site" host volume</h1>\n<p>Edit .dev/volumes/site/index.html and reload.</p>\n' > "$DEV/volumes/site/index.html"
+  fi
 }
 
 env_lines() {
@@ -145,6 +164,7 @@ Web UI:  https://localhost:$ADMIN_PORT/ui/
            $(cat "$DEV/admin-token")
 
 CLI:     eval "\$(make -s env)"   # then: valkvork status, valkvork apply -f examples/web.toml
+Node:    class "$NODE_CLASS", host volumes: ${HOST_VOLUMES:-none} (in .dev/volumes/)
 Metrics: http://127.0.0.1:$METRICS_PORT/metrics (controller), http://127.0.0.1:$AGENT_METRICS_PORT/metrics (agent)
 Stop:    make dev-down        Wipe state and containers: make dev-reset
 EOF
