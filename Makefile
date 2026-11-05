@@ -16,10 +16,11 @@ PLATFORM ?= linux/$(shell uname -m | sed -e 's/x86_64/amd64/' -e 's/aarch64/arm6
 
 .PHONY: help build build-release test test-unit fmt fmt-check check ci \
         dev-up dev-down dev-status dev-logs dev-reset env demo ui \
+        dev-add-node dev-stop-node dev-remove-node \
         dist image clean
 
 help:  ## Show this help
-	@awk 'BEGIN {FS = ":.*## "} /^[a-zA-Z_-]+:.*## / {printf "  \033[36m%-14s\033[0m %s\n", $$1, $$2}' $(MAKEFILE_LIST)
+	@awk 'BEGIN {FS = ":.*## "} /^[a-zA-Z_-]+:.*## / {printf "  \033[36m%-17s\033[0m %s\n", $$1, $$2}' $(MAKEFILE_LIST)
 
 # ── Build and test ───────────────────────────────────────────────────────────
 
@@ -61,6 +62,17 @@ dev-logs:  ## Follow controller and agent logs
 
 dev-reset:  ## Stop, remove the dev cluster's containers, delete .dev/
 	@scripts/dev.sh reset
+
+NAME ?= node2
+
+dev-add-node:  ## Add a node (NAME=node2): a Colima VM with its own Docker, plus an agent
+	@scripts/dev.sh add-node $(NAME)
+
+dev-stop-node:  ## Stop a node's agent (NAME=node2); its containers keep running, as in a partition
+	@scripts/dev.sh stop-node $(NAME)
+
+dev-remove-node:  ## Drain a node (NAME=node2), then stop and remove it; FORCE=1 skips the drain
+	@VALKVORK_DEV_FORCE=$(FORCE) scripts/dev.sh remove-node $(NAME)
 
 env:  ## Print CLI env vars, use: eval "$(make -s env)"
 	@scripts/dev.sh env

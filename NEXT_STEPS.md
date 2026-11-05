@@ -32,3 +32,10 @@ What is not built yet. The rest of the [spec](spec.md)'s MVP scope is implemente
      `docs/placement-and-storage.md` section that documents today's workaround.
    - *Until then:* `valkvork delete service <id>`, wait until it is gone, then apply again. The
      data stays in the volume.
+10. **Writable `/alloc` for non-root containers.** The agent creates each workload's alloc
+    directory as `root 0755`, so an image that runs as a non-root user cannot write to `/alloc`.
+    Options: create it world-writable with the sticky bit (`1777`), or chown it to the image's
+    `USER` read from the image config.
+11. **Container hardening options** for less trusted images: a PID limit, `no-new-privileges`,
+    capability drops and a read-only root filesystem, as manifest settings or agent defaults.
+    Today containers get Docker's defaults (see docs/components/security.md#process-permissions).

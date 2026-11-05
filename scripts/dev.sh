@@ -3,6 +3,10 @@
 # driving the local Docker Engine. State lives in .dev/ (gitignored).
 #
 #   scripts/dev.sh up | down | status | env | logs | reset
+#   scripts/dev.sh add-node [name] | stop-node <name> | remove-node <name>
+#
+# Extra nodes each need their own Docker daemon: by default a Colima VM
+# profile named after the node, or VALKVORK_DEV_NODE_SOCKET.
 #
 # TLS is on, with a throwaway CA, so the setup matches production. Containers
 # the agent starts are ordinary Docker containers labelled valkvork.*.
@@ -19,11 +23,21 @@ AGENT_METRICS_PORT="${VALKVORK_DEV_AGENT_METRICS_PORT:-9401}"
 NODE_CLASS="${VALKVORK_DEV_NODE_CLASS:-general}"
 # Host volumes to declare, comma separated; each is a directory .dev/volumes/<name>.
 HOST_VOLUMES="${VALKVORK_DEV_HOST_VOLUMES:-site,pgdata}"
+# Extra nodes (add-node): Colima VM size. Their class and volumes come from
+# VALKVORK_DEV_NODE_CLASS_EXTRA (default general) and VALKVORK_DEV_NODE_VOLUMES (default none).
+VALKVORK_DEV_NODE_CPUS="${VALKVORK_DEV_NODE_CPUS:-2}"
+VALKVORK_DEV_NODE_MEMORY="${VALKVORK_DEV_NODE_MEMORY:-2}"
 
 log() { printf '\033[1m==>\033[0m %s\n' "$*"; }
 die() { printf 'error: %s\n' "$*" >&2; exit 1; }
 
 docker_socket() {
+  # Once the dev cluster exists, the first node keeps the socket it started with,
+  # whatever the active Docker context is now.
+  if [ -f "$DEV/agent.toml" ]; then
+    sed -n 's/^docker_socket *= *"\(.*\)"$/\1/p' "$DEV/agent.toml"
+    return
+  fi
   # Respect DOCKER_HOST, then the active context (Colima, Docker Desktop, OrbStack …).
   local host="${DOCKER_HOST:-}"
   [ -n "$host" ] || host="$(docker context inspect --format '{{.Endpoints.docker.Host}}' 2>/dev/null || true)"
@@ -95,20 +109,27 @@ cpu    = 0.5
 memory = "512MiB"
 EOF
 
-  # Host volumes (FR-STO-02). Under .dev/ so a Docker VM (Colima, Docker
-  # Desktop) can see them, because the agent bind-mounts them by host path.
-  local vol
-  IFS=',' read -ra vols <<< "$HOST_VOLUMES"
-  for vol in "${vols[@]}"; do
-    [ -n "$vol" ] || continue
-    [[ "$vol" =~ ^[a-z0-9_-]+$ ]] || die "invalid host volume name '$vol'"
-    mkdir -p "$DEV/volumes/$vol"
-    printf '\n[host_volumes.%s]\npath      = "%s"\nread_only = false\n' "$vol" "$DEV/volumes/$vol" >> "$DEV/agent.toml"
-  done
+  render_volumes "$DEV/agent.toml" "$DEV/volumes" "$HOST_VOLUMES"
   # Content for examples/static-site.toml, written once so edits survive.
   if [ -d "$DEV/volumes/site" ] && [ ! -f "$DEV/volumes/site/index.html" ]; then
     printf '<!doctype html><title>Valkvork</title><h1>Served from the "site" host volume</h1>\n<p>Edit .dev/volumes/site/index.html and reload.</p>\n' > "$DEV/volumes/site/index.html"
   fi
+}
+
+# render_volumes <agent.toml> <volumes dir> <comma-separated names>
+# Host volumes (FR-STO-02) live under .dev/ so a Docker VM (Colima, Docker
+# Desktop) can see them: the agent bind-mounts them by host path.
+render_volumes() {
+  local file="$1" dir="$2" vol
+  [ -n "$3" ] || return 0   # bash 3.2 treats an empty array as unbound under set -u
+  local -a vols
+  IFS=',' read -ra vols <<< "$3"
+  for vol in "${vols[@]}"; do
+    [ -n "$vol" ] || continue
+    [[ "$vol" =~ ^[a-z0-9_-]+$ ]] || die "invalid host volume name '$vol'"
+    mkdir -p "$dir/$vol"
+    printf '\n[host_volumes.%s]\npath      = "%s"\nread_only = false\n' "$vol" "$dir/$vol" >> "$file"
+  done
 }
 
 env_lines() {
@@ -180,17 +201,19 @@ stop_one() {
 }
 
 down() {
-  # The agent goes first; containers keep running, as they would in production.
+  # Agents go first; containers keep running, as they would in production.
+  local n name
+  for name in $(node_names); do stop_one "nodes/$name/agent"; done
   stop_one agent
   stop_one controller
-  local n
   n=$(dev_containers | wc -l | tr -d ' ')
   [ "$n" = 0 ] || [ "${1:-}" = quiet ] || log "$n Valkvork container(s) left running; 'make dev-up' re-adopts them, 'make dev-reset' removes them"
 }
 
 status() {
-  for p in controller agent; do
-    if running "$p"; then printf '  %-11s running (pid %s)\n' "$p" "$(cat "$DEV/$p.pid")"; else printf '  %-11s stopped\n' "$p"; fi
+  local p
+  for p in controller agent $(node_names | sed 's|^|nodes/|; s|$|/agent|'); do
+    if running "$p"; then printf '  %-22s running (pid %s)\n' "${p%/agent}" "$(cat "$DEV/$p.pid")"; else printf '  %-22s stopped\n' "${p%/agent}"; fi
   done
   if running controller && [ -x "$BIN/valkvork" ]; then
     eval "$(env_lines)"
@@ -201,21 +224,174 @@ status() {
   fi
 }
 
-# Containers this dev agent created: labelled, with /alloc under .dev/data.
-# Valkvork containers from any other cluster on this Docker are left alone.
+# dev_containers [docker socket] [data dir]
+# Containers a dev agent created: labelled, with /alloc under its data dir.
+# Valkvork containers from anything else on that Docker are left alone.
 dev_containers() {
-  local id
-  for id in $(docker ps -aq --filter label=valkvork.workload_id 2>/dev/null); do
-    docker inspect --format '{{range .Mounts}}{{.Source}} {{end}}' "$id" 2>/dev/null \
-      | grep -q "$DEV/data/" && echo "$id"
+  local sock="${1:-$(docker_socket)}" data="${2:-$DEV/data}" id
+  for id in $(docker -H "unix://$sock" ps -aq --filter label=valkvork.workload_id 2>/dev/null); do
+    docker -H "unix://$sock" inspect --format '{{range .Mounts}}{{.Source}} {{end}}' "$id" 2>/dev/null \
+      | grep -q "$data/" && echo "$id"
   done
   return 0
 }
 
+# ---------------------------------------------------------------------------
+# Extra nodes
+# ---------------------------------------------------------------------------
+
+node_names() {
+  [ -d "$DEV/nodes" ] || return 0
+  find "$DEV/nodes" -mindepth 1 -maxdepth 1 -type d -exec basename {} \; | sort
+}
+
+wait_registered() {  # <log> <first new line> <pid name>
+  for _ in $(seq 100); do
+    tail -n +"$(($2 + 1))" "$1" 2>/dev/null | grep -q 'registered with controller' && return 0
+    running "$3" || { tail -20 "$1" >&2; die "agent exited"; }
+    sleep 0.2
+  done
+  tail -20 "$1" >&2
+  die "agent did not register within 20 s"
+}
+
+add_node() {
+  local name="${1:-node2}"
+  [[ "$name" =~ ^[a-z0-9][a-z0-9-]*$ ]] || die "node name must be lowercase letters, digits and dashes"
+  [ "$name" != default ] || die "'default' is Colima's own profile, used by the first node"
+  running controller || die "the dev cluster is not running; run 'make dev-up' first"
+  local dir="$DEV/nodes/$name" sock
+  mkdir -p "$dir/data"
+
+  if running "nodes/$name/agent"; then
+    log "Node $name already running (pid $(cat "$dir/agent.pid"))"
+    return 0
+  fi
+
+  # Each node needs its own Docker daemon: an agent manages every
+  # Valkvork-labelled container on its Docker, so two agents must not share one.
+  if [ -n "${VALKVORK_DEV_NODE_SOCKET:-}" ]; then
+    sock="$VALKVORK_DEV_NODE_SOCKET"
+  else
+    command -v colima >/dev/null || die "an extra node needs its own Docker daemon: install Colima, or set VALKVORK_DEV_NODE_SOCKET to another daemon's socket"
+    if ! colima status --profile "$name" >/dev/null 2>&1; then
+      log "Starting Colima VM '$name' ($VALKVORK_DEV_NODE_CPUS CPUs, $VALKVORK_DEV_NODE_MEMORY GiB); the first start takes a minute or two"
+      # colima start switches the active Docker context; put the operator's back.
+      local context
+      context=$(docker context show 2>/dev/null || true)
+      colima start --profile "$name" --cpu "$VALKVORK_DEV_NODE_CPUS" --memory "$VALKVORK_DEV_NODE_MEMORY" --disk 20
+      [ -z "$context" ] || docker context use "$context" >/dev/null
+    fi
+    sock="$HOME/.colima/$name/docker.sock"
+  fi
+  [ -S "$sock" ] || die "no Docker socket at $sock"
+  [ "$sock" != "$(docker_socket)" ] || die "$sock is the first node's Docker; each node needs its own daemon"
+  echo "$sock" > "$dir/docker.sock.path"
+
+  # A metrics port of its own, kept across restarts.
+  if [ ! -f "$dir/metrics_port" ]; then
+    local port=$((AGENT_METRICS_PORT + 1)) taken
+    while :; do
+      taken=$(cat "$DEV"/nodes/*/metrics_port 2>/dev/null | grep -cx "$port" || true)
+      [ "$taken" = 0 ] && ! listening "$port" && break
+      port=$((port + 1))
+    done
+    echo "$port" > "$dir/metrics_port"
+  fi
+  local mport class="${VALKVORK_DEV_NODE_CLASS_EXTRA:-general}"
+  mport=$(cat "$dir/metrics_port")
+
+  cat > "$dir/agent.toml" <<EOF
+# Generated by scripts/dev.sh add-node $name
+controller_endpoint = "https://localhost:$AGENT_PORT"
+ca_file             = "$DEV/tls/ca.pem"
+join_token_file     = "$DEV/join-token"
+node_class          = "$class"
+data_dir            = "$dir/data"
+docker_socket       = "$sock"
+registry_auth_file  = "$DEV/registry-auth.json"
+metrics_listen_addr = "127.0.0.1:$mport"
+
+[reserved]
+cpu    = 0.25
+memory = "256MiB"
+EOF
+  render_volumes "$dir/agent.toml" "$dir/volumes" "${VALKVORK_DEV_NODE_VOLUMES:-}"
+
+  log "Starting the agent for $name (log: .dev/nodes/$name/agent.log)"
+  local since=0
+  [ -f "$dir/agent.log" ] && since=$(wc -l < "$dir/agent.log")
+  # On macOS the agent takes its hostname from $HOSTNAME, so each node shows its own name.
+  HOSTNAME="$name" RUST_LOG="${RUST_LOG:-info}" nohup "$BIN/valkvork-agent" --config "$dir/agent.toml" \
+    >> "$dir/agent.log" 2>&1 < /dev/null &
+  echo $! > "$dir/agent.pid"
+  wait_registered "$dir/agent.log" "$since" "nodes/$name/agent"
+  log "Node $name registered: class \"$class\", node id $(cat "$dir/data/node_id"), metrics 127.0.0.1:$mport"
+  status
+  cat <<EOF
+
+Try:   valkvork scale service api 6          # new replicas go to the least-allocated node
+       make dev-stop-node NAME=$name          # agent gone: UNHEALTHY after 10 s, replacements elsewhere
+       make dev-add-node NAME=$name           # back: lost copies stopped or re-adopted (FR-CON-03)
+       make dev-remove-node NAME=$name        # drain, then remove
+EOF
+}
+
+stop_node() {
+  local name="${1:?usage: stop-node <name>}"
+  [ -d "$DEV/nodes/$name" ] || die "no node $name"
+  stop_one "nodes/$name/agent"
+  log "Agent for $name stopped; its containers keep running. The controller marks it UNHEALTHY after 10 s."
+}
+
+remove_node() {
+  local name="${1:?usage: remove-node <name>}"
+  local dir="$DEV/nodes/$name"
+  [ -d "$dir" ] || die "no node $name"
+  local id sock
+  id=$(cat "$dir/data/node_id" 2>/dev/null || true)
+  sock=$(cat "$dir/docker.sock.path" 2>/dev/null || true)
+  if [ -n "${VALKVORK_DEV_FORCE:-}" ]; then
+    log "FORCE: skipping the drain; $name's workloads go LOST and are replaced where they fit, as if the VM died"
+  elif [ -n "$id" ] && running controller && running "nodes/$name/agent"; then
+    eval "$(env_lines)"
+    log "Draining $name; its workloads move to other nodes first"
+    "$BIN/valkvork" node drain "$id" >/dev/null
+    local left
+    for _ in $(seq 120); do
+      left=$("$BIN/valkvork" workloads --node "$id" 2>/dev/null | awk 'NR>1 && $5!="STOPPED" && $5!="FAILED"' | wc -l | tr -d ' ')
+      [ "$left" = 0 ] && break
+      sleep 1
+    done
+    if [ "$left" != 0 ]; then
+      log "$left workload(s) could not leave $name. Their replacements wait with:"
+      "$BIN/valkvork" workloads --status PENDING | awk 'NR > 1 {$1 = substr($1, 1, 8); print "    " $0}'
+      die "$name stays drained. Free room elsewhere, undrain it (valkvork node undrain $id), or remove it anyway with FORCE=1"
+    fi
+  fi
+  stop_one "nodes/$name/agent"
+  if [ -n "$sock" ] && [ -S "$sock" ]; then
+    local ids
+    ids=$(dev_containers "$sock" "$dir/data")
+    # shellcheck disable=SC2086
+    [ -z "$ids" ] || docker -H "unix://$sock" rm -f $ids >/dev/null
+  fi
+  rm -rf "${DEV:?}/nodes/${name:?}"
+  log "Removed $name. The controller keeps it listed as UNHEALTHY (node removal is not built yet)."
+  [ -n "${VALKVORK_DEV_NODE_SOCKET:-}" ] || log "Its Colima VM is still running: 'colima stop --profile $name' (or 'colima delete --profile $name')"
+}
+
 reset() {
-  local ids
+  local ids name sock extra
   ids=$(dev_containers)
   down quiet
+  for name in $(node_names); do
+    sock=$(cat "$DEV/nodes/$name/docker.sock.path" 2>/dev/null || true)
+    [ -n "$sock" ] && [ -S "$sock" ] || continue
+    extra=$(dev_containers "$sock" "$DEV/nodes/$name/data")
+    # shellcheck disable=SC2086
+    [ -z "$extra" ] || { log "Removing $(echo "$extra" | wc -l | tr -d ' ') container(s) on $name"; docker -H "unix://$sock" rm -f $extra >/dev/null; }
+  done
   if [ -n "$ids" ]; then
     log "Removing Valkvork containers: $(echo "$ids" | wc -l | tr -d ' ')"
     # shellcheck disable=SC2086
@@ -223,6 +399,9 @@ reset() {
   fi
   log "Deleting .dev/"
   rm -rf "$DEV"
+  for name in $(colima list 2>/dev/null | awk 'NR > 1 && $1 != "default" && $2 == "Running" {print $1}'); do
+    log "Colima VM '$name' is still running: 'colima stop --profile $name' to stop it"
+  done
 }
 
 case "${1:-}" in
@@ -232,5 +411,8 @@ case "${1:-}" in
   env) [ -f "$DEV/admin-token" ] || die "no dev cluster yet; run 'make dev-up'"; env_lines ;;
   logs) touch "$DEV/controller.log" "$DEV/agent.log"; tail -n 50 -F "$DEV/controller.log" "$DEV/agent.log" ;;
   reset) reset ;;
-  *) die "usage: $0 up|down|status|env|logs|reset" ;;
+  add-node) add_node "${2:-}" ;;
+  stop-node) stop_node "${2:-}" ;;
+  remove-node) remove_node "${2:-}" ;;
+  *) die "usage: $0 up|down|status|env|logs|reset|add-node [name]|stop-node <name>|remove-node <name>" ;;
 esac

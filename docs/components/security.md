@@ -13,6 +13,99 @@ This page collects how Valkvork authenticates each party and limits what each ca
 | Controller → agent | Never: commands travel down the agent's own stream |
 | Users → workloads | Not Valkvork's concern: traffic goes from your load balancer to host ports |
 
+## Process Permissions
+
+What each process runs as, what it can touch, and why. "Golden image" means the systemd units and paths from [deployment.md](../deployment.md#golden-image).
+
+### Summary
+
+| Process | Runs as | Linux capabilities | Network | Writes |
+|---|---|---|---|---|
+| `valkvork-controller` | Unprivileged `valkvork` user (uid 65532 in the image) | None | Listens on 50051, 50052, 9400. Makes no outbound connections | Its SQLite directory only |
+| `valkvork-agent` | **root** | All (root) | One outbound connection to the controller. Listens on 127.0.0.1:9401 only | `data_dir` (node id, alloc dirs, failure markers). Through Docker: anything a container can be told to do |
+| Workload containers | The image's `USER` (often root inside the container) | Docker's default set | Docker bridge network, host ports bound on all addresses | Their own filesystem, `/alloc`, their host volumes |
+| `valkvork` CLI | The operator | None | One outbound connection to the admin API | Nothing |
+| Docker Engine (`dockerd`, `containerd`) | root | All | Unix socket only (must not listen on TCP) | Its data root |
+
+### Controller
+
+The controller needs no privileges: its ports are above 1024, and it never touches containers, the Docker socket or other hosts.
+
+On the golden image, `valkvork-controller.service` runs it as the `valkvork` system user, with this systemd sandbox:
+
+```ini
+User=valkvork
+Group=valkvork
+NoNewPrivileges=true      # setuid binaries cannot raise privileges
+PrivateTmp=true           # its own /tmp
+ProtectSystem=strict      # the whole filesystem is read-only to it ...
+ReadWritePaths=/data/valkvork   # ... except its database directory
+ProtectHome=true          # no access to /home, /root
+```
+
+| Path | Owner and mode | Access |
+|---|---|---|
+| `/etc/valkvork.d/controller.toml` | `root:valkvork 0640` | Read |
+| `/etc/valkvork.d/secrets/` (TLS key, join and admin tokens, CA) | `root:valkvork 0750`, files `0640` | Read. It cannot change its own secrets |
+| `/data/valkvork/db/` | `valkvork:valkvork 0750`; SQLite files `0600` | Read and write |
+| `/etc/valkvork.d/cli.env` (operator convenience, holds the admin token) | `root:root 0600` | None: for `sudo -i` sessions only |
+
+The controller image (`valkvlabs/valkvork-controller`) is FROM scratch and runs as uid and gid 65532, with no shell or other binaries; the database volume must be writable by that uid.
+
+What a compromised controller could do: change desired state, so it could run any image it chose on every worker through the agents. It holds the admin and join tokens. It cannot reach workers directly, because agents dial out and it never connects to them, and it has no access to the Docker socket.
+
+### Agent
+
+The agent **runs as root**, deliberately (FR-STO-03):
+
+- It drives the Docker socket. Access to the socket is equivalent to root on the host, so running as a user in the `docker` group would not reduce what it can do.
+- It creates per-workload directories under `data_dir` and asks Docker to bind-mount them and the host volumes, so workloads never need privileges to use storage.
+- It reads cgroup v2 files for every container and `/proc` for node usage.
+
+`valkvork-agent.service` on the golden image has no `User=` and no sandboxing, and `Requires=docker.service`.
+
+| Path | Owner and mode | Access |
+|---|---|---|
+| `/etc/valkvork.d/agent.toml`, `secrets/` (join token, CA) | root, `0640` | Read |
+| `/etc/valkvork.d/registry-auth.json` | `root 0600` | Read |
+| `/var/lib/valkvork/` (`node_id`, `failed/`) | `root 0700` | Read and write |
+| `/var/lib/valkvork/alloc` → `/data/valkvork/alloc/<workload_id>/` | `root 0711`; each workload's directory `root 0755` | Created and deleted by the agent; bind-mounted at `/alloc` |
+| `/var/run/docker.sock` | root | Read and write, and only the agent |
+
+Network: the agent opens no listening socket except metrics on loopback (FR-ARC-01); it refuses a non-loopback metrics address. Its only outbound connection is to `controller_endpoint`. Docker pulls images using its own network access.
+
+Limits the agent enforces on itself: it never mounts the Docker socket, `/var/lib/docker`, containerd's directories or Docker's actual data root into a workload (see [supervisor.md](supervisor.md#protected-paths)), and it never creates privileged containers. A compromised agent is root on its worker, but it holds only the join token, so it cannot act as an administrator or reach other workers.
+
+### Workload Containers
+
+The agent creates containers with:
+
+| Setting | Value |
+|---|---|
+| User | The image's `USER`. Valkvork does not override it |
+| Privileged | Never; there is no option for it (FR-STO-03) |
+| Capabilities | Docker's default set (for example `CHOWN`, `DAC_OVERRIDE`, `NET_BIND_SERVICE`, `SETUID`, `SETGID`, `KILL`). None added, none dropped |
+| Seccomp, AppArmor | Docker's default profiles |
+| Devices | None |
+| CPU, memory | `NanoCpus` from `resources.cpu`; `Memory = MemorySwap` from `resources.memory`, so no swap |
+| Disk | `/alloc` plus the writable layer, limited by polling (`resources.disk`) |
+| Network | Docker's default bridge; each `host_port` is published on all host addresses |
+| Mounts | `/alloc` (read-write) and declared host volumes (read-only if either side says so); never the Docker socket |
+| Restart policy | `no`: the agent restarts containers itself |
+| User namespaces | Not configured: root inside a container is uid 0 on the host, confined by namespaces, capabilities and seccomp |
+
+**`/alloc` is root-owned.** Each workload's directory is created by the agent as `root 0755`, so a container running as a non-root user can read `/alloc` but not write to it. Host volume directories have whatever ownership the operator gave them; the golden image creates them as `root 0755`. Images such as Postgres, whose entrypoint starts as root and changes ownership of its data directory, work. Images that start as a non-root user need writable directories prepared on the host. This is tracked in [NEXT_STEPS.md](../../NEXT_STEPS.md).
+
+Not set, and worth adding for untrusted images (also tracked there): a PID limit, `no-new-privileges`, dropping capabilities, and a read-only root filesystem. Valkvork assumes workloads are trusted code you deploy; it is not a sandbox for hostile tenants.
+
+### CLI and Browser
+
+The CLI needs no privileges. It reads the manifest files you pass it and holds the admin token only for the request. Anyone with the admin token is a full administrator; there are no roles yet. The web UI runs in the operator's browser with a session cookie it cannot read from JavaScript (`HttpOnly`); see below.
+
+### Local Development
+
+With `make dev-up`, the controller and agent run as **your user**, and the agent uses your Docker's socket (Colima, Docker Desktop, OrbStack), which is root inside that Docker VM. Generated secrets are written `0600` under `.dev/`. Nothing listens beyond `127.0.0.1` except what Docker publishes for workload host ports.
+
 ## TLS
 
 Both gRPC listeners use rustls through tonic, with one certificate and key: `tls_cert_file` and `tls_key_file`, PEM, key in PKCS#8. The certificate's subject alternative names must cover the name agents and operators use, for example `controlplane.valkvork.internal`.
