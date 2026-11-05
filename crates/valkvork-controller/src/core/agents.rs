@@ -76,6 +76,7 @@ impl Core {
             },
         );
         self.touch_node(&node_id);
+        self.metrics.registration();
         let msg = match (&previous, was_unhealthy) {
             (None, _) => format!(
                 "{} ({}) joined, class {}",

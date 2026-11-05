@@ -10,6 +10,7 @@
 
 pub mod connection;
 pub mod identity;
+pub mod metrics;
 pub mod runtime;
 pub mod supervisor;
 pub mod telemetry;

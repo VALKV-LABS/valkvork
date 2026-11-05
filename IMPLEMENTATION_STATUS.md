@@ -19,7 +19,15 @@ TLS against a real Docker Engine).
 | FR-CON-09 Command dispatch | Done | Re-send once after 30 s and on reconnect; `START_TIMEOUT` after 5 min. Rejected starts are rescheduled. |
 | FR-CON-10 Admin API and CLI | Done ✓e2e | All commands; bearer token; exit codes 0/1/2; manual scale clamps to the autoscale range; delete drains, then removes the row. |
 | FR-CON-11 History retention | Done | 24 h / last 10 terminal workloads per service; events 30 days. |
-| FR-UI-* Web UI | **Not started** | The admin service layer (`core/admin.rs`) is meant to back it (FR-UI-05). |
+| FR-UI-01 Self-contained | Done ✓e2e | Hand-written HTML/CSS/ES-module JS in `ui/`, `include_bytes!` plus build-time gzip; `build.rs` fails above 250 KB (currently about 32 KB); strict CSP on every response, no inline script or style. |
+| FR-UI-02 Where served | Done ✓e2e | Shares `:50052`: a tower layer sends `application/grpc` to AdminService and everything else to the UI; `/` redirects to `/ui/`; `[ui] enabled = false` turns it off. |
+| FR-UI-03 Pages | Done ✓e2e | Overview, Services, Service detail (scale, delete confirmed by typing the id), Nodes, Node detail (drain/undrain), Workloads (filters), Events (kind filter), Deploy (plan, then apply). Checked in headless Chrome. |
+| FR-UI-04 Live updates | Done ✓e2e | SSE at `/ui/api/events`, one `change` per commit; falls back to 5 s polling. |
+| FR-UI-05 One code path | Done | `/ui/api/*` call the same core operations as AdminService. |
+| FR-UI-06 Auth and audit | Done ✓e2e | Admin token login; random session cookie (`HttpOnly; SameSite=Strict; Path=/ui`, `Secure` with TLS), 12 h, in memory; `X-Valkvork-CSRF` on mutations (403 without); every apply/scale/delete/drain is an `AUDIT` event with actor `ui:<audit id>`, which is not the cookie value. |
+| FR-UI-07 Chart data | Done | 60 one-minute samples per service (CPU) and per class (allocation), in memory. |
+| FR-UI-08 Usability | Done | Light/dark via `prefers-color-scheme`, text plus colour status badges, deep links, 1024 px minimum layout. |
+| FR-UI-09 Isolation | Done | Each SSE client has a bounded broadcast buffer and is dropped when it lags; the core never waits for UI clients. RSS budget not measured yet (AT-11). |
 
 ## Agent
 
@@ -45,7 +53,7 @@ TLS against a real Docker Engine).
 | FR-STO-01/02/03 | Done | `/alloc` bind; host volumes; the Docker socket, `/var/lib/docker` and Docker's actual data root can never be mounted (FR-SEC-06). |
 | FR-SEC-01/03 | Done ✓e2e | Server TLS (rustls) with agents verifying the CA; join token; admin bearer token; constant-time compare. |
 | NFR-03 Static binaries | Done | `docker buildx build --target export`. |
-| NFR-07 Metrics | **Not started** | Logs are JSON `tracing`; no `/metrics` endpoints yet. |
+| NFR-07 Observability | Done ✓e2e | JSON `tracing` logs; Prometheus `/metrics` on the controller (`:9400`, the full minimum set plus extras) and the agent (`127.0.0.1:9401`, loopback enforced). |
 | §10 Deployment | Partial | Packer image: goldenimage#7. Terraform, ENI/EBS boot script and Litestream are not started. |
 
 ## Known limitations

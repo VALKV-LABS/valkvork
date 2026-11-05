@@ -12,7 +12,8 @@ Valkvork is a lightweight workload orchestrator and autoscaler written in Rust, 
 - Rolling updates on spec change
 - CPU-based horizontal autoscaling with cooldown
 - Basic storage: ephemeral disk limits and node-local host volumes
-- Built-in web UI *(not implemented yet)*
+- Built-in web UI at `/ui` on the admin port, embedded in the controller binary
+- Prometheus metrics on the controller (`:9400`) and agent (`127.0.0.1:9401`)
 - Production deployment on AWS via the [goldenimage](https://github.com/VALKV-LABS/goldenimage) Packer image
 
 See [IMPLEMENTATION_STATUS.md](IMPLEMENTATION_STATUS.md) for what is built and what remains.
@@ -105,9 +106,15 @@ recovery_grace_period_seconds  = 30
 command_timeout_seconds        = 30
 start_timeout_seconds          = 300
 
+metrics_listen_addr = "0.0.0.0:9400"   # Prometheus; remove to disable
+
 [autoscaler]
 enabled          = true
 cooldown_seconds = 180
+
+[ui]
+enabled             = true     # web UI at https://<controller>:50052/ui/
+session_ttl_seconds = 43200
 ```
 
 Without `tls_cert_file`/`tls_key_file` the controller serves plaintext and
@@ -158,7 +165,40 @@ valkvork events [--kind NODE|WORKLOAD|DEPLOY|SCALE|AUDIT]
 valkvork node list | drain <id> | undrain <id>
 ```
 
-Add `-o json` for machine-readable output. Exit codes: `0` success, `1`
+### Web UI
+
+Open `https://<controller>:50052/ui/` and sign in with the admin token. The
+UI shares the admin listener with gRPC (requests are split by content type),
+so it needs no extra port or certificate. It covers the overview, services
+(scale, delete), nodes (drain, undrain), workloads, events and deploy
+(plan, then apply). Pages update live over Server-Sent Events and fall back
+to polling. Every action is recorded as an `AUDIT` event with actor
+`ui:<session>`.
+
+The assets are hand-written HTML, CSS and JavaScript with no third-party
+code, compiled into the binary and gzipped at build time
+(`crates/valkvork-controller/ui/`). Responses carry the CSP
+`default-src 'self'; img-src 'self' data:; frame-ancestors 'none'`, the
+session cookie is `HttpOnly; SameSite=Strict` (and `Secure` with TLS), and
+mutating requests need the `X-Valkvork-CSRF` header.
+
+### Metrics
+
+`GET /metrics` in the Prometheus text format:
+
+- controller (`metrics_listen_addr`, default `0.0.0.0:9400`):
+  `valkvork_nodes{status,class}`, `valkvork_workloads{status}`,
+  `valkvork_pending_unplaced_workloads{class}`,
+  `valkvork_allocated_ratio{class,resource}`,
+  `valkvork_service_cpu_utilization{service}`,
+  `valkvork_scaling_actions_total{service,direction}`,
+  `valkvork_schedule_duration_seconds`, plus agent connections, outstanding
+  commands, recovery grace, uptime and database size;
+- agent (`metrics_listen_addr`, default `127.0.0.1:9401`, loopback only):
+  `valkvork_agent_reconnects_total`, `valkvork_agent_connected`, heartbeats,
+  commands by result, local restarts and workloads by state.
+
+The CLI takes `-o json` for machine-readable output. Exit codes: `0` success, `1`
 server or transport error, `2` validation error.
 
 ## Manifest Examples
@@ -254,6 +294,6 @@ Apache 2.0
 - [x] M0: Foundations (proto, TLS, register, heartbeat)
 - [x] M1: Run workloads (manifests, SQLite, apply/plan/delete, scheduler, Docker runtime)
 - [x] M2: Resilience (health, LOST/replacement, reconnect rules, recovery grace, adoption, local restarts)
-- [ ] M3: Change management + UI: rolling updates, drain, autoscaler, events, disk limits and host volumes are done; web UI and metrics remain
+- [x] M3: Change management + UI (rolling updates, drain, autoscaler, events, disk limits, host volumes, metrics, web UI)
 - [ ] M4: Production: Packer image in [goldenimage#7](https://github.com/VALKV-LABS/goldenimage/pull/7); Terraform, Litestream and runbooks remain
 - [ ] P2: Native containerd driver, block volumes, mTLS, secrets, etc.

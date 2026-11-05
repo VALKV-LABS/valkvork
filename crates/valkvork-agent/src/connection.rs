@@ -63,6 +63,8 @@ pub async fn run(
             Ok(()) => tracing::warn!("controller closed the stream"),
             Err(e) => tracing::warn!(error = %e, "controller stream failed"),
         }
+        crate::metrics::CONNECTED.store(false, std::sync::atomic::Ordering::Relaxed);
+        crate::metrics::RECONNECTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let delay = backoff.next_delay();
         tracing::info!(
             delay_ms = delay.as_millis() as u64,
@@ -144,6 +146,7 @@ async fn session(
         _ => return Err(net("expected RegisterAck as the first message")),
     };
     backoff.reset();
+    crate::metrics::CONNECTED.store(true, std::sync::atomic::Ordering::Relaxed);
     tracing::info!(node = %node.node_id, inventory, interval_ms, "registered with controller");
 
     let heartbeat = {
@@ -172,6 +175,7 @@ async fn session(
                 {
                     break;
                 }
+                crate::metrics::HEARTBEATS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
         })
     };
@@ -182,6 +186,7 @@ async fn session(
             Ok(None) => break Ok(()),
             Err(e) => break Err(net(e)),
         };
+        let is_start = matches!(msg.msg, Some(pb::controller_message::Msg::StartWorkload(_)));
         let (command_id, workload_id, outcome) = match msg.msg {
             Some(pb::controller_message::Msg::StartWorkload(s)) => {
                 tracing::info!(workload = %s.workload_id, service = %s.service_id, image = %s.image, "StartWorkload");
@@ -195,6 +200,7 @@ async fn session(
             }
             _ => continue,
         };
+        crate::metrics::command(is_start, outcome.is_ok());
         let result = pb::CommandResult {
             command_id,
             workload_id,

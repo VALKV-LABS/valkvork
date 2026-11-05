@@ -8,7 +8,6 @@ Status by requirement: [IMPLEMENTATION_STATUS.md](IMPLEMENTATION_STATUS.md).
    fixed-IP ENI, worker ASGs per class, the SSM parameters listed in the
    golden image README, and security groups (50051 from workers, 50052 from operators).
 3. **Litestream** backup of the controller database to S3 (§10.3).
-4. **Metrics** (NFR-07): controller `:9400`, agent `127.0.0.1:9401`. This unblocks
-   infrastructure autoscaling (§10.4).
-5. **Web UI** (FR-UI-01…09), served on `:50052` next to the gRPC API.
+4. **Publish metrics to CloudWatch** for the per-class infrastructure scaling loop (§10.4), and the ASG lifecycle hook that calls `valkvork node drain`.
+5. **Measure memory** at the NFR-01 load (AT-11), including 10 UI sessions.
 6. **Live autoscaler test** (AT-07) on a Linux worker, where cgroup telemetry is available.

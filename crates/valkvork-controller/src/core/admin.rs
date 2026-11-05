@@ -63,6 +63,15 @@ pub enum AdminOp {
         node_class: Option<String>,
         reply: Reply<Vec<pb::NodeSummary>>,
     },
+    /// UI overview page (FR-UI-03).
+    Overview { reply: Reply<super::Overview> },
+    /// Last 60 one-minute CPU samples of a service (FR-UI-07).
+    ServiceSeries {
+        service_id: String,
+        reply: Reply<Vec<super::SeriesPoint>>,
+    },
+    /// Prometheus exposition text (NFR-07).
+    Metrics { reply: Reply<String> },
 }
 
 #[derive(Debug, Clone)]
@@ -151,6 +160,20 @@ impl Core {
                     self.node_summaries(node_id.as_deref(), node_class.as_deref())
                 ));
             }
+            AdminOp::Overview { reply } => {
+                let _ = reply.send(Ok(self.overview()));
+            }
+            AdminOp::ServiceSeries { service_id, reply } => {
+                let res = if self.services.contains_key(&service_id) {
+                    Ok(self.service_series(&service_id))
+                } else {
+                    Err(ValkvorkError::NotFound(format!("service {service_id}")))
+                };
+                let _ = reply.send(res);
+            }
+            AdminOp::Metrics { reply } => {
+                let _ = reply.send(Ok(self.render_metrics()));
+            }
         }
     }
 
@@ -216,6 +239,14 @@ impl Core {
                 SubjectType::Service,
                 &id,
                 format!("{id} created at v1 with {target} replicas"),
+                actor,
+            );
+            // FR-UI-06: every operator action is audited, whichever client made it.
+            self.event(
+                EventKind::Audit,
+                SubjectType::Service,
+                &id,
+                format!("apply service {id}: created"),
                 actor,
             );
             return Ok(outcome);
@@ -314,6 +345,13 @@ impl Core {
             _ => format!("{id} re-applied"),
         };
         self.event(EventKind::Deploy, SubjectType::Service, &id, msg, actor);
+        self.event(
+            EventKind::Audit,
+            SubjectType::Service,
+            &id,
+            format!("apply service {id}: {change}"),
+            actor,
+        );
         Ok(outcome)
     }
 
@@ -527,6 +565,7 @@ impl Core {
                 running_replicas: self.count(&s.service_id, WorkloadStatus::Running),
                 cpu_utilization: self.service_utilisation(&s.service_id).unwrap_or(0.0),
                 created_at: s.created_at as u64,
+                rollout_status: s.rollout_status.to_string(),
             })
             .collect()
     }

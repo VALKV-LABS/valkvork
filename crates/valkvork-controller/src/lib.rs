@@ -8,6 +8,8 @@
 pub mod core;
 pub mod db;
 pub mod grpc;
+pub mod http;
 pub mod model;
 pub mod scheduler;
 pub mod server;
+pub mod ui;

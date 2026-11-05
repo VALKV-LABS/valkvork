@@ -516,6 +516,7 @@ impl Supervisor {
             l.state = WorkloadState::Restarting;
             l.reason = format!("{reason}({exit_code})");
             l.restart_count += 1;
+            crate::metrics::LOCAL_RESTARTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             l.recent_restarts.push_back(now);
             let (delay, cid) = (l.policy.delay, l.container_id.clone());
             tracing::info!(
@@ -705,6 +706,27 @@ impl Supervisor {
     // ------------------------------------------------------------------
 
     /// Sample cgroup counters and return a status for every managed container.
+    /// Managed containers by state, for metrics. Cheap: no cgroup reads.
+    pub fn state_counts(&self) -> std::collections::BTreeMap<&'static str, u32> {
+        let mut out: std::collections::BTreeMap<&'static str, u32> =
+            ["starting", "running", "restarting", "stopped", "failed"]
+                .into_iter()
+                .map(|s| (s, 0))
+                .collect();
+        for l in self.workloads.lock().unwrap().values() {
+            let key = match l.state {
+                WorkloadState::Starting => "starting",
+                WorkloadState::Running => "running",
+                WorkloadState::Restarting => "restarting",
+                WorkloadState::Stopped => "stopped",
+                WorkloadState::Failed => "failed",
+                WorkloadState::Unspecified => continue,
+            };
+            *out.entry(key).or_default() += 1;
+        }
+        out
+    }
+
     pub fn report(&self) -> Vec<pb::WorkloadStatus> {
         let now = Instant::now();
         let mut map = self.workloads.lock().unwrap();

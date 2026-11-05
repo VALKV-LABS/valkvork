@@ -1,0 +1,27 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Valkvork</title>
+<link rel="icon" href="/ui/assets/icon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/ui/assets/app.css">
+<script type="module" src="/ui/assets/app.js"></script>
+</head>
+<body>
+<header class="top">
+  <a class="brand" href="/ui/" data-link><img src="/ui/assets/icon.svg" alt="" width="20" height="20"> Valkvork</a>
+  <nav id="nav" aria-label="Main" hidden>
+    <a href="/ui/" data-link data-nav="overview">Overview</a>
+    <a href="/ui/services" data-link data-nav="services">Services</a>
+    <a href="/ui/nodes" data-link data-nav="nodes">Nodes</a>
+    <a href="/ui/workloads" data-link data-nav="workloads">Workloads</a>
+    <a href="/ui/events" data-link data-nav="events">Events</a>
+    <a href="/ui/deploy" data-link data-nav="deploy">Deploy</a>
+  </nav>
+  <span id="live" class="live" hidden></span>
+  <button id="logout" class="link" type="button" hidden>Sign out</button>
+</header>
+<main id="main" tabindex="-1"><p class="muted">Loading…</p></main>
+</body>
+</html>
