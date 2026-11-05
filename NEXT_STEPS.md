@@ -17,9 +17,18 @@ What is not built yet. The rest of the [spec](spec.md)'s MVP scope is implemente
    workloads STOPPED. The spec does not define this yet.
 8. **Docker daemon settings in the golden image** to match FR-AGE-01: the `local` log driver
    (the image uses `json-file`) and `native.cgroupdriver=systemd` set explicitly.
-9. **Updates for services on a single-node host volume.** Rolling updates and drains start the new
-   workload before stopping the old one (FR-CON-07), so a service whose host volume exists on one
-   node can never complete a rollout (the replacement stays PENDING), and start-first would briefly
-   run two processes on one data directory. Add a stop-first update order (for example
-   `[update] order = "stop-first"`, or automatic for writable host volumes). Until then: delete and
-   re-apply. See docs/placement-and-storage.md.
+9. **Stop-first updates for services on a single-node host volume** (to do later).
+   - *Problem:* rolling updates and drains start the new workload before stopping the old one
+     (FR-CON-07). A service whose host volume exists on only one node, such as
+     `examples/postgres.toml`, has nowhere to put the new workload, so a replacing apply (new
+     image, env or resources) leaves it PENDING forever and the rollout never completes.
+     Start-first would also briefly run two processes on one data directory.
+   - *Fix:* a stop-first order in the reconciler: stop the old workload, wait until it is STOPPED,
+     then start the replacement, `max_parallel` at a time. A short outage per replica is expected.
+   - *To decide:* automatic for services that mount a writable host volume (recommended, since
+     start-first can never work for them), or opt-in with `[update] order = "stop-first"`. Either
+     way it is a deliberate change to FR-CON-07, so update the spec too.
+   - *Also:* tests for a rolling update and a drain of a host-volume service, and the
+     `docs/placement-and-storage.md` section that documents today's workaround.
+   - *Until then:* `valkvork delete service <id>`, wait until it is gone, then apply again. The
+     data stays in the volume.
