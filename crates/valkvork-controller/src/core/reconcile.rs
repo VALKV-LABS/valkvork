@@ -349,7 +349,10 @@ impl Core {
             let Some(spec) = self.services.get(&sid).map(|s| s.spec.clone()) else {
                 continue;
             };
-            match snap.place(&spec) {
+            let started = Instant::now();
+            let placed = snap.place(&spec);
+            self.metrics.observe_schedule(started.elapsed());
+            match placed {
                 Ok(node_id) => {
                     snap.reserve(&node_id, &spec, true);
                     if let Some(w) = self.wl(&wid) {

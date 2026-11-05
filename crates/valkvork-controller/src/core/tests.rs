@@ -746,3 +746,69 @@ impl Core {
         self.finish().unwrap();
     }
 }
+
+#[test]
+fn metrics_expose_the_nfr07_set() {
+    let mut c = core();
+    let a = register(&mut c, "a");
+    apply(
+        &mut c,
+        &manifest(
+            "web",
+            "nginx:1",
+            2,
+            "[constraints]\nrequired_class = \"gpu\"\n",
+        ),
+    );
+    apply(&mut c, &manifest("api", "nginx:1", 1, ""));
+    run_all(&mut c, &a);
+    let text = c.render_metrics();
+    for name in [
+        "valkvork_nodes{status=\"HEALTHY\",class=\"general\"} 1",
+        "valkvork_workloads{status=\"RUNNING\"} 1",
+        "valkvork_pending_unplaced_workloads{class=\"gpu\"} 2",
+        "valkvork_pending_unplaced_workloads{class=\"general\"} 0",
+        "valkvork_allocated_ratio{class=\"general\",resource=\"cpu\"} 0.25",
+        "valkvork_scaling_actions_total",
+        "valkvork_schedule_duration_seconds_count",
+        "valkvork_schedule_duration_seconds_bucket{le=\"+Inf\"}",
+        "valkvork_agent_registrations_total 1",
+        "valkvork_controller_recovery_grace 0",
+    ] {
+        assert!(text.contains(name), "missing {name} in:\n{text}");
+    }
+    // Every sample line belongs to a declared metric family.
+    for l in text.lines().filter(|l| !l.starts_with('#')) {
+        let family = l.split(['{', ' ']).next().unwrap();
+        let base = family
+            .trim_end_matches("_bucket")
+            .trim_end_matches("_sum")
+            .trim_end_matches("_count");
+        assert!(
+            text.contains(&format!("# TYPE {base} "))
+                || text.contains(&format!("# TYPE {family} ")),
+            "{l}"
+        );
+    }
+}
+
+#[test]
+fn metric_labels_are_escaped() {
+    let mut o = String::new();
+    super::observe::line(&mut o, "m", &[("a", "x\"y\\z\n")], 1.0);
+    assert_eq!(o, "m{a=\"x\\\"y\\\\z\\n\"} 1\n");
+}
+
+#[test]
+fn chart_series_keep_sixty_minutes() {
+    let mut c = core();
+    let _a = register(&mut c, "a");
+    apply(&mut c, &manifest("web", "nginx:1", 1, ""));
+    for _ in 0..65 {
+        c.sample_series();
+    }
+    assert_eq!(c.service_series("web").len(), 60);
+    let o = c.overview();
+    assert_eq!(o.classes[0].series.len(), 60);
+    assert_eq!(o.classes[0].class, "general");
+}

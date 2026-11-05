@@ -1,8 +1,11 @@
-//! Wires the core, the two gRPC listeners and TLS together.
+//! Wires the core, the listeners (agent gRPC, admin gRPC + web UI, metrics)
+//! and TLS together.
 
 use crate::core::Core;
 use crate::db::{Db, EventReader};
 use crate::grpc::{admin_auth, AdminApi, AgentApi};
+use crate::http::{serve_metrics, UiLayer};
+use crate::ui::UiState;
 use std::sync::Arc;
 use tonic::transport::Server;
 use valkvork_common::config::ControllerConfig;
@@ -52,18 +55,53 @@ pub async fn run(cfg: ControllerConfig) -> Result<(), ValkvorkError> {
     let agent_srv = builder()?
         .add_service(AgentServiceServer::new(AgentApi::new(handle.clone())))
         .serve(cfg.agent_listen_addr);
+    // The UI shares the admin listener (FR-UI-02). Browsers speak HTTP/1.1
+    // over plaintext, so HTTP/1 is accepted next to gRPC's HTTP/2.
+    let ui = cfg.ui.enabled.then(|| {
+        UiState::new(
+            handle.clone(),
+            reader.clone(),
+            admin_token.clone(),
+            std::time::Duration::from_secs(cfg.ui.session_ttl_seconds),
+            tls.is_some(),
+            cfg.database_path.clone(),
+        )
+    });
     let admin_srv = builder()?
+        .accept_http1(true)
+        .layer(UiLayer::new(ui))
         .add_service(AdminServiceServer::with_interceptor(
-            AdminApi::new(handle, reader),
+            AdminApi::new(handle.clone(), reader),
             admin_auth(admin_token),
         ))
         .serve(cfg.admin_listen_addr);
 
-    tracing::info!(agent = %cfg.agent_listen_addr, admin = %cfg.admin_listen_addr, "controller listening");
+    let metrics = {
+        let (addr, handle, db) = (
+            cfg.metrics_listen_addr,
+            handle.clone(),
+            cfg.database_path.clone(),
+        );
+        async move {
+            match addr {
+                Some(addr) => serve_metrics(addr, handle, db).await,
+                None => std::future::pending().await,
+            }
+        }
+    };
+
+    tracing::info!(
+        agent = %cfg.agent_listen_addr,
+        admin = %cfg.admin_listen_addr,
+        ui = cfg.ui.enabled,
+        metrics = ?cfg.metrics_listen_addr,
+        "controller listening"
+    );
     let net = |e: tonic::transport::Error| ValkvorkError::Network(e.to_string());
     tokio::select! {
         r = agent_srv => r.map_err(net),
         r = admin_srv => r.map_err(net),
+        r = metrics => r.map_err(|e| ValkvorkError::Network(format!("metrics listener: {e}"))),
         r = core_task => match r {
             Ok(r) => r.and(Err(ValkvorkError::Internal("controller core stopped".into()))),
             Err(e) => Err(ValkvorkError::Internal(format!("controller core panicked: {e}"))),

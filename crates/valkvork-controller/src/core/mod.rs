@@ -14,6 +14,7 @@
 mod admin;
 mod agents;
 mod autoscale;
+mod observe;
 mod reconcile;
 #[cfg(test)]
 mod tests;
@@ -23,13 +24,14 @@ use crate::model::{AgentSender, CpuSamples, NodeEntry, Service, ServiceRuntime, 
 use crate::scheduler::{NodeCapacity, Snapshot};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::time::{Duration, Instant};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{broadcast, mpsc, oneshot};
 use valkvork_common::config::ControllerConfig;
 use valkvork_common::models::{now_ms, DesiredState, EventKind, SubjectType, WorkloadStatus};
 use valkvork_common::ValkvorkError;
 use valkvork_proto::v1 as pb;
 
 pub use admin::{AdminOp, ApplyOutcome, WorkloadFilter};
+pub use observe::{ClassCapacity, ClassPoint, Overview, SeriesPoint};
 
 /// Messages accepted by the core.
 pub enum CoreMsg {
@@ -54,9 +56,16 @@ pub enum CoreMsg {
 #[derive(Clone)]
 pub struct CoreHandle {
     tx: mpsc::Sender<CoreMsg>,
+    changes: broadcast::Sender<u64>,
 }
 
 impl CoreHandle {
+    /// Notified after every commit that changed state (UI live updates,
+    /// FR-UI-04). Each subscriber has its own bounded buffer (FR-UI-09).
+    pub fn subscribe(&self) -> broadcast::Receiver<u64> {
+        self.changes.subscribe()
+    }
+
     pub async fn send(&self, msg: CoreMsg) -> Result<(), ValkvorkError> {
         self.tx
             .send(msg)
@@ -91,6 +100,11 @@ type AfterCommit = Box<dyn FnOnce() + Send>;
 
 pub struct Core {
     pub(crate) cfg: ControllerConfig,
+    pub(crate) started: Instant,
+    changes: broadcast::Sender<u64>,
+    change_seq: u64,
+    pub(crate) metrics: observe::CoreMetrics,
+    pub(crate) series: observe::Series,
     pub(crate) db: Db,
     pub(crate) join_token: String,
     pub(crate) grace_until: Instant,
@@ -167,6 +181,11 @@ impl Core {
 
         Ok(Self {
             cfg,
+            started: start,
+            changes: broadcast::channel(64).0,
+            change_seq: 0,
+            metrics: Default::default(),
+            series: Default::default(),
             db,
             join_token,
             grace_until,
@@ -203,7 +222,8 @@ impl Core {
         tokio::task::JoinHandle<Result<(), ValkvorkError>>,
     ) {
         let (tx, rx) = mpsc::channel(1024);
-        (CoreHandle { tx }, tokio::spawn(self.run(rx)))
+        let changes = self.changes.clone();
+        (CoreHandle { tx, changes }, tokio::spawn(self.run(rx)))
     }
 
     async fn run(mut self, mut rx: mpsc::Receiver<CoreMsg>) -> Result<(), ValkvorkError> {
@@ -218,6 +238,8 @@ impl Core {
         let mut flush_tick = mk(self.cfg.heartbeat_flush_interval_seconds);
         let mut autoscale_tick = mk(self.cfg.autoscaler.evaluation_interval_seconds);
         let mut prune_tick = mk(600);
+        let mut series_tick = mk(60);
+        series_tick.reset(); // first sample after a full minute
 
         loop {
             tokio::select! {
@@ -238,6 +260,7 @@ impl Core {
                     }
                 }
                 _ = prune_tick.tick() => self.prune_history(),
+                _ = series_tick.tick() => self.sample_series(),
             }
             self.finish()?;
         }
@@ -292,6 +315,7 @@ impl Core {
             scaling_events: std::mem::take(&mut self.scaling_events),
             heartbeats: std::mem::take(&mut self.heartbeats),
         };
+        let changed = !batch.is_empty();
         if let Err(e) = self.db.commit(&batch) {
             tracing::error!(error = %e, "failed to commit state; exiting so the controller restarts from SQLite");
             return Err(e);
@@ -313,6 +337,11 @@ impl Core {
         }
         for f in std::mem::take(&mut self.after_commit) {
             f();
+        }
+        if changed {
+            self.change_seq += 1;
+            // No subscribers is fine.
+            let _ = self.changes.send(self.change_seq);
         }
         Ok(())
     }

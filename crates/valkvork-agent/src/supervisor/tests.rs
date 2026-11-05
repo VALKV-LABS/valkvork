@@ -414,3 +414,19 @@ async fn resync_reports_foreign_labelled_containers() {
     s.resync().await;
     assert_eq!(state_of(&s, "ghost").unwrap().0, WorkloadState::Running);
 }
+
+#[tokio::test]
+async fn metrics_render_counts_workloads() {
+    let d = tempfile::tempdir().unwrap();
+    let rt = Fake::new();
+    let s = supervisor(rt.clone(), d.path());
+    s.start(start_cmd("w1", 3)).await.unwrap();
+    settle().await;
+    let text = crate::metrics::render(&s);
+    assert!(
+        text.contains("valkvork_agent_workloads{state=\"running\"} 1"),
+        "{text}"
+    );
+    assert!(text.contains("valkvork_agent_reconnects_total "));
+    assert!(text.contains("# TYPE valkvork_agent_commands_total counter"));
+}

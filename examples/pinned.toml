@@ -1,0 +1,18 @@
+# Pinning by node class. Only nodes whose agent.toml has node_class = "db"
+# are eligible. Classes are the only placement constraint: to pin to one
+# specific VM, give that VM a class of its own (e.g. node_class = "db-1").
+#
+# With the default `make dev-up` (class "general") this stays PENDING with
+# "NO_NODE: no healthy nodes in class db". Restart the dev cluster with
+# VALKVORK_DEV_NODE_CLASS=db to see it placed.
+[service]
+id       = "pinned-worker"
+image    = "docker.io/library/nginx:1.27-alpine"
+replicas = 1
+
+[resources]
+cpu    = 0.1
+memory = "32MiB"
+
+[constraints]
+required_class = "db"

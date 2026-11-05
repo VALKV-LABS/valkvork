@@ -108,6 +108,7 @@ message ServiceSummary {
   uint32 running_replicas = 6;
   double cpu_utilization = 7;
   uint64 created_at = 8;
+  string rollout_status = 9;  // NONE | IN_PROGRESS | HALTED
 }
 
 message ListWorkloadsRequest {

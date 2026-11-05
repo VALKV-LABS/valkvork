@@ -1,0 +1,61 @@
+name: Tag
+
+# After CI passes on a push to main, tag that commit with the next version
+# (scripts/next-version.sh), so you never have to work out the next number:
+#
+#   default          patch:  v0.1.3 → v0.1.4
+#   "#minor"         in a commit message since the last tag → v0.2.0
+#   "#major"         in a commit message since the last tag → v1.0.0
+#   "#skip-tag"      in the commit's own message → no tag for it
+#
+# The first tag is the crate version (v0.1.0). Tagging does not release:
+# release.yml publishes the tag you choose, e.g.
+#   gh workflow run release.yml -f tag=v0.1.4
+
+on:
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+    branches: [main]
+
+permissions:
+  contents: write
+
+# One at a time, so two merges in quick succession get consecutive numbers.
+concurrency:
+  group: tag
+  cancel-in-progress: false
+
+jobs:
+  tag:
+    name: Tag the commit
+    if: github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'push'
+    runs-on: ubuntu-24.04
+    env:
+      SHA: ${{ github.event.workflow_run.head_sha }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # every tag and the history since the last one
+
+      - name: Work out the next tag
+        id: next
+        run: echo "tag=$(scripts/next-version.sh "$SHA")" >> "$GITHUB_OUTPUT"
+
+      - name: Create the tag
+        if: steps.next.outputs.tag != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.next.outputs.tag }}
+        run: |
+          gh api "repos/$GITHUB_REPOSITORY/git/refs" -f ref="refs/tags/$TAG" -f sha="$SHA" >/dev/null
+          {
+            echo "Tagged \`$SHA\` as **$TAG**."
+            echo
+            echo "To release it: \`gh workflow run release.yml -f tag=$TAG\`, or Actions → Release → Run workflow."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Nothing to tag
+        if: steps.next.outputs.tag == ''
+        run: |
+          echo "No tag for $SHA (already tagged, older than the latest tag, or #skip-tag)." >> "$GITHUB_STEP_SUMMARY"

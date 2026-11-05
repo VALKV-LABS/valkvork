@@ -1,0 +1,23 @@
+# The spec's autoscaling example (§6.3). The autoscaler needs per-container
+# CPU from cgroup v2, so it only acts with the agent running on Linux.
+[service]
+id       = "frontend-web"
+image    = "docker.io/library/nginx:1.27.2-alpine-slim"
+replicas = 3
+
+[resources]
+cpu    = 0.5
+memory = "512MiB"
+
+[constraints]
+required_class = "general"
+
+[[ports]]
+name           = "http"
+container_port = 80
+host_port      = 8080
+
+[autoscale]
+min_replicas       = 3
+max_replicas       = 10
+target_cpu_percent = 75

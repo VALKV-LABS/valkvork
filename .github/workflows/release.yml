@@ -3,11 +3,21 @@ name: Release
 # Every push to main publishes both images as `edge`, which also keeps the
 # build cache warm for releases.
 #
-# Pushing a tag vX.Y.Z (matching the crate versions) publishes both images for
-# amd64 and arm64 as X.Y.Z, X.Y and latest, and creates a GitHub release with
-# static binaries as valkvork-X.Y.Z-linux-<x86_64|aarch64>.tar.gz, the layout
-# the golden image installer downloads (valkvork_download_url). CI runs first,
-# unless it already passed on main for the tagged commit.
+# Releasing is a decision: tag.yml tags every green commit on main with the
+# next version automatically, and you choose which tag to release:
+#
+#   gh workflow run release.yml -f tag=v0.1.3     (or Actions → Release → Run workflow)
+#
+# Pushing a tag vX.Y.Z yourself also releases it. (Tags created by tag.yml do
+# not trigger this, because GitHub never starts workflows from events made with
+# the workflow token.)
+#
+# A release builds the tag's commit with the tag's version stamped into the
+# crates (scripts/set-version.sh), publishes both images for amd64 and arm64 as
+# X.Y.Z, X.Y and latest, and creates a GitHub release with static binaries as
+# valkvork-X.Y.Z-linux-<x86_64|aarch64>.tar.gz, the layout the golden image
+# installer downloads (valkvork_download_url). The tag's commit must have
+# passed CI on main.
 #
 # Images:
 #   valkvlabs/valkvork-controller   controller + valkvork CLI
@@ -22,56 +32,70 @@ on:
     branches: [main]
     tags:
       - 'v[0-9]+.[0-9]+.[0-9]+'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Tag to release, e.g. v0.1.3 (tag.yml creates one per green commit on main)
+        required: true
+        type: string
 
 permissions:
   contents: read
 
+concurrency:
+  group: release-${{ inputs.tag || github.ref }}
+  cancel-in-progress: false
+
 jobs:
-  # ── Gate: all CI checks must pass before a release ───────────────────────────
-  ci-status:
-    name: Check CI on main
-    if: startsWith(github.ref, 'refs/tags/')
+  # ── What to build ────────────────────────────────────────────────────────────
+  plan:
+    name: Plan
     runs-on: ubuntu-24.04
     permissions:
       actions: read
     outputs:
-      passed: ${{ steps.check.outputs.passed }}
-    steps:
-      - name: Look for a passing run of this commit
-        id: check
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          count=$(gh run list --repo "$GITHUB_REPOSITORY" --workflow ci.yml \
-            --branch main --event push --commit "$GITHUB_SHA" --status success \
-            --json databaseId --jq length)
-          echo "passed=$([ "$count" -gt 0 ] && echo true || echo false)" >> "$GITHUB_OUTPUT"
-
-  ci:
-    name: CI
-    needs: ci-status
-    if: ${{ needs.ci-status.result == 'success' && needs.ci-status.outputs.passed != 'true' }}
-    uses: ./.github/workflows/ci.yml
-
-  # The tag must match the crate versions: binaries report it in --version and
-  # the golden image installer checks it.
-  version:
-    name: Check tag matches crate versions
-    if: startsWith(github.ref, 'refs/tags/')
-    runs-on: ubuntu-24.04
+      release: ${{ steps.plan.outputs.release }}
+      tag: ${{ steps.plan.outputs.tag }}
+      version: ${{ steps.plan.outputs.version }}
+      sha: ${{ steps.plan.outputs.sha }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
-      - name: Compare
+      - name: Work out the commit and version
+        id: plan
+        env:
+          GH_TOKEN: ${{ github.token }}
+          INPUT_TAG: ${{ inputs.tag }}
         run: |
-          want="${GITHUB_REF_NAME#v}"
-          for manifest in crates/*/Cargo.toml; do
-            have=$(sed -n 's/^version = "\(.*\)"$/\1/p' "$manifest" | head -1)
-            if [ "$have" != "$want" ]; then
-              echo "$manifest has version $have, tag is $want"
-              exit 1
-            fi
-          done
+          set -euo pipefail
+          if [ "$GITHUB_EVENT_NAME" = workflow_dispatch ]; then
+            tag="$INPUT_TAG"
+          elif [ "$GITHUB_REF_TYPE" = tag ]; then
+            tag="$GITHUB_REF_NAME"
+          else
+            # A push to main: edge images only.
+            echo "release=false" >> "$GITHUB_OUTPUT"
+            echo "sha=$GITHUB_SHA" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          [[ "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "::error::$tag is not a vX.Y.Z tag"; exit 1; }
+          sha=$(git rev-parse --verify --quiet "refs/tags/$tag^{commit}") \
+            || { echo "::error::tag $tag does not exist"; exit 1; }
+          git merge-base --is-ancestor "$sha" origin/main \
+            || { echo "::error::$tag ($sha) is not on main"; exit 1; }
+          # Only commits that passed CI on main are released.
+          passed=$(gh run list --repo "$GITHUB_REPOSITORY" --workflow ci.yml --branch main \
+            --event push --commit "$sha" --status success --json databaseId --jq length)
+          [ "$passed" -gt 0 ] || { echo "::error::CI has not passed on main for $sha"; exit 1; }
+          {
+            echo "release=true"
+            echo "tag=$tag"
+            echo "version=${tag#v}"
+            echo "sha=$sha"
+          } >> "$GITHUB_OUTPUT"
+          echo "Releasing $tag ($sha)" >> "$GITHUB_STEP_SUMMARY"
 
   # ── Images ────────────────────────────────────────────────────────────────────
   # Each platform builds on its own hardware, because compiling Rust under
@@ -79,8 +103,7 @@ jobs:
   # build stage, so the second and third builds reuse the first.
   build:
     name: Build ${{ matrix.arch }}
-    needs: [ci-status, ci, version]
-    if: ${{ !cancelled() && needs.ci-status.result != 'failure' && (needs.ci.result == 'success' || needs.ci.result == 'skipped') && (needs.version.result == 'success' || needs.version.result == 'skipped') }}
+    needs: plan
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
@@ -96,8 +119,19 @@ jobs:
       # The build record is not an archive the publish job can unpack, and
       # nothing here reads it.
       DOCKER_BUILD_RECORD_UPLOAD: "false"
+      RELEASE: ${{ needs.plan.outputs.release }}
+      VERSION: ${{ needs.plan.outputs.version }}
+      SHA: ${{ needs.plan.outputs.sha }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.plan.outputs.sha }}
+
+      # Binaries report the release version in --version; the golden image
+      # installer checks it. The committed crate version stays as it is.
+      - name: Stamp the version
+        if: env.RELEASE == 'true'
+        run: scripts/set-version.sh "$VERSION"
 
       - uses: docker/setup-buildx-action@v3
 
@@ -110,11 +144,11 @@ jobs:
       - name: Image labels
         id: labels
         run: |
-          version="${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || format('edge-{0}', github.sha) }}"
+          version=$([ "$RELEASE" = true ] && echo "$VERSION" || echo "edge-$SHA")
           {
             echo 'value<<EOF'
             echo "org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}"
-            echo "org.opencontainers.image.revision=${{ github.sha }}"
+            echo "org.opencontainers.image.revision=$SHA"
             echo "org.opencontainers.image.version=$version"
             echo "org.opencontainers.image.licenses=Apache-2.0"
             echo EOF
@@ -154,7 +188,7 @@ jobs:
           provenance: false
           cache-from: type=gha,scope=valkvork-${{ matrix.arch }}
 
-      - name: Record the digests and package the binaries
+      - name: Check and package the binaries
         run: |
           mkdir -p digests
           echo "${{ steps.controller.outputs.digest }}" > "digests/valkvork-controller-${{ matrix.arch }}"
@@ -162,8 +196,12 @@ jobs:
           for bin in dist/valkvork-controller dist/valkvork-agent dist/valkvork; do
             file "$bin" | grep -qE 'statically linked|static-pie linked' || { echo "$bin is not statically linked"; exit 1; }
           done
-          version="${GITHUB_REF_NAME#v}"
-          [ "$GITHUB_REF_TYPE" = tag ] || version="edge"
+          version=$([ "$RELEASE" = true ] && echo "$VERSION" || echo edge)
+          # Release binaries must report the release version.
+          if [ "$RELEASE" = true ] && [ "${{ matrix.arch }}" = amd64 ]; then
+            reported=$(dist/valkvork --version | awk '{print $2}')
+            [ "$reported" = "$VERSION" ] || { echo "binaries report $reported, expected $VERSION"; exit 1; }
+          fi
           mkdir -p tarballs
           tar -C dist -czf "tarballs/valkvork-${version}-linux-${{ matrix.uname }}.tar.gz" \
             valkvork-controller valkvork-agent valkvork
@@ -182,9 +220,11 @@ jobs:
 
   publish:
     name: Publish images
-    needs: build
-    if: ${{ !cancelled() && needs.build.result == 'success' }}
+    needs: [plan, build]
     runs-on: ubuntu-24.04
+    env:
+      RELEASE: ${{ needs.plan.outputs.release }}
+      VERSION: ${{ needs.plan.outputs.version }}
     steps:
       - uses: actions/download-artifact@v4
         with:
@@ -202,9 +242,8 @@ jobs:
 
       - name: Join the platforms under one tag
         run: |
-          if [ "$GITHUB_REF_TYPE" = tag ]; then
-            version="${GITHUB_REF_NAME#v}"
-            tags="$version ${version%.*} latest"
+          if [ "$RELEASE" = true ]; then
+            tags="$VERSION ${VERSION%.*} latest"
           else
             tags=edge
           fi
@@ -224,11 +263,14 @@ jobs:
   # ── GitHub release ────────────────────────────────────────────────────────────
   github-release:
     name: Create GitHub Release
-    needs: publish
-    if: ${{ !cancelled() && needs.publish.result == 'success' && startsWith(github.ref, 'refs/tags/') }}
+    needs: [plan, publish]
+    if: needs.plan.outputs.release == 'true'
     runs-on: ubuntu-24.04
     permissions:
       contents: write
+    env:
+      TAG: ${{ needs.plan.outputs.tag }}
+      VERSION: ${{ needs.plan.outputs.version }}
     steps:
       - uses: actions/download-artifact@v4
         with:
@@ -238,29 +280,29 @@ jobs:
 
       - name: Checksums and notes
         run: |
-          version="${GITHUB_REF_NAME#v}"
           (cd release && sha256sum -- *.tar.gz > SHA256SUMS)
           {
             echo "## Docker images"
             echo
             echo '```'
-            echo "docker pull valkvlabs/valkvork-controller:$version"
-            echo "docker pull valkvlabs/valkvork-agent:$version"
+            echo "docker pull valkvlabs/valkvork-controller:$VERSION"
+            echo "docker pull valkvlabs/valkvork-agent:$VERSION"
             echo '```'
             echo
             echo "## Static binaries"
             echo
-            echo "\`valkvork-$version-linux-x86_64.tar.gz\` and \`valkvork-$version-linux-aarch64.tar.gz\`"
+            echo "\`valkvork-$VERSION-linux-x86_64.tar.gz\` and \`valkvork-$VERSION-linux-aarch64.tar.gz\`"
             echo "contain \`valkvork-controller\`, \`valkvork-agent\` and \`valkvork\`. For the golden image:"
             echo
             echo '```'
-            echo "packer build -var orchestrator=valkvork -var valkvork_version=$version \\"
-            echo "  -var valkvork_download_url=${{ github.server_url }}/${{ github.repository }}/releases/download/$GITHUB_REF_NAME ."
+            echo "packer build -var orchestrator=valkvork -var valkvork_version=$VERSION \\"
+            echo "  -var valkvork_download_url=${{ github.server_url }}/${{ github.repository }}/releases/download/$TAG ."
             echo '```'
           } > notes.md
 
       - uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ needs.plan.outputs.tag }}
           body_path: notes.md
           generate_release_notes: true
           files: |

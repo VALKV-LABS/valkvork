@@ -146,6 +146,7 @@ impl Core {
             svc.target_replicas = desired;
             svc.last_scaled_at = Some(now_ms());
             self.touch_service(&id);
+            self.metrics.scaling_action(&id, direction);
             self.scaling_event(NewScalingEvent {
                 service_id: id.clone(),
                 from_replicas: current,

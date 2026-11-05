@@ -52,6 +52,12 @@ pub struct ControllerConfig {
     pub heartbeat_flush_interval_seconds: u64,
 
     pub autoscaler: AutoscalerConfig,
+
+    /// Built-in web UI on the admin listener (FR-UI-02).
+    pub ui: UiConfig,
+
+    /// Prometheus `/metrics` listener (NFR-07). Unset disables it.
+    pub metrics_listen_addr: Option<SocketAddr>,
 }
 
 impl Default for ControllerConfig {
@@ -74,6 +80,8 @@ impl Default for ControllerConfig {
             reconcile_interval_seconds: 5,
             heartbeat_flush_interval_seconds: 30,
             autoscaler: AutoscalerConfig::default(),
+            ui: UiConfig::default(),
+            metrics_listen_addr: Some("0.0.0.0:9400".parse().unwrap()),
         }
     }
 }
@@ -97,6 +105,24 @@ impl ControllerConfig {
             self.admin_token.as_deref(),
             self.admin_token_file.as_deref(),
         )
+    }
+}
+
+/// Web UI settings (FR-UI-02).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct UiConfig {
+    pub enabled: bool,
+    /// Session lifetime (FR-UI-06: 12 h).
+    pub session_ttl_seconds: u64,
+}
+
+impl Default for UiConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            session_ttl_seconds: 12 * 3600,
+        }
     }
 }
 
@@ -146,6 +172,9 @@ pub struct AgentConfig {
     pub registry_auth_file: PathBuf,
     /// Overrides the auto-detected address reported in `Register`.
     pub advertise_ip: Option<String>,
+    /// Prometheus `/metrics` (NFR-07). Must be a loopback address: the
+    /// agent exposes no other listener (FR-ARC-01). Unset disables it.
+    pub metrics_listen_addr: Option<SocketAddr>,
     pub reserved: ReservedResources,
     pub host_volumes: BTreeMap<String, HostVolume>,
 }
@@ -163,6 +192,7 @@ impl Default for AgentConfig {
             docker_socket: PathBuf::from("/var/run/docker.sock"),
             registry_auth_file: PathBuf::from("/etc/valkvork/registry-auth.json"),
             advertise_ip: None,
+            metrics_listen_addr: Some("127.0.0.1:9401".parse().unwrap()),
             reserved: ReservedResources::default(),
             host_volumes: BTreeMap::new(),
         }
@@ -180,7 +210,19 @@ impl AgentConfig {
         }
         parse_size(&cfg.reserved.memory)
             .map_err(|e| ValkvorkError::Config(format!("reserved.memory: {e}")))?;
+        cfg.validate()?;
         Ok(cfg)
+    }
+
+    pub fn validate(&self) -> Result<(), ValkvorkError> {
+        if let Some(addr) = self.metrics_listen_addr {
+            if !addr.ip().is_loopback() {
+                return Err(ValkvorkError::Config(format!(
+                    "metrics_listen_addr {addr} must be a loopback address (FR-ARC-01)"
+                )));
+            }
+        }
+        Ok(())
     }
 }
 
@@ -280,6 +322,23 @@ read_only = false
             toml::from_str("join_token = \"j\"\nadmin_token = \"a\"\n").unwrap();
         assert_eq!(cfg.node_unhealthy_timeout_seconds, 10);
         assert_eq!(cfg.resolve_join_token().unwrap(), "j");
+    }
+
+    #[test]
+    fn agent_metrics_must_be_loopback() {
+        let mut cfg = AgentConfig::default();
+        assert!(cfg.validate().is_ok());
+        cfg.metrics_listen_addr = Some("0.0.0.0:9401".parse().unwrap());
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn controller_ui_and_metrics_keys() {
+        let cfg: ControllerConfig =
+            toml::from_str("metrics_listen_addr = \"127.0.0.1:9999\"\n[ui]\nenabled = false\n")
+                .unwrap();
+        assert!(!cfg.ui.enabled);
+        assert_eq!(cfg.metrics_listen_addr.unwrap().port(), 9999);
     }
 
     #[test]
