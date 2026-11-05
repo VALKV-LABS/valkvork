@@ -1,0 +1,18 @@
+# Two replicas without a host port, so both fit on one node. Change RELEASE
+# and re-apply to watch a rolling update; `valkvork scale service api 4` to scale.
+[service]
+id           = "api"
+image        = "docker.io/library/nginx:1.27-alpine"
+replicas     = 2
+kill_timeout = "2s"
+
+[resources]
+cpu    = 0.1
+memory = "32MiB"
+
+[env]
+RELEASE = "v1"
+
+[update]
+max_parallel     = 1
+min_healthy_time = "5s"

@@ -1,0 +1,14 @@
+# nginx on host port 18080. Static host ports allow one replica per node.
+[service]
+id       = "web"
+image    = "docker.io/library/nginx:1.27-alpine"
+replicas = 1
+
+[resources]
+cpu    = 0.25
+memory = "64MiB"
+
+[[ports]]
+name           = "http"
+container_port = 80
+host_port      = 18080

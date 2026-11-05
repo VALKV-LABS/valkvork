@@ -66,6 +66,19 @@ See [IMPLEMENTATION_STATUS.md](IMPLEMENTATION_STATUS.md) for what is built and w
 
 ## Quick Start
 
+To try it on your machine (controller and agent against local Docker, TLS on):
+
+```bash
+make dev-up    # start a local cluster; prints the UI URL and admin token
+make demo      # deploy the example services
+make ui        # open the web UI
+make help      # all targets
+```
+
+See [docs/local-development.md](docs/local-development.md) for the CLI setup,
+things to try, and the limits of a one-node local cluster. The rest of this
+section covers building and configuring Valkvork for real hosts.
+
 ### Prerequisites
 
 - Rust (stable) and `protoc` (`brew install protobuf` / `apt install protobuf-compiler`)
@@ -76,12 +89,11 @@ See [IMPLEMENTATION_STATUS.md](IMPLEMENTATION_STATUS.md) for what is built and w
 ### Building
 
 ```bash
-cargo build --release          # native binaries in target/release/
-cargo test --workspace         # unit and behaviour tests
+make build-release             # native binaries in target/release/
+make ci                        # fmt check, clippy -D warnings, tests
 
-# Static musl binaries for Linux (NFR-03): writes dist/valkvork-controller,
-# dist/valkvork-agent and dist/valkvork
-docker buildx build --platform linux/amd64 --target export --output dist/ .
+# Static musl binaries for Linux (NFR-03) in dist/
+make dist PLATFORM=linux/amd64
 ```
 
 ### Configuration
@@ -277,12 +289,15 @@ crates/
 └── valkvork-cli/          `valkvork` binary
 ```
 
+Also: `examples/` (sample manifests), `scripts/dev.sh` (the local cluster
+behind `make dev-*`), `docs/` (guides).
+
 ## Development
 
 ```bash
-cargo test --workspace
-cargo clippy --workspace --all-targets
-cargo fmt
+make test      # unit and behaviour tests
+make ci        # fmt check, clippy -D warnings, tests
+make fmt
 ```
 
 ## License
