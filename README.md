@@ -85,7 +85,8 @@ Every key, the validation rules and how changes roll out: [docs/components/manif
 | [local-development.md](docs/local-development.md) | Running a cluster on your machine |
 | [deployment.md](docs/deployment.md) | Artefacts and releases, the golden image, systemd, the production layout, upgrades |
 | [spec.md](spec.md) | The product and technical specification; requirement IDs such as `FR-CON-03` refer to it |
-| [NEXT_STEPS.md](NEXT_STEPS.md) | What is not built yet |
+| [NEXT_STEPS.md](NEXT_STEPS.md) | MVP work not built yet |
+| [phase-2.md](docs/phase-2.md) | Phase 2 and 3 roadmap: block volumes, containerd, mTLS, secrets, health checks, dynamic ports, batch jobs, RBAC, … |
 
 ## Development
 
