@@ -1,314 +1,112 @@
 # Valkvork
 
-Valkvork is a lightweight workload orchestrator and autoscaler written in Rust, following the model of HashiCorp Nomad with one deliberate simplification: **one control node backed by embedded SQLite, with no Raft or consensus**.
+Valkvork is a lightweight workload orchestrator and autoscaler written in Rust, following the model of HashiCorp Nomad with one deliberate simplification: **one controller backed by embedded SQLite, with no Raft or consensus**. The controller's availability comes from cloud primitives, a single-instance auto-scaling group, a persistent disk and backups, rather than from clustering.
 
-## Features
+- Declarative TOML manifests with `apply`, `plan` and `delete`; re-applying the same manifest is a no-op
+- Spread scheduling with CPU, memory, node-class, host-port and host-volume filtering
+- Automatic replacement of workloads on failed nodes, with exact replica counts after a partition heals
+- Rolling updates and node drains, starting each new workload before stopping the old one
+- Local restart-on-failure that keeps working while the controller is unreachable
+- CPU-based horizontal autoscaling with a dead zone, sustain period and cooldown
+- Ephemeral disk limits and node-local host volumes
+- A built-in web UI at `/ui`, embedded in the controller binary, with no third-party code
+- Prometheus metrics on the controller and the agent
+- Static musl binaries with rustls: no glibc or OpenSSL on hosts
 
-- Single controller with SQLite state store
-- Multiple worker agents (valkvork-agent) on worker VMs
-- Declarative TOML manifests
-- Spread scheduling with resource and node-class filtering
-- Automatic replacement of workloads on failed nodes
-- Rolling updates on spec change
-- CPU-based horizontal autoscaling with cooldown
-- Basic storage: ephemeral disk limits and node-local host volumes
-- Built-in web UI at `/ui` on the admin port, embedded in the controller binary
-- Prometheus metrics on the controller (`:9400`) and agent (`127.0.0.1:9401`)
-- Production deployment on AWS via the [goldenimage](https://github.com/VALKV-LABS/goldenimage) Packer image
-
-See [IMPLEMENTATION_STATUS.md](IMPLEMENTATION_STATUS.md) for what is built and what remains.
-
-## Architecture
+**The data plane outlives the control plane:** losing the controller, or the network to it, never stops or restarts a running container.
 
 ```
-                              OPERATORS
-      ┌─────────────────────┐            ┌─────────────────────┐
-      │ valkvork CLI  /  CI │            │  Browser  (Web UI)  │
-      └──────────┬──────────┘            └──────────┬──────────┘
-                 │ [1] gRPC AdminService            │ [2] HTTPS /ui
-                 │     apply · plan · scale · drain │     pages · actions · live view
-                 └────────────────┬─────────────────┘
-                                  ▼  :50052  (TLS + admin token or UI session)
-   ┌────────────────────────────────────────────────────────────────────┐
-   │ CONTROL PLANE · 1 VM · valkvork-controller                         │
-   │ Decides what runs, where, and how many. Never runs app containers. │
-   │                                                                    │
-   │   SQLite (desired state) ────── [6] WAL stream ──────► S3 backup   │
-   │                                                                    │
-   └──────────────────────────────▲───────────────────┬─────────────────┘
-                                  │                   │
-     [4] agent → controller       │                   │   [3] controller → agent
-     Register (on connect)        │  one gRPC stream  │   StartWorkload
-     Heartbeat (every 2 s)        │    per agent,     │   StopWorkload
-     CommandResult (acks)         │ opened by agent   │
-                                  │  port :50051      │
-   ┌──────────────────────────────┴───────────────────▼─────────────────┐
-   │ DATA PLANE · N worker VMs · one valkvork-agent each                │
-   │ Does what it is told; reports facts. Keeps apps up if cut off.     │
-   │                                                                    │
-   │   valkvork-agent ──► Docker API ──► dockerd ──► containerd         │
-   │         ▲                                            │             │
-   │         │ [7] reads CPU/memory from cgroup files     ▼             │
-   │         └─────────────────────────────────── app containers        │
-   │                                                     ▲              │
-   └─────────────────────────────────────────────────────┼──────────────┘
-                                                         │ [5] user traffic → host ports (e.g. :8080)
-                                End users ──► Public LB ─┘
+ operators: valkvork CLI / CI, browser
+        │  gRPC AdminService and HTTPS /ui, :50052 (TLS, admin token)
+        ▼
+ valkvork-controller ── SQLite        one instance: desired state, scheduling, autoscaling
+        ▲
+        │  one gRPC stream per agent, opened by the agent, :50051 (TLS, join token)
+        │
+ valkvork-agent ── Docker ── your containers ◄── load balancer ◄── users
+   on every worker VM
 ```
 
-## Components
-
-| Component | Binary | Responsibilities |
-| :--- | :--- | :--- |
-| Controller | `valkvork-controller` | Admin API, SQLite state, reconciler, scheduler, autoscaler |
-| Agent | `valkvork-agent` | Stream to controller, container lifecycle, telemetry |
-| CLI | `valkvork` | Operator tool: apply, plan, delete, scale, status, etc. |
+[docs/architecture.md](docs/architecture.md) describes every process, port and data flow; [docs/components/](docs/components/index.md) covers each component in depth.
 
 ## Quick Start
 
-To try it on your machine (controller and agent against local Docker, TLS on):
+To try it on your machine, with a controller and an agent against your local Docker and TLS on:
 
 ```bash
-make dev-up    # start a local cluster; prints the UI URL and admin token
-make demo      # deploy the example services
+make dev-up    # build, start a local cluster; prints the UI URL and admin token
+make demo      # deploy examples/web.toml and examples/api.toml
 make ui        # open the web UI
-make help      # all targets
+make help      # every target
 ```
 
-See [docs/local-development.md](docs/local-development.md) for the CLI setup,
-things to try, and the limits of a one-node local cluster. The rest of this
-section covers building and configuring Valkvork for real hosts.
-
-### Prerequisites
-
-- Rust (stable) and `protoc` (`brew install protobuf` / `apt install protobuf-compiler`)
-- Docker Engine on the worker (spec: 27.0+ with `live-restore`, cgroup v2)
-- On macOS, if linking fails with an SDK error:
-  `export SDKROOT=/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk`
-
-### Building
+Then use the CLI:
 
 ```bash
-make build-release             # native binaries in target/release/
-make ci                        # fmt check, clippy -D warnings, tests
-
-# Static musl binaries for Linux (NFR-03) in dist/
-make dist PLATFORM=linux/amd64
+eval "$(make -s env)"
+target/debug/valkvork status
+target/debug/valkvork apply -f examples/api.toml
 ```
 
-### Configuration
+You need Rust, `protoc`, `openssl` and a running Docker (Docker Desktop, Colima, OrbStack or Docker Engine). See [docs/local-development.md](docs/local-development.md) for things to try and the limits of a one-node local cluster.
 
-Every key has a default and unknown keys are rejected. Both binaries accept
-`--check-config` to validate a file (including token and TLS files) and exit.
-
-#### Controller (`/etc/valkvork/controller.toml`)
-
-```toml
-agent_listen_addr = "0.0.0.0:50051"   # agent streams
-admin_listen_addr = "0.0.0.0:50052"   # admin API (CLI)
-tls_cert_file     = "/etc/valkvork/controller.pem"
-tls_key_file      = "/etc/valkvork/controller.key"   # PKCS#8 PEM
-database_path     = "/var/lib/valkvork/db/valkvork.db"
-join_token_file   = "/etc/valkvork/join-token"       # or join_token = "..."
-admin_token_file  = "/etc/valkvork/admin-token"      # or admin_token = "...", >= 32 random bytes
-
-# Optional tuning (spec defaults shown)
-node_unhealthy_timeout_seconds = 10
-recovery_grace_period_seconds  = 30
-command_timeout_seconds        = 30
-start_timeout_seconds          = 300
-
-metrics_listen_addr = "0.0.0.0:9400"   # Prometheus; remove to disable
-
-[autoscaler]
-enabled          = true
-cooldown_seconds = 180
-
-[ui]
-enabled             = true     # web UI at https://<controller>:50052/ui/
-session_ttl_seconds = 43200
-```
-
-Without `tls_cert_file`/`tls_key_file` the controller serves plaintext and
-logs a warning (development only).
-
-#### Agent (`/etc/valkvork/agent.toml`)
-
-```toml
-controller_endpoint = "https://controlplane.valkvork.internal:50051"
-ca_file             = "/etc/valkvork/ca.pem"
-join_token_file     = "/etc/valkvork/join-token"
-node_class          = "general"
-data_dir            = "/var/lib/valkvork"
-runtime             = "docker"
-docker_socket       = "/var/run/docker.sock"
-registry_auth_file  = "/etc/valkvork/registry-auth.json"   # optional, Docker config.json format
-# advertise_ip      = "10.0.1.23"                          # default: route towards the controller
-
-[reserved]
-cpu    = 0.25
-memory = "384MiB"
-
-[host_volumes.pgdata]
-path      = "/data/pgdata"
-read_only = false
-```
-
-The agent runs as root: it drives the Docker socket and bind-mounts host
-volumes and the per-workload `/alloc` directory.
-
-### Running
-
-```bash
-valkvork-controller --config /etc/valkvork/controller.toml
-valkvork-agent      --config /etc/valkvork/agent.toml
-
-export VALKVORK_ADDR=https://controlplane.valkvork.internal:50052
-export VALKVORK_CA_FILE=/etc/valkvork/ca.pem
-export VALKVORK_ADMIN_TOKEN=...
-
-valkvork plan -f service.toml            # diff + placement check, writes nothing
-valkvork apply -f service.toml
-valkvork status [service]
-valkvork workloads [--service S] [--node N] [--status RUNNING]
-valkvork scale service <id> <n>
-valkvork delete service <id>
-valkvork events [--kind NODE|WORKLOAD|DEPLOY|SCALE|AUDIT]
-valkvork node list | drain <id> | undrain <id>
-```
-
-### Web UI
-
-Open `https://<controller>:50052/ui/` and sign in with the admin token. The
-UI shares the admin listener with gRPC (requests are split by content type),
-so it needs no extra port or certificate. It covers the overview, services
-(scale, delete), nodes (drain, undrain), workloads, events and deploy
-(plan, then apply). Pages update live over Server-Sent Events and fall back
-to polling. Every action is recorded as an `AUDIT` event with actor
-`ui:<session>`.
-
-The assets are hand-written HTML, CSS and JavaScript with no third-party
-code, compiled into the binary and gzipped at build time
-(`crates/valkvork-controller/ui/`). Responses carry the CSP
-`default-src 'self'; img-src 'self' data:; frame-ancestors 'none'`, the
-session cookie is `HttpOnly; SameSite=Strict` (and `Secure` with TLS), and
-mutating requests need the `X-Valkvork-CSRF` header.
-
-### Metrics
-
-`GET /metrics` in the Prometheus text format:
-
-- controller (`metrics_listen_addr`, default `0.0.0.0:9400`):
-  `valkvork_nodes{status,class}`, `valkvork_workloads{status}`,
-  `valkvork_pending_unplaced_workloads{class}`,
-  `valkvork_allocated_ratio{class,resource}`,
-  `valkvork_service_cpu_utilization{service}`,
-  `valkvork_scaling_actions_total{service,direction}`,
-  `valkvork_schedule_duration_seconds`, plus agent connections, outstanding
-  commands, recovery grace, uptime and database size;
-- agent (`metrics_listen_addr`, default `127.0.0.1:9401`, loopback only):
-  `valkvork_agent_reconnects_total`, `valkvork_agent_connected`, heartbeats,
-  commands by result, local restarts and workloads by state.
-
-The CLI takes `-o json` for machine-readable output. Exit codes: `0` success, `1`
-server or transport error, `2` validation error.
-
-## Manifest Examples
-
-### Stateless Web Service
+## A Manifest
 
 ```toml
 [service]
-id = "frontend-web"
-image = "docker.io/library/nginx:1.27.2-alpine-slim"
+id       = "frontend-web"
+image    = "docker.io/library/nginx:1.27.2-alpine-slim"
 replicas = 3
 
 [resources]
-cpu = 0.5
+cpu    = 0.5          # cores: reserved for scheduling and enforced as a limit
 memory = "512MiB"
 
-[constraints]
-required_class = "general"
-
 [[ports]]
-name = "http"
+name           = "http"
 container_port = 80
-host_port = 8080
+host_port      = 8080
 
 [autoscale]
-min_replicas = 3
-max_replicas = 10
+min_replicas       = 3
+max_replicas       = 10
 target_cpu_percent = 75
 ```
 
-### Stateful Service with Host Volume
+Every key, the validation rules and how changes roll out: [docs/components/manifests.md](docs/components/manifests.md).
 
-```toml
-[service]
-id = "postgres-main"
-image = "docker.io/library/postgres:16.4"
-replicas = 1
+## Documentation
 
-[resources]
-cpu = 2.0
-memory = "4GiB"
-disk = "20GiB"
-
-[[volumes]]
-type = "host"
-source = "pgdata"
-target = "/var/lib/postgresql/data"
-```
-
-## Project Structure
-
-```
-crates/
-├── valkvork-proto/        valkvork.v1 protos (agent stream + AdminService)
-├── valkvork-common/       manifest parsing/validation, config, models, units, TLS helpers
-├── valkvork-controller/
-│   └── src/
-│       ├── core/          the single actor that owns state and the SQLite writer:
-│       │   ├── mod.rs        commit-then-send, dispatcher (command retries)
-│       │   ├── agents.rs     Register/FR-CON-03, heartbeats, node health
-│       │   ├── reconcile.rs  scaling, rollouts, drains, deletes, backoff
-│       │   ├── autoscale.rs  FR-AUT
-│       │   ├── admin.rs      apply/plan/scale/drain + read views
-│       │   └── tests.rs      behaviour tests (no network)
-│       ├── scheduler.rs   spread placement (pure)
-│       ├── db.rs          schema migrations, load, batched commits, read-only history
-│       ├── grpc.rs        AgentService / AdminService adapters, admin auth
-│       └── server.rs      listeners and TLS
-├── valkvork-agent/
-│   └── src/
-│       ├── runtime.rs     ContainerRuntime trait + DockerRuntime (bollard)
-│       ├── supervisor.rs  start/stop, restart policy, adoption, disk limits, telemetry
-│       ├── connection.rs  outbound stream, Register/heartbeat, backoff
-│       ├── identity.rs    node id, hostname, address
-│       └── telemetry.rs   cgroup v2 and /proc readers
-└── valkvork-cli/          `valkvork` binary
-```
-
-Also: `examples/` (sample manifests), `scripts/dev.sh` (the local cluster
-behind `make dev-*`), `docs/` (guides).
+| Doc | Covers |
+|---|---|
+| [architecture.md](docs/architecture.md) | Processes, ports, where state lives, each operation step by step, failure behaviour |
+| [components/](docs/components/index.md) | Controller core, state store, reconciler, scheduler, node health, autoscaler, admin API, web UI, metrics, agent, agent stream, supervisor, container runtime, manifests, CLI, configuration, security |
+| [local-development.md](docs/local-development.md) | Running a cluster on your machine |
+| [deployment.md](docs/deployment.md) | Artefacts and releases, the golden image, systemd, the production layout, upgrades |
+| [spec.md](spec.md) | The product and technical specification; requirement IDs such as `FR-CON-03` refer to it |
+| [NEXT_STEPS.md](NEXT_STEPS.md) | What is not built yet |
 
 ## Development
 
 ```bash
-make test      # unit and behaviour tests
-make ci        # fmt check, clippy -D warnings, tests
-make fmt
+make build     # debug binaries in target/debug/
+make test      # unit and behaviour tests; no Docker needed
+make ci        # what CI runs: fmt check, clippy -D warnings, tests
+make dist      # static musl binaries in dist/ (PLATFORM=linux/amd64 to cross-build)
 ```
+
+| Path | |
+|---|---|
+| `crates/valkvork-proto` | `valkvork.v1` protos: the agent stream and AdminService |
+| `crates/valkvork-common` | Manifests, configuration, shared models, TLS helpers |
+| `crates/valkvork-controller` | The controller, including the web UI (`ui/` holds its assets) |
+| `crates/valkvork-agent` | The agent |
+| `crates/valkvork-cli` | The `valkvork` CLI |
+| `examples/` | Sample manifests |
+| `scripts/dev.sh` | The local cluster behind `make dev-*` |
+
+Pull requests run CI (fmt, clippy, tests, static build). Pushes to `main` publish `valkvlabs/valkvork-controller` and `valkvlabs/valkvork-agent` as `edge`; tags `vX.Y.Z` publish releases. See [docs/deployment.md](docs/deployment.md#release-workflow).
 
 ## License
 
 Apache 2.0
-
-## Roadmap
-
-- [x] M0: Foundations (proto, TLS, register, heartbeat)
-- [x] M1: Run workloads (manifests, SQLite, apply/plan/delete, scheduler, Docker runtime)
-- [x] M2: Resilience (health, LOST/replacement, reconnect rules, recovery grace, adoption, local restarts)
-- [x] M3: Change management + UI (rolling updates, drain, autoscaler, events, disk limits, host volumes, metrics, web UI)
-- [ ] M4: Production: Packer image in [goldenimage#7](https://github.com/VALKV-LABS/goldenimage/pull/7); Terraform, Litestream and runbooks remain
-- [ ] P2: Native containerd driver, block volumes, mTLS, secrets, etc.
