@@ -107,7 +107,7 @@ make dist      # static musl binaries in dist/ (PLATFORM=linux/amd64 to cross-bu
 | `examples/` | Sample manifests |
 | `scripts/dev.sh` | The local cluster behind `make dev-*` |
 
-Pull requests run CI (fmt, clippy, tests, static build). Pushes to `main` publish `valkvlabs/valkvork-controller` and `valkvlabs/valkvork-agent` as `edge`; tags `vX.Y.Z` publish releases. See [docs/deployment.md](docs/deployment.md#release-workflow).
+Pull requests run CI (fmt, clippy, tests, static build). Pushes to `main` publish `valkvlabs/valkvork-controller` and `valkvlabs/valkvork-agent` as `edge`, and every green commit on `main` is tagged with the next version automatically; you choose which tag to release with `gh workflow run release.yml -f tag=vX.Y.Z`. See [docs/deployment.md](docs/deployment.md#release-workflow).
 
 ## License
 

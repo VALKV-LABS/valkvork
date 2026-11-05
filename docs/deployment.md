@@ -10,18 +10,33 @@ All three binaries are statically linked musl executables with no glibc or OpenS
 |---|---|---|
 | Binaries | `make dist PLATFORM=linux/amd64` (or `linux/arm64`) | `dist/valkvork-controller`, `dist/valkvork-agent`, `dist/valkvork` |
 | Images | `make image`, or the release workflow | `valkvlabs/valkvork-controller` (controller and CLI) and `valkvlabs/valkvork-agent` (agent and CLI), FROM scratch, about 8 MB each |
-| Release tarballs | Pushing a tag `vX.Y.Z` | `valkvork-X.Y.Z-linux-x86_64.tar.gz` and `…-linux-aarch64.tar.gz` with all three binaries, plus `SHA256SUMS`, on the GitHub release |
+| Release tarballs | Releasing a tag `vX.Y.Z` (below) | `valkvork-X.Y.Z-linux-x86_64.tar.gz` and `…-linux-aarch64.tar.gz` with all three binaries, plus `SHA256SUMS`, on the GitHub release |
 
 ### Release workflow
 
-`.github/workflows/release.yml`:
+Tagging is automatic; releasing is your choice.
 
-- **Every push to `main`** publishes both images as `edge`.
-- **A tag `vX.Y.Z`** must match the crate versions, and runs CI first unless it already passed on `main` for that commit. It then publishes both images for amd64 and arm64 as `X.Y.Z`, `X.Y` and `latest`, and creates the GitHub release with the tarballs.
-- Each architecture builds natively on its own runner.
-- The workflow needs the repository secrets `DOCKERHUB_USERNAME` and `DOCKERHUB_TOKEN`.
+| Workflow | When | Does |
+|---|---|---|
+| `ci.yml` | Every pull request and every push to `main` | `cargo fmt --check`, `clippy -D warnings`, the tests, and a static-linking check of the musl build |
+| `tag.yml` | CI passed on a push to `main` | Tags that commit with the next version. Nothing is published |
+| `release.yml` | Every push to `main` | Publishes both images as `edge` |
+| `release.yml` | You run it for a tag, or push a tag yourself | Releases that tag: versioned images and the GitHub release |
 
-`.github/workflows/ci.yml` runs on every pull request: `cargo fmt --check`, `clippy -D warnings`, the tests, and a static-linking check of the musl build. `make ci` runs the first three locally.
+**Version numbers.** `scripts/next-version.sh` picks each tag: the next patch by default (`v0.1.3` → `v0.1.4`). Put `#minor` or `#major` in a commit message, or a pull request title that becomes the merge commit's message, to bump that part instead; `#skip-tag` leaves that commit untagged. The first tag is the crate version, `v0.1.0`. Commits that finish CI out of order never get a lower number than an older tag.
+
+**Releasing.** Pick any tag on `main` whose commit passed CI:
+
+```bash
+git fetch --tags && git tag --sort=-v:refname | head     # see what is available
+gh workflow run release.yml -f tag=v0.1.4                # or Actions → Release → Run workflow
+```
+
+The release builds that tag's commit with its version stamped into the crates (`scripts/set-version.sh`), so the binaries report it in `--version`, which the golden image installer checks. The version committed in `Cargo.toml` is not changed. It publishes both images for amd64 and arm64 as `X.Y.Z`, `X.Y` and `latest`, and a GitHub release with the tarballs and `SHA256SUMS`. Pushing a tag yourself releases it the same way. Tags created by `tag.yml` do not trigger a release, because GitHub never starts workflows from events made with the workflow token.
+
+Each architecture builds natively on its own runner. The workflows need the repository secrets `DOCKERHUB_USERNAME` and `DOCKERHUB_TOKEN`.
+
+`make ci` runs CI's first three checks locally.
 
 ## Production Layout
 
