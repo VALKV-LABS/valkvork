@@ -315,7 +315,7 @@ Every service has an integer `version`. It is incremented by any apply that chan
   * The Packer build MUST **truncate `/etc/machine-id`** and remove `/var/lib/valkvork/` before the image is captured. Otherwise every VM cloned from the image shares one identity (see FR-AGE-02).
 
 * **FR-AGE-02 [MVP]: Configuration and identity**
-  * The agent MUST read `/etc/valkvork/agent.toml`, which cloud-init renders at boot (example in §10.2). It holds the controller endpoint, CA bundle, join token path, `node_class`, reserved resources, and host volumes.
+  * The agent MUST read `/etc/valkvork/agent.toml`, which is rendered at boot (on the golden image, by its bootstrap from a template baked into the image; example in §10.2). It holds the controller endpoint, CA bundle, join token path, `node_class`, reserved resources, and host volumes.
   * `node_id` MUST be a UUIDv5 derived from `/etc/machine-id`, persisted to `/var/lib/valkvork/node_id` on first boot, and stable across agent restarts.
   * The first message on every stream MUST be `Register`. It carries the identity, hostname, IP, node class, allocatable capacity (total minus `[reserved]`), host volumes, agent version, and a **full inventory of the Valkvork containers already on the host**.
 
@@ -767,7 +767,7 @@ Valkvork has two separate traffic paths. **They share nothing.**
 * **FR-SEC-02 [P2]:** Mutual TLS with per-node certificates, issued by the controller from a CSR on first join and rotated automatically.
 * **FR-SEC-03: Admin API and UI.** TLS plus a bearer admin token held in the controller's config. The token must be at least 32 random bytes. The web UI exchanges the same token for a session cookie with CSRF protection (FR-UI-06). RBAC is [P2].
 * **FR-SEC-04: Secrets.** `[env]` values are stored in plaintext in SQLite and in the Litestream replica, so manifests MUST NOT carry secrets in MVP. Secret references, resolved by the agent at start, are [P2].
-* **FR-SEC-05: Network.** Port 50051 is reachable from the worker subnets only. Port 50052 is reachable from the operator/CI CIDR or a bastion only. The agent itself opens no inbound ports. Workers accept inbound traffic only on workload host ports, and only from the load balancer's security group.
+* **FR-SEC-05: Network.** Port 50051 is reachable from the worker subnets only. Port 50052 is reachable from the operator/CI CIDR or a bastion only; the golden image goes further and binds it to the controller's localhost, reached through an SSH or Session Manager port forward. The agent itself opens no inbound ports. Workers accept inbound traffic only on workload host ports, and only from the load balancer's security group.
 * **FR-SEC-06: Docker socket.** `/var/run/docker.sock` gives root on the host. Only the agent may use it. dockerd MUST NOT listen on TCP (`-H tcp://`). The agent MUST refuse to mount the Docker socket, or any path under `/var/lib/docker`, into a workload, even if a host volume points there.
 
 ---
@@ -833,7 +833,8 @@ Containers are children of containerd shims, not of the agent or of dockerd. Res
 ```
 
 ```toml
-# /etc/valkvork/agent.toml  (rendered by cloud-init)
+# /etc/valkvork/agent.toml  (rendered at boot; the golden image renders
+# /etc/valkvork.d/agent.toml from its agent.toml.tmpl)
 controller_endpoint = "https://controlplane.valkvork.internal:50051"
 ca_file             = "/etc/valkvork/ca.pem"
 join_token_file     = "/etc/valkvork/join-token"
@@ -843,8 +844,8 @@ runtime             = "docker"                  # "containerd" in P2 (FR-AGE-10)
 docker_socket       = "/var/run/docker.sock"
 
 [reserved]               # kept back for the OS, dockerd/containerd and the agent
-cpu    = 0.25
-memory = "384MiB"
+cpu    = 0.25            # binary defaults; the golden image scales them to the
+memory = "384MiB"        # instance (e.g. 0.1 core, ~475 MiB on 2 vCPU / 2 GiB)
 
 [host_volumes.pgdata]
 path      = "/data/pgdata"

@@ -60,7 +60,7 @@ Two rules shape everything below:
 | Process | Port | Default | Reachable from | Protocol and authentication |
 |---|---|---|---|---|
 | Controller, agent stream | `agent_listen_addr` | `0.0.0.0:50051` | Worker subnets only | gRPC over TLS. Agents present the join token in their first message |
-| Controller, admin API and web UI | `admin_listen_addr` | `0.0.0.0:50052` | Operators and CI only | gRPC (`application/grpc`) with a bearer admin token, and HTTPS `/ui` with a session cookie. Same TLS certificate. See [admin_api.md](components/admin_api.md) and [web_ui.md](components/web_ui.md) |
+| Controller, admin API and web UI | `admin_listen_addr` | `0.0.0.0:50052` (the golden image uses `127.0.0.1:50052`, reached by port forward) | Operators and CI only | gRPC (`application/grpc`) with a bearer admin token, and HTTPS `/ui` with a session cookie. Same TLS certificate. See [admin_api.md](components/admin_api.md) and [web_ui.md](components/web_ui.md) |
 | Controller metrics | `metrics_listen_addr` | `0.0.0.0:9400` | The monitoring system | Plain HTTP `GET /metrics` |
 | Agent metrics | `metrics_listen_addr` | `127.0.0.1:9401` | The worker itself | Plain HTTP. Must be a loopback address; the agent refuses to start otherwise |
 | Agent | none | | | The agent opens no other listener. It only dials out |

@@ -90,7 +90,7 @@ The spec lists these as non-goals for this release (§1.4): multiple labels or t
 
 The scheduler only places the workload on nodes that declare **every** volume it mounts. The agent bind-mounts the directory into the container, read-only if either the manifest or `agent.toml` says so. The container needs no privileges; the agent, running as root, does the mount. The Docker socket, Docker's data directory and containerd's directories can never be mounted, even through a host volume or a symlink.
 
-On the golden image, declare volumes with `VALKVORK_HOST_VOLUMES=pgdata=/data/pgdata` in user data. Put them on the data volume (`/data`), not the root disk.
+On the golden image, declare volumes with `VALKVORK_HOST_VOLUMES=pgdata=/data/pgdata` in user data (the cell template's `host_volumes` variable); the node class comes from the instance's `valkvork-node-class` tag. Put them on the data volume (`/data`), not the root disk.
 
 ### Data Is Node-Local
 
