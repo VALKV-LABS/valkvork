@@ -168,3 +168,21 @@ The controller image runs as uid 65532, so its database directory must be writab
 - **Upgrade order.** Upgrade the controller first, then roll the workers (spec §11.2). Restarting the controller enters the recovery grace period and never touches running workloads. Proto fields are only ever added, so agents built from older code keep working.
 - **Workers** are immutable: drain a node (`valkvork node drain <id>`), wait until it has no workloads, then replace it with an instance of the new image. Restarting an agent in place also works: it re-adopts its containers.
 - **Database** migrations run automatically at controller start and are forward-only. Snapshot the volume before upgrading.
+
+### Unreleased Binaries on a Dev Cell
+
+To try a fix on a running dev cell without building an image, `scripts/dev-cell-upgrade.sh`
+puts this checkout's binaries on every node of the cell:
+
+```bash
+scripts/dev-cell-upgrade.sh --cell aws-us-west-1-valkvork --bucket <s3-bucket> --region us-west-1
+```
+
+1. It builds them with `make dist`.
+2. It stages them in the bucket, behind a link that expires after 15 minutes. The nodes
+   need no S3 permissions.
+3. On each node, over SSM, it checks the SHA-256, swaps the binaries in and restarts the
+   units that node runs, in upgrade order: the controller node first.
+
+Running workloads keep running. It is for development only: a replaced instance comes back
+with the image's released binaries, so a fix is kept by releasing it and building an image.
