@@ -1,5 +1,9 @@
 # Valkvork
 
+[![CI](https://github.com/VALKV-LABS/valkvork/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/VALKV-LABS/valkvork/actions/workflows/ci.yml)
+[![Release](https://github.com/VALKV-LABS/valkvork/actions/workflows/release.yml/badge.svg)](https://github.com/VALKV-LABS/valkvork/actions/workflows/release.yml)
+[![Latest release](https://img.shields.io/github/v/release/VALKV-LABS/valkvork?sort=semver)](https://github.com/VALKV-LABS/valkvork/releases/latest)
+
 Valkvork is a lightweight workload orchestrator and autoscaler written in Rust, following the model of HashiCorp Nomad with one deliberate simplification: **one controller backed by embedded SQLite, with no Raft or consensus**. The controller's availability comes from cloud primitives, a single-instance auto-scaling group, a persistent disk and backups, rather than from clustering.
 
 - Declarative TOML manifests with `apply`, `plan` and `delete`; re-applying the same manifest is a no-op
