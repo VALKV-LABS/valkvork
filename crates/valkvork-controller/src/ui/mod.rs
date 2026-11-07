@@ -627,6 +627,17 @@ async fn api(state: &Arc<UiState>, req: Request<Body>, rest: &str) -> ApiResult 
             .await?;
             ok(&json!({ "accepted": true, "draining": draining }))
         }
+        (&Method::POST, ["nodes", id, "remove"]) => {
+            let node_id = id.to_string();
+            let stopped = core
+                .ask(|reply| AdminOp::RemoveNode {
+                    node_id,
+                    actor,
+                    reply,
+                })
+                .await?;
+            ok(&json!({ "accepted": true, "workloads_stopped": stopped }))
+        }
 
         (&Method::GET, ["workloads"]) => {
             let filter = WorkloadFilter {

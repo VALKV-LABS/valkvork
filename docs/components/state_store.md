@@ -23,7 +23,7 @@ The schema is spec §12, created by migration 1.
 
 | Table | Key columns | Notes |
 |---|---|---|
-| `nodes` | `node_id`, `hostname`, `ip_address`, `node_class`, `agent_version`, `runtime`, allocatable CPU and memory, `host_volumes` (JSON), `status`, `draining`, `last_heartbeat_at` | Upserted on every Register |
+| `nodes` | `node_id`, `hostname`, `ip_address`, `node_class`, `agent_version`, `runtime`, allocatable CPU and memory, `host_volumes` (JSON), `status`, `draining`, `last_heartbeat_at` | Upserted on every Register; deleted by `node remove`, which sets `node_id` to NULL on the node's remaining workload rows |
 | `services` | `service_id`, `version`, `spec_json`, `spec_hash`, `image`, CPU and memory, `required_class`, `target_replicas`, autoscale bounds, `last_scaled_at`, `status`, `rollout_status` | `spec_json` is the canonical manifest; `spec_hash` its SHA-256 |
 | `workloads` | `workload_id` (UUIDv7, time-ordered), `service_id`, `service_version`, `node_id`, `container_id`, `desired_state`, `status`, `status_reason`, `replaces_workload_id`, `restart_count`, timestamps | `ON DELETE CASCADE` from services |
 | `scaling_events` | `service_id`, from/to replicas, `metric_value`, `reason` | Autoscaler actions |

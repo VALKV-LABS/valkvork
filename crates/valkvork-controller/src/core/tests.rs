@@ -71,6 +71,17 @@ fn register_with(
     token: &str,
     inventory: Vec<pb::WorkloadStatus>,
 ) -> Agent {
+    register_full(c, id, class, token, inventory, vec![])
+}
+
+fn register_full(
+    c: &mut Core,
+    id: &str,
+    class: &str,
+    token: &str,
+    inventory: Vec<pb::WorkloadStatus>,
+    host_volumes: Vec<String>,
+) -> Agent {
     let (tx, rx) = mpsc::channel(1024);
     let conn = CONN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let register = pb::Register {
@@ -82,7 +93,7 @@ fn register_with(
         agent_version: "0.1.0".into(),
         allocatable_cpu_millicores: 2000,
         allocatable_memory_bytes: 4 << 30,
-        host_volumes: vec![],
+        host_volumes,
         inventory,
         runtime: "docker/27.3.1".into(),
     };
@@ -735,6 +746,17 @@ impl Core {
         self.finish().unwrap();
     }
 
+    fn remove_node_for_test(&mut self, node: &str) -> Result<u32, ValkvorkError> {
+        let (tx, mut rx) = oneshot::channel();
+        self.handle(CoreMsg::Admin(AdminOp::RemoveNode {
+            node_id: node.into(),
+            actor: "t".into(),
+            reply: tx,
+        }));
+        self.finish().unwrap();
+        rx.try_recv().unwrap()
+    }
+
     fn set_draining_for_test(&mut self, node: &str, draining: bool) {
         let (tx, _rx) = oneshot::channel();
         self.handle(CoreMsg::Admin(AdminOp::SetDraining {
@@ -811,4 +833,233 @@ fn chart_series_keep_sixty_minutes() {
     let o = c.overview();
     assert_eq!(o.classes[0].series.len(), 60);
     assert_eq!(o.classes[0].class, "general");
+}
+
+#[test]
+fn removing_a_dead_node_stops_its_lost_workloads() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("v.db");
+    let (old, new) = {
+        let mut c = Core::new(cfg(), Db::open(&path).unwrap(), TOKEN.into()).unwrap();
+        let mut a = register(&mut c, "a");
+        let mut b = register(&mut c, "b");
+        c.nodes.get_mut("b").unwrap().node.allocatable_memory_bytes = 1 << 20;
+        apply(&mut c, &manifest("web", "nginx:1", 1, ""));
+        let old = a.starts()[0].workload_id.clone();
+        run_all(&mut c, &a);
+        c.nodes.get_mut("b").unwrap().node.allocatable_memory_bytes = 4 << 30;
+
+        c.nodes.get_mut("a").unwrap().last_seen = Instant::now() - Duration::from_secs(11);
+        c.check_health();
+        c.finish().unwrap();
+        let new = b.starts()[0].workload_id.clone();
+        run_all(&mut c, &b);
+        assert_eq!(c.workloads[&old].status, WorkloadStatus::Lost);
+
+        assert_eq!(c.remove_node_for_test("a").unwrap(), 1);
+        assert!(!c.nodes.contains_key("a"));
+        let w = &c.workloads[&old];
+        assert_eq!(w.status, WorkloadStatus::Stopped);
+        assert_eq!(w.status_reason.as_deref(), Some("NODE_REMOVED"));
+        assert_eq!(w.node_id, None);
+        assert_eq!(c.workloads[&new].status, WorkloadStatus::Running);
+        assert!(c.events.is_empty(), "audit event committed");
+        drop(a);
+        (old, new)
+    };
+
+    // Durable: the node row is gone and the history row lost its node.
+    let mut c = Core::new(cfg(), Db::open(&path).unwrap(), TOKEN.into()).unwrap();
+    assert!(!c.nodes.contains_key("a"));
+    assert_eq!(c.workloads[&old].status, WorkloadStatus::Stopped);
+    assert_eq!(c.workloads[&old].node_id, None);
+    assert_eq!(c.workloads[&new].status, WorkloadStatus::Running);
+
+    // The VM comes back after all: it joins as a new node and its stale
+    // copy is stopped.
+    let mut a2 = register_with(
+        &mut c,
+        "a",
+        "general",
+        TOKEN,
+        vec![status(&old, WorkloadState::Running)],
+    );
+    assert_eq!(stops(&a2.take()), vec![old.clone()]);
+    assert_eq!(c.nodes["a"].node.status, NodeStatus::Healthy);
+}
+
+#[test]
+fn removing_a_healthy_node_is_refused() {
+    let mut c = core();
+    let _a = register(&mut c, "a");
+    let err = c.remove_node_for_test("a").unwrap_err();
+    assert!(matches!(err, ValkvorkError::FailedPrecondition(_)), "{err}");
+    assert!(c.nodes.contains_key("a"));
+    assert!(matches!(
+        c.remove_node_for_test("missing"),
+        Err(ValkvorkError::NotFound(_))
+    ));
+}
+
+// ----------------------------------------------------------------------
+// Single-writer volumes: stop-first updates and drains
+// ----------------------------------------------------------------------
+
+const PGDATA: &str = "[[volumes]]\ntype = \"host\"\nsource = \"pgdata\"\ntarget = \"/data\"\n";
+
+fn register_pg(c: &mut Core, id: &str) -> Agent {
+    let mut a = register_full(c, id, "general", TOKEN, vec![], vec!["pgdata".into()]);
+    a.take();
+    a
+}
+
+/// Report the agent's containers: RUNNING for live ones, none for stopping
+/// ones (their containers are gone).
+fn report(c: &mut Core, a: &Agent) {
+    let on_node: Vec<_> = c
+        .workloads
+        .values()
+        .filter(|w| {
+            w.node_id.as_deref() == Some(&a.id)
+                && matches!(w.status, WorkloadStatus::Assigned | WorkloadStatus::Running)
+        })
+        .map(|w| status(&w.workload_id, WorkloadState::Running))
+        .collect();
+    heartbeat(c, a, on_node);
+    for w in c.workloads.values_mut() {
+        if w.status == WorkloadStatus::Running && w.started_at.is_some() {
+            w.started_at = Some(now_ms() - 60_000);
+        }
+    }
+}
+
+#[test]
+fn single_writer_rolling_update_stops_old_before_starting_new() {
+    let mut c = core();
+    let mut a = register_pg(&mut c, "a");
+    apply(&mut c, &manifest("pg", "postgres:16", 1, PGDATA));
+    let old = a.starts()[0].workload_id.clone();
+    report(&mut c, &a);
+
+    let plan = c
+        .apply(&manifest("pg", "postgres:17", 1, PGDATA), true, "test")
+        .unwrap();
+    assert_eq!(
+        (plan.to_place, plan.placeable),
+        (1, 1),
+        "old one is stopped first"
+    );
+    let out = apply(&mut c, &manifest("pg", "postgres:17", 1, PGDATA));
+    assert_eq!(out.change, ChangeKind::Replacing);
+    // Old first: a stop goes out, no start, and the replacement waits.
+    let msgs = a.take();
+    assert_eq!(stops(&msgs), vec![old.clone()]);
+    assert!(!msgs
+        .iter()
+        .any(|m| matches!(m, pb::controller_message::Msg::StartWorkload(_))));
+    assert_eq!(c.workloads[&old].status, WorkloadStatus::Stopping);
+    assert_eq!(
+        c.workloads[&old].status_reason.as_deref(),
+        Some("ROLLED_OUT")
+    );
+    let new = by_status(&c, "pg", WorkloadStatus::Pending);
+    assert_eq!(new.len(), 1);
+    assert_eq!(new[0].replaces_workload_id.as_deref(), Some(old.as_str()));
+    assert!(new[0]
+        .status_reason
+        .as_deref()
+        .unwrap()
+        .contains("single-writer host volume pgdata in use"));
+    assert_eq!(c.services["pg"].rollout_status, RolloutStatus::InProgress);
+
+    // The old container is gone: the replacement starts on the same node.
+    report(&mut c, &a);
+    assert_eq!(c.workloads[&old].status, WorkloadStatus::Stopped);
+    let starts = a.starts();
+    assert_eq!(starts.len(), 1);
+    assert_eq!(starts[0].workload_id, new[0].workload_id);
+    assert!(starts[0].image.ends_with("postgres:17"));
+    assert_eq!(c.services["pg"].rollout_status, RolloutStatus::InProgress);
+
+    report(&mut c, &a);
+    c.reconcile();
+    c.finish().unwrap();
+    assert_eq!(c.services["pg"].rollout_status, RolloutStatus::None);
+    assert_eq!(c.workloads.values().filter(|w| w.is_live()).count(), 1);
+}
+
+#[test]
+fn single_writer_drain_keeps_workload_when_it_cannot_move() {
+    let mut c = core();
+    let mut a = register_pg(&mut c, "a");
+    let _b = register(&mut c, "b"); // no pgdata
+    apply(&mut c, &manifest("pg", "postgres:16", 1, PGDATA));
+    let old = a.starts()[0].workload_id.clone();
+    report(&mut c, &a);
+
+    c.set_draining_for_test("a", true);
+    c.reconcile();
+    c.finish().unwrap();
+    assert!(
+        stops(&a.take()).is_empty(),
+        "never stopped with nowhere to go"
+    );
+    assert_eq!(c.workloads[&old].status, WorkloadStatus::Running);
+    assert_eq!(c.workloads.values().filter(|w| w.is_live()).count(), 1);
+    let blocked = c.db_events_for_test(&old);
+    assert_eq!(blocked, 1, "reported once, not every pass");
+}
+
+#[test]
+fn single_writer_drain_moves_when_another_node_has_the_volume() {
+    let mut c = core();
+    let mut a = register_pg(&mut c, "a");
+    let mut b = register_pg(&mut c, "b");
+    c.nodes.get_mut("b").unwrap().node.allocatable_memory_bytes = 1 << 20;
+    apply(&mut c, &manifest("pg", "postgres:16", 1, PGDATA));
+    let old = a.starts()[0].workload_id.clone();
+    report(&mut c, &a);
+    c.nodes.get_mut("b").unwrap().node.allocatable_memory_bytes = 4 << 30;
+
+    c.set_draining_for_test("a", true);
+    assert_eq!(stops(&a.take()), vec![old.clone()]);
+    assert_eq!(c.workloads[&old].status_reason.as_deref(), Some("DRAINED"));
+    // b's pgdata is a different directory, so the replacement need not wait.
+    let starts = b.starts();
+    assert_eq!(starts.len(), 1);
+    report(&mut c, &b);
+    report(&mut c, &a);
+    assert_eq!(c.workloads[&old].status, WorkloadStatus::Stopped);
+    assert_eq!(c.workloads.values().filter(|w| w.is_live()).count(), 1);
+}
+
+#[test]
+fn single_writer_volume_is_not_shared_by_replicas() {
+    let mut c = core();
+    let mut a = register_pg(&mut c, "a");
+    apply(&mut c, &manifest("pg", "postgres:16", 2, PGDATA));
+    assert_eq!(a.starts().len(), 1);
+    let pending = by_status(&c, "pg", WorkloadStatus::Pending);
+    assert_eq!(pending.len(), 1);
+    assert!(pending[0]
+        .status_reason
+        .as_deref()
+        .unwrap()
+        .contains("pgdata in use"));
+
+    // Declared shared: both replicas run.
+    let shared = format!("{PGDATA}single_writer = false\n");
+    apply(&mut c, &manifest("pg", "postgres:16", 2, &shared));
+    report(&mut c, &a);
+    report(&mut c, &a);
+    c.reconcile();
+    c.finish().unwrap();
+    assert_eq!(by_status(&c, "pg", WorkloadStatus::Running).len(), 2);
+}
+
+impl Core {
+    /// Committed cluster events about one subject.
+    fn db_events_for_test(&self, subject: &str) -> usize {
+        self.db.count_events_for_test(subject)
+    }
 }

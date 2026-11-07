@@ -64,6 +64,9 @@ pub struct ServiceRuntime {
     /// Autoscaler: when utilisation first went above / below the band.
     pub above_since: Option<Instant>,
     pub below_since: Option<Instant>,
+    /// Stop-first moves that could not proceed because the replacement had
+    /// nowhere to go; each is reported once.
+    pub move_blocked: std::collections::HashSet<String>,
 }
 
 #[derive(Debug, Clone)]

@@ -117,11 +117,16 @@ impl Core {
     }
 
     /// Rolling update (version bump) and drain both migrate workloads with
-    /// start-new-then-stop-old, `max_parallel` at a time.
+    /// start-new-then-stop-old, `max_parallel` at a time. Services with a
+    /// single-writer volume use stop-first instead.
     fn reconcile_migrations(&mut self, service_id: &str) {
         let Some(svc) = self.services.get(service_id) else {
             return;
         };
+        if svc.spec.stop_first() {
+            self.reconcile_migrations_stop_first(service_id);
+            return;
+        }
         let (version, max_parallel, min_healthy, rollout) = (
             svc.version,
             svc.spec.update.max_parallel.max(1) as usize,
@@ -237,7 +242,123 @@ impl Core {
             );
         }
 
-        // Rollout status bookkeeping.
+        self.set_rollout(service_id, version, rollout, any_outdated);
+    }
+
+    /// Stop-first migration for services with a single-writer volume: the
+    /// old workload is stopped and its replacement created at once; the
+    /// replacement stays PENDING until the old container is gone and the
+    /// volume is free, then starts (usually on the same node). One
+    /// replacement per `max_parallel` is coming up at any time. A workload
+    /// is only stopped if its replacement could be placed once it is gone,
+    /// so a drain never stops a workload that has nowhere else to run.
+    fn reconcile_migrations_stop_first(&mut self, service_id: &str) {
+        let Some(svc) = self.services.get(service_id).cloned() else {
+            return;
+        };
+        let version = svc.version;
+        let max_parallel = svc.spec.update.max_parallel.max(1) as usize;
+        let min_healthy = svc.spec.update.min_healthy_time_seconds as i64;
+        let rollout = svc.rollout_status;
+        let halted = rollout == RolloutStatus::Halted;
+        let now = now_ms();
+
+        let draining: HashSet<&str> = self
+            .nodes
+            .values()
+            .filter(|n| n.node.draining)
+            .map(|n| n.node.node_id.as_str())
+            .collect();
+        let live: Vec<&Workload> = self
+            .workloads
+            .values()
+            .filter(|w| w.service_id == service_id && w.is_live())
+            .collect();
+        let healthy = |w: &Workload| {
+            w.status == WorkloadStatus::Running
+                && w.started_at.is_some_and(|t| now - t >= min_healthy * 1000)
+        };
+        let outdated = |w: &Workload| w.service_version < version;
+        let any_outdated = live.iter().any(|w| outdated(w));
+        // Workloads still coming up hold the parallelism budget.
+        let in_flight = live.iter().filter(|w| !healthy(w)).count();
+        let mut movers: Vec<(i64, String, bool)> = live
+            .iter()
+            .filter(|w| outdated(w) || w.node_id.as_deref().is_some_and(|n| draining.contains(n)))
+            // During a halted rollout outdated workloads stay put; a drain
+            // still proceeds.
+            .filter(|w| !(halted && outdated(w)))
+            .map(|w| (w.created_at, w.workload_id.clone(), outdated(w)))
+            .collect();
+        movers.sort();
+        let mover_ids: HashSet<String> = movers.iter().map(|m| m.1.clone()).collect();
+        if let Some(rt) = self.svc_rt.get_mut(service_id) {
+            rt.move_blocked.retain(|id| mover_ids.contains(id));
+        }
+
+        let budget = if self.replacement_blocked(service_id) {
+            0
+        } else {
+            max_parallel.saturating_sub(in_flight)
+        };
+        let mut moving: Vec<(String, bool)> = Vec::new();
+        let mut excluded = HashSet::new();
+        for (_, old, is_outdated) in movers {
+            if moving.len() >= budget {
+                break;
+            }
+            // Would the replacements fit once these old workloads are gone?
+            excluded.insert(old.clone());
+            let mut snap = self.snapshot_excluding(&excluded);
+            let mut fits = Ok(String::new());
+            for _ in 0..=moving.len() {
+                fits = snap.place(&svc.spec);
+                match &fits {
+                    Ok(node) => snap.reserve(node, &svc.spec, true),
+                    Err(_) => break,
+                }
+            }
+            match fits {
+                Ok(_) => moving.push((old, is_outdated)),
+                Err(reason) => {
+                    excluded.remove(&old);
+                    let first = self
+                        .svc_rt
+                        .entry(service_id.to_string())
+                        .or_default()
+                        .move_blocked
+                        .insert(old.clone());
+                    if first {
+                        self.event(
+                            EventKind::Workload,
+                            SubjectType::Workload,
+                            &old,
+                            format!("{service_id}: not stopping {old} (single-writer volume) because its replacement could not be placed ({reason}); it keeps running"),
+                            CONTROLLER,
+                        );
+                    }
+                }
+            }
+        }
+        for (old, is_outdated) in moving {
+            self.stop_workload(&old, if is_outdated { "ROLLED_OUT" } else { "DRAINED" });
+            let w = self.new_workload(&svc, Some(old));
+            self.insert_workload(w);
+        }
+
+        // The rollout lasts until the last replacement is healthy, not just
+        // until the last old workload is stopped.
+        let rolling = any_outdated || (rollout != RolloutStatus::None && in_flight > 0);
+        self.set_rollout(service_id, version, rollout, rolling);
+    }
+
+    fn set_rollout(
+        &mut self,
+        service_id: &str,
+        version: u64,
+        rollout: RolloutStatus,
+        any_outdated: bool,
+    ) {
         match (any_outdated, rollout) {
             (true, RolloutStatus::None) => {
                 self.services.get_mut(service_id).unwrap().rollout_status =

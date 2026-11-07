@@ -5,7 +5,7 @@ Valkvork is a lightweight workload orchestrator and autoscaler written in Rust, 
 - Declarative TOML manifests with `apply`, `plan` and `delete`; re-applying the same manifest is a no-op
 - Spread scheduling with CPU, memory, node-class, host-port and host-volume filtering
 - Automatic replacement of workloads on failed nodes, with exact replica counts after a partition heals
-- Rolling updates and node drains, starting each new workload before stopping the old one
+- Rolling updates and node drains, starting each new workload before stopping the old one, or stopping first for services on a single-writer volume such as a database
 - Local restart-on-failure that keeps working while the controller is unreachable
 - CPU-based horizontal autoscaling with a dead zone, sustain period and cooldown
 - Ephemeral disk limits and node-local host volumes

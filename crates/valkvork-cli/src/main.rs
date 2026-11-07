@@ -118,6 +118,10 @@ enum NodeCmd {
     Undrain {
         node_id: String,
     },
+    /// Forget an UNHEALTHY node, e.g. a VM that was terminated.
+    Remove {
+        node_id: String,
+    },
 }
 
 /// Failure classes mapped to exit codes.
@@ -479,6 +483,20 @@ async fn run(cli: &Cli) -> Result<(), Failure> {
             })
             .await?;
             println!("node {node_id} accepts placements again");
+        }
+        Command::Node {
+            cmd: NodeCmd::Remove { node_id },
+        } => {
+            let r = c
+                .remove_node(pb::RemoveNodeRequest {
+                    node_id: node_id.clone(),
+                })
+                .await?
+                .into_inner();
+            println!(
+                "node {node_id} removed; {} lost workloads marked STOPPED",
+                r.workloads_stopped
+            );
         }
     }
     Ok(())

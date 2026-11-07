@@ -51,7 +51,8 @@ curl -s http://localhost:18080/          # nginx from examples/web.toml
 | Validation | `valkvork plan -f` on a manifest with a typo | exit code 2 and the field path, for example `UNKNOWN_FIELD at service.replica` |
 | Events and audit | Events page, or `valkvork events --kind AUDIT` | every UI and CLI action, with actor `cli` or `ui:<session>` |
 | Host volumes | `valkvork apply -f examples/static-site.toml`, then `curl http://localhost:18081/` | nginx serves `.dev/volumes/site/`; edits on the host show up at once |
-| Data across workloads | [placement-and-storage.md](placement-and-storage.md#try-it-locally) | a Postgres row survives deleting and re-applying the service |
+| Data across workloads | [placement-and-storage.md](placement-and-storage.md#try-it-locally) | a Postgres row survives deleting and re-applying the service, and an image update (stop-first) |
+| Shared volumes | `valkvork apply -f examples/shared-logs.toml` | two nginx replicas on one node, both writing to `.dev/volumes/applogs/` |
 | Pinning | `valkvork apply -f examples/pinned.toml` | PENDING with `NO_NODE: no healthy nodes in class db`, until you run `VALKVORK_DEV_NODE_CLASS=db make dev-up` |
 | Metrics | `curl -s http://127.0.0.1:9400/metrics`, `curl -s http://127.0.0.1:9401/metrics` | controller and agent Prometheus series |
 

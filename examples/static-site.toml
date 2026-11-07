@@ -21,4 +21,4 @@ host_port      = 18081
 type      = "host"
 source    = "site"                       # name from [host_volumes.site] in agent.toml
 target    = "/usr/share/nginx/html"
-read_only = true
+read_only = true                         # read-only volumes are always shared

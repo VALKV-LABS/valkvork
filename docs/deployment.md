@@ -66,7 +66,7 @@ Each architecture builds natively on its own runner. The workflows need the repo
 
 The controller's availability comes from replacing the VM and re-attaching the volume (RTO under 5 minutes), not from clustering. Running workloads keep serving throughout.
 
-Not built yet (see [NEXT_STEPS.md](../NEXT_STEPS.md)): the Terraform for this layout, Litestream backups, publishing metrics to CloudWatch, and the ASG lifecycle hook that drains a worker before it terminates.
+The Terraform for a cell lives in the [goldenimage](https://github.com/VALKV-LABS/goldenimage) repository (`environments/template-valkvork`); it runs a fixed number of instances rather than auto-scaling groups so far. Not built yet (see [NEXT_STEPS.md](../NEXT_STEPS.md)): the auto-scaling groups, Litestream backups, publishing metrics to CloudWatch, and the ASG lifecycle hook that drains a worker before it terminates and then runs `valkvork node remove`.
 
 ## Golden Image
 

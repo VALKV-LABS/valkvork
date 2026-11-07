@@ -315,10 +315,22 @@ async fn delete_needs_the_typed_service_id() {
     .await;
     assert_eq!(r.status(), StatusCode::OK);
     let r = handle(
-        s,
+        s.clone(),
         request(
             Method::POST,
             "/ui/api/nodes/missing/drain",
+            None,
+            Some(&cookie),
+            Some(&csrf),
+        ),
+    )
+    .await;
+    assert_eq!(r.status(), StatusCode::NOT_FOUND);
+    let r = handle(
+        s,
+        request(
+            Method::POST,
+            "/ui/api/nodes/missing/remove",
             None,
             Some(&cookie),
             Some(&csrf),

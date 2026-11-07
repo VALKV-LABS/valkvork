@@ -22,6 +22,8 @@ pub struct NodeCapacity {
     pub used_ports: HashSet<u16>,
     /// service_id -> number of that service's workloads on the node.
     pub per_service: HashMap<String, u32>,
+    /// Host volume name -> workloads using it, as (single-writer, all).
+    pub volume_users: HashMap<String, (u32, u32)>,
 }
 
 impl NodeCapacity {
@@ -46,6 +48,7 @@ impl NodeCapacity {
             alloc_mem: 0,
             used_ports: HashSet::new(),
             per_service: HashMap::new(),
+            volume_users: HashMap::new(),
         }
     }
 
@@ -80,6 +83,8 @@ struct Rejections {
     port_count: usize,
     volume: Option<String>,
     volume_count: usize,
+    volume_busy: Option<String>,
+    volume_busy_count: usize,
 }
 
 impl Snapshot {
@@ -94,6 +99,12 @@ impl Snapshot {
             // Ports stay bound until the container is actually gone, so they
             // are reserved even for workloads that are stopping.
             n.used_ports.extend(spec.ports.iter().map(|p| p.host_port));
+            // Likewise the directory is in use until the container is gone.
+            for v in &spec.volumes {
+                let u = n.volume_users.entry(v.source.clone()).or_default();
+                u.0 += v.single_writer() as u32;
+                u.1 += 1;
+            }
         }
     }
 
@@ -147,6 +158,20 @@ impl Snapshot {
                 rej.volume_count += 1;
                 continue;
             }
+            // A single-writer volume admits no other user; a shared one
+            // admits no single-writer user.
+            if let Some(v) = spec.volumes.iter().find(|v| {
+                let (single, all) = n.volume_users.get(&v.source).copied().unwrap_or_default();
+                if v.single_writer() {
+                    all > 0
+                } else {
+                    single > 0
+                }
+            }) {
+                rej.volume_busy = Some(v.source.clone());
+                rej.volume_busy_count += 1;
+                continue;
+            }
             let score = (
                 n.ratio_with(cpu, mem),
                 n.per_service.get(&spec.id).copied().unwrap_or(0),
@@ -197,6 +222,12 @@ fn reason(spec: &ServiceSpec, r: &Rejections) -> String {
         }
         if let Some(v) = &r.volume {
             parts.push(format!("host volume {v} missing on {}", r.volume_count));
+        }
+        if let Some(v) = &r.volume_busy {
+            parts.push(format!(
+                "single-writer host volume {v} in use on {}",
+                r.volume_busy_count
+            ));
         }
         format!("{}{class}", parts.join(", "))
     };
@@ -304,6 +335,7 @@ mod tests {
             source: "pgdata".into(),
             target: "/d".into(),
             read_only: false,
+            shared: false,
         });
         assert!(s.place(&v).unwrap_err().contains("pgdata"));
         s.nodes
@@ -312,6 +344,26 @@ mod tests {
             .host_volumes
             .insert("pgdata".into());
         assert_eq!(s.place(&v).unwrap(), "a");
+
+        // Single-writer: a second user of a's pgdata is refused, even while
+        // the first only holds the directory (stopping).
+        s.reserve("a", &v, false);
+        assert!(s
+            .place(&v)
+            .unwrap_err()
+            .contains("single-writer host volume pgdata in use on 1"));
+        // Shared users may coexist with each other, not with a single writer.
+        let mut shared = v.clone();
+        shared.volumes[0].shared = true;
+        assert!(s.place(&shared).is_err());
+        s.nodes
+            .get_mut("b")
+            .unwrap()
+            .host_volumes
+            .insert("pgdata".into());
+        s.reserve("b", &shared, true);
+        assert_eq!(s.place(&shared).unwrap(), "b");
+        assert!(s.place(&v).is_err(), "b has a shared user, a a writer");
     }
 
     #[test]

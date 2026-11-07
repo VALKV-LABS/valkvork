@@ -138,7 +138,7 @@ See [web_ui.md](web_ui.md#sign-in-sessions-and-csrf) for the details. In short:
 
 ## Audit
 
-Every operator action (apply, scale, delete, drain, undrain) writes a `cluster_events` row of kind `AUDIT` with the actor (`cli` or `ui:<audit id>`), the target and what was done. They are kept for 30 days. `valkvork events --kind AUDIT` or the Events page show them.
+Every operator action (apply, scale, delete, drain, undrain, node remove) writes a `cluster_events` row of kind `AUDIT` with the actor (`cli` or `ui:<audit id>`), the target and what was done. They are kept for 30 days. `valkvork events --kind AUDIT` or the Events page show them.
 
 ## The Docker Socket
 

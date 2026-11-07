@@ -82,6 +82,9 @@ struct RawVolume {
     target: String,
     #[serde(default)]
     read_only: bool,
+    /// Defaults to true for writable volumes (only one live workload uses
+    /// the directory at a time); false allows sharing it.
+    single_writer: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -301,6 +304,17 @@ fn canonicalise(raw: RawManifest, out: &mut Vec<ValidationError>) -> Option<Serv
         }
     };
 
+    // VE-07: sharing rules only apply to writable volumes.
+    for (i, v) in raw.volumes.iter().enumerate() {
+        if v.read_only && v.single_writer == Some(true) {
+            out.push(ValidationError::new(
+                Code::InvalidVolumeSpec,
+                &format!("volumes[{i}].single_writer"),
+                "single_writer applies to writable volumes; a read_only volume is always shared",
+            ));
+        }
+    }
+
     let spec = ServiceSpec {
         id: raw.service.id,
         image: normalise_image(&raw.service.image),
@@ -331,6 +345,7 @@ fn canonicalise(raw: RawManifest, out: &mut Vec<ValidationError>) -> Option<Serv
                 source: v.source,
                 target: v.target,
                 read_only: v.read_only,
+                shared: v.single_writer == Some(false),
             })
             .collect(),
         autoscale,
@@ -711,5 +726,53 @@ target_cpu_percent = 75
         let errs = parse_manifest_str(&bad).unwrap_err();
         assert!(errs.iter().all(|e| e.code == Code::InvalidVolumeSpec));
         assert_eq!(errs.len(), 2);
+    }
+
+    #[test]
+    fn volumes_default_to_single_writer_when_writable() {
+        let vol = |extra: &str| {
+            let m = format!(
+                "{VALID}\n[[volumes]]\ntype = \"host\"\nsource = \"a\"\ntarget = \"/a\"\n{extra}"
+            );
+            parse_manifest_str(&m).map(|p| p.spec.volumes[0].clone())
+        };
+        let writable = vol("").unwrap();
+        assert!(writable.single_writer() && !writable.shared);
+        let shared = vol("single_writer = false\n").unwrap();
+        assert!(!shared.single_writer() && shared.shared);
+        assert!(vol("single_writer = true\n").unwrap().single_writer());
+        assert!(!vol("read_only = true\n").unwrap().single_writer());
+        let errs = vol("read_only = true\nsingle_writer = true\n").unwrap_err();
+        assert_eq!(errs[0].field_path, "volumes[0].single_writer");
+    }
+
+    /// Every example manifest parses without errors or warnings.
+    #[test]
+    fn examples_are_valid() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples");
+        let mut seen = 0;
+        for entry in std::fs::read_dir(&dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.extension().is_some_and(|e| e == "toml") {
+                let text = std::fs::read_to_string(&path).unwrap();
+                let parsed = parse_manifest_str(&text)
+                    .unwrap_or_else(|e| panic!("{}: {e:?}", path.display()));
+                assert!(
+                    parsed.warnings.is_empty(),
+                    "{}: {:?}",
+                    path.display(),
+                    parsed.warnings
+                );
+                seen += 1;
+            }
+        }
+        assert!(seen >= 7);
+        let pg = parse_manifest_str(&std::fs::read_to_string(dir.join("postgres.toml")).unwrap())
+            .unwrap();
+        assert!(pg.spec.stop_first());
+        let logs =
+            parse_manifest_str(&std::fs::read_to_string(dir.join("shared-logs.toml")).unwrap())
+                .unwrap();
+        assert!(!logs.spec.stop_first());
     }
 }

@@ -29,6 +29,7 @@ With an `https://` endpoint the controller's certificate is verified against `--
 | `events [--kind K] [--limit N]` | Cluster events, newest first. Kinds: `NODE`, `WORKLOAD`, `DEPLOY`, `SCALE`, `AUDIT` |
 | `node list [--class C]` | Nodes with allocation, workloads, heartbeat age and runtime |
 | `node drain <id>` / `node undrain <id>` | Move workloads off a node, or allow placements again |
+| `node remove <id>` | Forget an UNHEALTHY node, such as a terminated VM. Its LOST workloads are marked STOPPED. If it comes back, it joins as a new node |
 
 Manifests are validated locally before anything is sent, so a bad file fails with exit code 2 even when no controller is reachable.
 

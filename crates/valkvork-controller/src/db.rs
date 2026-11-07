@@ -141,6 +141,9 @@ pub struct Batch<'a> {
     pub workloads: Vec<&'a Workload>,
     pub deleted_workloads: Vec<String>,
     pub deleted_services: Vec<String>,
+    /// Removed nodes. Deleted after the workload upserts; `ON DELETE SET
+    /// NULL` clears `node_id` on their remaining workload rows.
+    pub deleted_nodes: Vec<String>,
     pub events: Vec<NewEvent>,
     pub scaling_events: Vec<NewScalingEvent>,
     /// (node_id, last_heartbeat_at) — lazy heartbeat flush.
@@ -154,6 +157,7 @@ impl Batch<'_> {
             && self.workloads.is_empty()
             && self.deleted_workloads.is_empty()
             && self.deleted_services.is_empty()
+            && self.deleted_nodes.is_empty()
             && self.events.is_empty()
             && self.scaling_events.is_empty()
             && self.heartbeats.is_empty()
@@ -453,6 +457,10 @@ impl Db {
             tx.execute("DELETE FROM workloads WHERE workload_id = ?1", params![id])
                 .map_err(db_err)?;
         }
+        for id in &b.deleted_nodes {
+            tx.execute("DELETE FROM nodes WHERE node_id = ?1", params![id])
+                .map_err(db_err)?;
+        }
         let now = now_ms();
         for e in &b.scaling_events {
             tx.execute(
@@ -475,6 +483,17 @@ impl Db {
             .map_err(db_err)?;
         }
         tx.commit().map_err(db_err)
+    }
+
+    #[cfg(test)]
+    pub fn count_events_for_test(&self, subject_id: &str) -> usize {
+        self.conn
+            .query_row(
+                "SELECT COUNT(*) FROM cluster_events WHERE subject_id = ?1",
+                params![subject_id],
+                |r| r.get::<_, i64>(0),
+            )
+            .unwrap() as usize
     }
 
     #[cfg(test)]
