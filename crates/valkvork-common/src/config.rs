@@ -215,6 +215,12 @@ impl AgentConfig {
     }
 
     pub fn validate(&self) -> Result<(), ValkvorkError> {
+        for (name, hv) in &self.host_volumes {
+            hv.owner_ids()
+                .map_err(|e| ValkvorkError::Config(format!("host_volumes.{name}.owner: {e}")))?;
+            hv.mode_bits()
+                .map_err(|e| ValkvorkError::Config(format!("host_volumes.{name}.mode: {e}")))?;
+        }
         if let Some(addr) = self.metrics_listen_addr {
             if !addr.ip().is_loopback() {
                 return Err(ValkvorkError::Config(format!(
@@ -243,12 +249,50 @@ impl Default for ReservedResources {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct HostVolume {
     pub path: PathBuf,
     #[serde(default)]
     pub read_only: bool,
+    /// Numeric `"uid"` or `"uid:gid"` the agent gives the directory at
+    /// startup, so images that run as a non-root user can write to it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner: Option<String>,
+    /// Octal permission bits the agent sets at startup, e.g. `"0750"`, or
+    /// `"1777"` for a scratch directory any user may write.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<String>,
+}
+
+impl HostVolume {
+    /// `owner` as (uid, optional gid).
+    pub fn owner_ids(&self) -> Result<Option<(u32, Option<u32>)>, String> {
+        let Some(o) = self.owner.as_deref() else {
+            return Ok(None);
+        };
+        let num = |s: &str| {
+            s.parse::<u32>()
+                .map_err(|_| format!("{o:?} must be a numeric uid or uid:gid"))
+        };
+        match o.split_once(':') {
+            None => Ok(Some((num(o)?, None))),
+            Some((u, g)) => Ok(Some((num(u)?, Some(num(g)?)))),
+        }
+    }
+
+    /// `mode` as permission bits.
+    pub fn mode_bits(&self) -> Result<Option<u32>, String> {
+        let Some(m) = self.mode.as_deref() else {
+            return Ok(None);
+        };
+        match u32::from_str_radix(m, 8) {
+            Ok(bits) if bits <= 0o7777 && !m.is_empty() => Ok(Some(bits)),
+            _ => Err(format!(
+                "{m:?} must be octal permission bits, e.g. \"0750\""
+            )),
+        }
+    }
 }
 
 // ============================================================================
@@ -314,6 +358,34 @@ read_only = false
             cfg.host_volumes["pgdata"].path,
             PathBuf::from("/data/pgdata")
         );
+        assert_eq!(cfg.host_volumes["pgdata"].owner_ids(), Ok(None));
+    }
+
+    #[test]
+    fn host_volume_owner_and_mode() {
+        let hv = |owner: Option<&str>, mode: Option<&str>| HostVolume {
+            path: "/d".into(),
+            read_only: false,
+            owner: owner.map(Into::into),
+            mode: mode.map(Into::into),
+        };
+        assert_eq!(hv(Some("101"), None).owner_ids(), Ok(Some((101, None))));
+        assert_eq!(
+            hv(Some("101:102"), None).owner_ids(),
+            Ok(Some((101, Some(102))))
+        );
+        assert!(hv(Some("nginx"), None).owner_ids().is_err());
+        assert!(hv(Some("101:"), None).owner_ids().is_err());
+        assert_eq!(hv(None, Some("0750")).mode_bits(), Ok(Some(0o750)));
+        assert_eq!(hv(None, Some("1777")).mode_bits(), Ok(Some(0o1777)));
+        assert!(hv(None, Some("0789")).mode_bits().is_err());
+        assert!(hv(None, Some("17777")).mode_bits().is_err());
+
+        let mut cfg = AgentConfig::default();
+        cfg.host_volumes
+            .insert("logs".into(), hv(Some("app"), None));
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("host_volumes.logs.owner"), "{err}");
     }
 
     #[test]

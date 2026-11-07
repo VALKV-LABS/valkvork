@@ -113,6 +113,9 @@ async fn run(args: Args) -> Result<(), ValkvorkError> {
             host_volumes: cfg.host_volumes.clone(),
         },
     );
+    supervisor
+        .prepare_host_volumes()
+        .map_err(ValkvorkError::Config)?;
     // FR-AGE-07: adopt existing containers before the first Register.
     loop {
         match supervisor.adopt().await {

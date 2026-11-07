@@ -374,6 +374,7 @@ async fn forbidden_host_volume_is_refused() {
                     HostVolume {
                         path: "/var/run".into(),
                         read_only: true,
+                        ..Default::default()
                     },
                 ),
                 (
@@ -381,6 +382,7 @@ async fn forbidden_host_volume_is_refused() {
                     HostVolume {
                         path: "/data/docker/volumes".into(),
                         read_only: false,
+                        ..Default::default()
                     },
                 ),
             ]),
@@ -445,4 +447,78 @@ async fn metrics_render_counts_workloads() {
     );
     assert!(text.contains("valkvork_agent_reconnects_total "));
     assert!(text.contains("# TYPE valkvork_agent_commands_total counter"));
+}
+
+fn supervisor_with(dir: &Path, vols: Vec<(&str, HostVolume)>) -> Arc<Supervisor> {
+    Supervisor::new(
+        Fake::new(),
+        SupervisorConfig {
+            data_dir: dir.to_path_buf(),
+            registry_auth_file: dir.join("none.json"),
+            docker_socket: PathBuf::from("/var/run/docker.sock"),
+            protected_paths: vec![dir.join("docker")],
+            host_volumes: vols.into_iter().map(|(n, v)| (n.to_string(), v)).collect(),
+        },
+    )
+}
+
+/// owner and mode from agent.toml are applied to the directory at startup.
+#[cfg(unix)]
+#[test]
+fn host_volume_owner_and_mode_are_applied() {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    let d = tempfile::tempdir().unwrap();
+    // Without root, the only uid we may chown to is our own.
+    let me = std::fs::metadata(d.path()).unwrap();
+    let logs = d.path().join("logs");
+    let s = supervisor_with(
+        d.path(),
+        vec![
+            (
+                "logs",
+                HostVolume {
+                    path: logs.clone(),
+                    owner: Some(format!("{}:{}", me.uid(), me.gid())),
+                    mode: Some("1777".into()),
+                    ..Default::default()
+                },
+            ),
+            // Neither set: left alone, not even created.
+            (
+                "plain",
+                HostVolume {
+                    path: d.path().join("plain"),
+                    ..Default::default()
+                },
+            ),
+        ],
+    );
+    s.prepare_host_volumes().unwrap();
+    let m = std::fs::metadata(&logs).unwrap();
+    assert_eq!(m.permissions().mode() & 0o7777, 0o1777);
+    assert_eq!((m.uid(), m.gid()), (me.uid(), me.gid()));
+    assert!(!d.path().join("plain").exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn host_volume_prepare_refuses_symlinks_and_protected_paths() {
+    let d = tempfile::tempdir().unwrap();
+    let target = d.path().join("real");
+    std::fs::create_dir(&target).unwrap();
+    let link = d.path().join("link");
+    std::os::unix::fs::symlink(&target, &link).unwrap();
+    let vol = |p: PathBuf| HostVolume {
+        path: p,
+        mode: Some("0750".into()),
+        ..Default::default()
+    };
+    let err = supervisor_with(d.path(), vec![("l", vol(link))])
+        .prepare_host_volumes()
+        .unwrap_err();
+    assert!(err.contains("not a symlink"), "{err}");
+    let err = supervisor_with(d.path(), vec![("p", vol(d.path().join("docker/volumes")))])
+        .prepare_host_volumes()
+        .unwrap_err();
+    assert!(err.contains("protected"), "{err}");
 }

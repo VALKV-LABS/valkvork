@@ -70,7 +70,11 @@ memory = "384MiB"
 [host_volumes.pgdata]      # one table per volume manifests can mount by name
 path      = "/data/pgdata"
 read_only = false
+# owner   = "101:101"      # optional numeric uid or uid:gid, applied at startup
+# mode    = "0750"         # optional octal permission bits, applied at startup
 ```
+
+When `owner` or `mode` is set, the agent creates the directory if it is missing and applies them at every startup, so an image that runs as a non-root user can write to the volume. Only the directory itself changes, never the files in it. Both must be numeric (`owner = "nginx"` is rejected, since names differ between the host and the image), and `--check-config` validates them. The agent refuses to change a symlink, a non-directory, or a protected path such as Docker's data directory.
 
 `data_dir` must be visible to the Docker daemon at the same path, because the agent bind-mounts alloc directories from it. On a normal Linux host it is. With Docker in a VM (Colima, Docker Desktop), use a path under your home directory, which those share.
 

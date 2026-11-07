@@ -414,6 +414,49 @@ impl Supervisor {
         Ok(cid)
     }
 
+    /// Apply each host volume's `owner` and `mode` from agent.toml, creating
+    /// the directory if needed, so images that run as a non-root user can
+    /// write to it. Only the directory itself changes, never its contents.
+    /// Protected paths, symlinks and non-directories are refused.
+    pub fn prepare_host_volumes(&self) -> Result<(), String> {
+        for (name, hv) in &self.cfg.host_volumes {
+            let err = |e: String| format!("host volume {name} ({}): {e}", hv.path.display());
+            let owner = hv.owner_ids().map_err(err)?;
+            let mode = hv.mode_bits().map_err(err)?;
+            if owner.is_none() && mode.is_none() {
+                continue;
+            }
+            if self.forbidden(&hv.path) {
+                return Err(err("refusing to change a protected path".into()));
+            }
+            std::fs::create_dir_all(&hv.path).map_err(|e| err(e.to_string()))?;
+            let meta = std::fs::symlink_metadata(&hv.path).map_err(|e| err(e.to_string()))?;
+            if meta.file_type().is_symlink() || !meta.is_dir() {
+                return Err(err("must be a directory, not a symlink".into()));
+            }
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                if let Some((uid, gid)) = owner {
+                    std::os::unix::fs::chown(&hv.path, Some(uid), gid)
+                        .map_err(|e| err(format!("chown: {e}")))?;
+                }
+                if let Some(bits) = mode {
+                    std::fs::set_permissions(&hv.path, std::fs::Permissions::from_mode(bits))
+                        .map_err(|e| err(format!("chmod: {e}")))?;
+                }
+            }
+            tracing::info!(
+                volume = %name,
+                path = %hv.path.display(),
+                owner = hv.owner.as_deref().unwrap_or("-"),
+                mode = hv.mode.as_deref().unwrap_or("-"),
+                "prepared host volume"
+            );
+        }
+        Ok(())
+    }
+
     fn forbidden(&self, path: &Path) -> bool {
         // Check both the configured and the resolved path, so symlinks cannot
         // be used to smuggle the socket in (and /var/run → /run style links match).
