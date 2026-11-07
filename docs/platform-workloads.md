@@ -47,6 +47,18 @@ No Valkvork features. Infrastructure and tooling that Stages 1 and 2 need.
 | 0.3 | Workload secrets created in SSM: `POSTGRES_PASSWORD` and `APG_SECRET_KEY`, `APG_ADMIN_TOKEN`, `APG_NODE_TOKEN` under that prefix | You, with `aws ssm put-parameter` | The manifests reference them |
 | 0.4 | A dev-cell upgrade script: copy unreleased binaries to the nodes over SSM and restart the agent and controller | valkvork `scripts/` | Lets a fix be tried in minutes, without an image build. Releases still go through the image |
 
+**Status:**
+- 0.1 and 0.2 are built: goldenimage#11, which also sets `aws-us-west-1-valkvork` to the layout below.
+- 0.4 is built: valkvork#8 (`scripts/dev-cell-upgrade.sh`).
+- 0.3 is yours, after goldenimage#11 is applied:
+
+  ```bash
+  for name in POSTGRES_PASSWORD APG_SECRET_KEY APG_ADMIN_TOKEN APG_NODE_TOKEN; do
+    aws ssm put-parameter --region us-west-1 --type SecureString \
+      --name "/valkv/aws-us-west-1-valkvork/workloads/$name" --value "$(openssl rand -hex 32)"
+  done
+  ```
+
 **Cell layout for Stages 1 and 2** (`aws-us-west-1-valkvork`, two nodes):
 
 | Node | Class | Host volumes |
