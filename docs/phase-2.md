@@ -28,6 +28,8 @@ This page collects every P2 and P3 item, and for each one: what it is, what alre
 
 ## Suggested Order
 
+The [platform workloads plan](platform-workloads.md) takes precedence. It schedules secret references, health checks and batch jobs first, along with a few things not listed here: a bind address per port, `command` and `args`, and secrets inside values.
+
 1. **The MVP gaps that P2 builds on are done:** node removal (`valkvork node remove`) and stop-first updates for single-writer volumes, which block volumes will reuse.
 2. **Health checks.** Small, self-contained, and they make rollouts, drains and load balancer registration safer.
 3. **Secret references**, then **per-node mTLS**: both close security gaps that production users hit first.
