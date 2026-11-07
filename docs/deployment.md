@@ -54,7 +54,7 @@ Each architecture builds natively on its own runner. The workflows need the repo
             │  outbound gRPC/TLS :50051
             └────────┬─────────┘
           ┌──────────▼──────────────────────────┐
-          │ controller VM  (ASG 1/1/1, one AZ)  │──► S3 (Litestream WAL replica)
+          │ controller VM  (ASG 1/1/1, one AZ)  │──► daily EBS snapshots
           │ fixed-IP ENI + DNS name             │
           │ EBS volume for the database         │
           └─────────────────────────────────────┘
@@ -66,7 +66,7 @@ Each architecture builds natively on its own runner. The workflows need the repo
 
 The controller's availability comes from replacing the VM and re-attaching the volume (RTO under 5 minutes), not from clustering. Running workloads keep serving throughout.
 
-The Terraform for a cell lives in the [goldenimage](https://github.com/VALKV-LABS/goldenimage) repository (`environments/template-valkvork`); it runs a fixed number of instances rather than auto-scaling groups so far. Not built yet (see [NEXT_STEPS.md](../NEXT_STEPS.md)): the auto-scaling groups, Litestream backups, publishing metrics to CloudWatch, and the ASG lifecycle hook that drains a worker before it terminates and then runs `valkvork node remove`.
+The Terraform for a cell lives in the [goldenimage](https://github.com/VALKV-LABS/goldenimage) repository (`environments/template-valkvork`); it runs a fixed number of instances rather than auto-scaling groups so far. The controller's data volume is snapshotted daily (goldenimage `controller_backup_*`). Not built yet: the auto-scaling groups ([NEXT_STEPS.md](../NEXT_STEPS.md)). Deferred until needed ([phase-2.md](phase-2.md#later-only-if-needed)): continuous Litestream backups, and node scaling from controller metrics with its drain-then-remove lifecycle hook.
 
 ## Golden Image
 
