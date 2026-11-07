@@ -141,26 +141,27 @@ three `*-db-init` services.
 
 ---
 
-## Decisions Before Stage 1
+## Decisions (2026-11-07)
 
-**1. Containers can use the node's role.**
+**1. Containers can use the node's role: accepted for Stages 1 and 2.**
 - The golden image allows containers to reach the instance metadata service (hop limit 2), and some platform services need the role, such as global-cp launching EC2 instances.
 - So any container on a node can read whatever that node's role can, including every workload secret under the prefix.
 - On the controller node, that includes the controller's TLS key and admin token.
-- **Recommendation:** accept this for Stages 1 and 2 and document it. Run only trusted platform services on the controller node. Per-workload credentials come later.
+- Mitigation: run only trusted platform services on the controller node. Per-workload credentials come later.
 
-**2. Secrets as variables or as files.**
-- Environment variables work for every service here.
-- Files under `/alloc/secrets/` could be rotated without a restart, and keep values out of `docker inspect`.
-- **Recommendation:** variables now; files when a service needs rotation without restart.
+**2. Secrets as environment variables, for now.** Files are the more secure delivery:
+- A variable is visible in `docker inspect`, in the process's `/proc/<pid>/environ`, and to child processes, and it can end up in crash reports and debug output.
+- A file on an in-memory filesystem, readable only by the container's user, avoids all of that and can be rotated without a restart.
+- Variables come first because every service here reads its secrets from them, while only some images read secrets from files (Postgres can, with `POSTGRES_PASSWORD_FILE`).
+- File delivery is a planned follow-up (NEXT_STEPS.md, "Re-evaluate").
 
-**3. Caching resolved secrets.**
-- Without a cache, a container restart while SSM is unreachable fails, and the restart policy retries it.
-- **Recommendation:** no cache in Stage 1. Revisit if it shows up in testing.
+**3. No cache of resolved secrets.**
+- A container restart while SSM is unreachable fails, and the restart policy retries it.
+- Revisit if it shows up in testing.
 
-**4. The default bind address.**
-- Keep `0.0.0.0` as the default and opt in per port, so existing manifests behave the same.
-- **Recommendation:** revisit after Stage 2, possibly making `advertise` the default.
+**4. Bind address: `0.0.0.0` stays the default.**
+- Ports opt in per port with `host_ip`, so existing manifests behave the same.
+- Re-evaluate after Stage 2: making `advertise` the default (NEXT_STEPS.md, "Re-evaluate").
 
 ---
 
