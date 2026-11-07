@@ -55,7 +55,7 @@ The spec's second autoscaling loop (§10.4) scales each node class's ASG from th
 - scale out when `valkvork_pending_unplaced_workloads{class} > 0` for 1 minute, or `valkvork_allocated_ratio{class}` stays above 0.8;
 - scale in when `valkvork_allocated_ratio{class}` stays below 0.4 for 15 minutes, draining nodes through an ASG lifecycle hook first.
 
-Publishing these to CloudWatch and wiring the hooks is not built yet; see [NEXT_STEPS.md](../../NEXT_STEPS.md).
+Publishing these to CloudWatch and wiring the hooks is deferred until needed; see [phase-2.md](../phase-2.md#infrastructure-autoscaling-from-controller-metrics).
 
 ## Example Alerts
 

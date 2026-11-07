@@ -126,7 +126,7 @@ Read it from top to bottom. Operators change *desired state*. The controller tur
 | 3 | Controller → agent | `StartWorkload`, `StopWorkload` | Whenever desired ≠ actual | Agent's own stream, :50051 |
 | 4 | Agent → controller | `Register` (identity, capacity, container inventory). `Heartbeat` (usage, per-container state and CPU). `CommandResult` (acks). | On connect; every 2 s; per command | Agent's own stream, :50051 |
 | 5 | End users → containers | Application requests | Always | Public LB → worker host ports (§8.2) |
-| 6 | Controller → S3 | SQLite WAL frames (backup) | Continuous | Litestream (§10.3) |
+| 6 | Controller data volume → EBS snapshots | The whole volume, including SQLite (backup) | Daily | AWS Data Lifecycle Manager (§10.3); continuous Litestream to S3 is [Later] |
 | 7 | Containers → agent | CPU and memory counters | Every 2 s | Local cgroup v2 files (FR-AGE-03) |
 
 * **FR-ARC-01 [MVP]:** Agents MUST open connections **outbound only**. Agents expose no network listener apart from an optional `127.0.0.1` metrics endpoint. Commands travel down the agent's own stream, so the controller never initiates a connection to a worker.
@@ -766,7 +766,7 @@ Valkvork has two separate traffic paths. **They share nothing.**
 * **FR-SEC-01: Agent → controller.** The connection uses TLS (`rustls`), and the agent verifies the controller certificate against the CA bundle in `/etc/valkvork/ca.pem`. Agents authenticate with a **join token**, which cloud-init fetches at boot from a secrets store (AWS SSM Parameter Store or GCP Secret Manager). The token is never baked into the image. Unauthenticated `Register` calls are rejected.
 * **FR-SEC-02 [P2]:** Mutual TLS with per-node certificates, issued by the controller from a CSR on first join and rotated automatically.
 * **FR-SEC-03: Admin API and UI.** TLS plus a bearer admin token held in the controller's config. The token must be at least 32 random bytes. The web UI exchanges the same token for a session cookie with CSRF protection (FR-UI-06). RBAC is [P2].
-* **FR-SEC-04: Secrets.** `[env]` values are stored in plaintext in SQLite and in the Litestream replica, so manifests MUST NOT carry secrets in MVP. Secret references, resolved by the agent at start, are [P2].
+* **FR-SEC-04: Secrets.** `[env]` values are stored in plaintext in SQLite and in its backups, so manifests MUST NOT carry secrets in MVP. Secret references, resolved by the agent at start, are [P2].
 * **FR-SEC-05: Network.** Port 50051 is reachable from the worker subnets only. Port 50052 is reachable from the operator/CI CIDR or a bastion only; the golden image goes further and binds it to the controller's localhost, reached through an SSH or Session Manager port forward. The agent itself opens no inbound ports. Workers accept inbound traffic only on workload host ports, and only from the load balancer's security group.
 * **FR-SEC-06: Docker socket.** `/var/run/docker.sock` gives root on the host. Only the agent may use it. dockerd MUST NOT listen on TCP (`-H tcp://`). The agent MUST refuse to mount the Docker socket, or any path under `/var/lib/docker`, into a workload, even if a host volume points there.
 
@@ -790,8 +790,8 @@ Valkvork has two separate traffic paths. **They share nothing.**
             │  outbound gRPC/TLS :50051
             └────────┬─────────┘
           ┌──────────▼──────────────────────────┐
-          │ Controller VM  (ASG 1/1/1, one AZ)  │──► S3 bucket (Litestream WAL
-          │ fixed-IP ENI + DNS name             │    replica, versioned)
+          │ Controller VM  (ASG 1/1/1, one AZ)  │──► daily EBS snapshots
+          │ fixed-IP ENI + DNS name             │    (Litestream to S3: [Later])
           │ EBS volume: /var/lib/valkvork/db    │
           └─────────────────────────────────────┘
 ```
@@ -858,15 +858,15 @@ read_only = false
   1. Attach the tagged EBS data volume. If the dead instance still holds it, force-detach first, after confirming that instance is terminated.
   2. Mount the volume at `/var/lib/valkvork/db`.
   3. Attach the fixed-IP ENI.
-  4. If the volume is missing or the database fails `PRAGMA integrity_check`, run `litestream restore` from S3.
-  5. Start `litestream replicate` and `valkvork-controller`.
-* **Backups:** Litestream streams the WAL continuously to a versioned S3 bucket (RPO ≈ seconds). This copy covers losing the AZ or the volume. A nightly snapshot of the EBS volume gives defence in depth.
+  4. Start `valkvork-controller`.
+* **Backups [MVP]:** a daily EBS snapshot of the controller's data volume (AWS Data Lifecycle Manager, 7 kept). Snapshots are crash-consistent, which SQLite in WAL mode recovers from like a power loss. They are stored regionally, so they cover deleting the volume, a bad write (restore the previous day) and losing the AZ. RPO ≤ 24 h, which is acceptable: the database holds desired state, not customer data, and services can be re-applied from their manifests. Restoring is a manual step.
+* **Continuous backups [Later]:** Litestream would stream the WAL to a versioned S3 bucket (RPO ≈ seconds, point-in-time restore), and the boot script would run `litestream restore` when the volume is missing or fails `PRAGMA integrity_check`. Built only if a day of lost changes becomes unacceptable (see docs/phase-2.md).
 * **SQLite on block storage only:** never place the database on NFS, EFS or any other network filesystem.
 * **Targets:** RTO < 5 min for instance loss (detect, boot, attach, recover) and < 15 min for AZ loss (manual or scripted ASG AZ switch plus S3 restore). The data plane keeps serving traffic throughout (NFR-02).
 
 ### 10.4 Two-layer autoscaling
 * **Loop A: application (Valkvork).** The controller changes replica counts (§6.5). It works only within existing capacity.
-* **Loop B: infrastructure (cloud ASG, one per node class).** The scale signals come from the **controller's** metrics, published to CloudWatch [Cloud Monitoring]. Host CPU is not used, because Valkvork places workloads by reservation, not by usage.
+* **Loop B: infrastructure (cloud ASG, one per node class) [Later].** Not scheduled; until it is, node counts are changed by the operator (see docs/phase-2.md). The scale signals come from the **controller's** metrics, published to CloudWatch [Cloud Monitoring]. Host CPU is not used, because Valkvork places workloads by reservation, not by usage.
   * **Scale out** when `valkvork_pending_unplaced_workloads{class} > 0` for 1 min, **or** when `valkvork_allocated_ratio{class}` is above 80 %.
   * **Scale in** when `valkvork_allocated_ratio{class}` stays below 40 % for 15 min.
   * Every scale-in, and every instance refresh for an image upgrade, passes through an **ASG lifecycle hook**. The hook calls `valkvork node drain` (FR-CON-08) and lets termination proceed only after the drain completes.
@@ -878,7 +878,7 @@ read_only = false
 | :--- | :--- | :--- | :--- |
 | Controller process crash | systemd | Restart, then 30 s recovery grace (FR-CON-04). | None. Scaling and replacement pause for about 30 s. |
 | Controller VM loss | ASG health check | New VM, volume re-attach, ENI move (§10.3). | None to running workloads. No changes for up to 5 min. |
-| Controller volume or AZ loss | Boot script | Restore from S3 with Litestream. | None to running workloads. Intent from the last seconds before the loss may be lost. |
+| Controller volume or AZ loss | Operator | Restore the latest daily snapshot to a new volume and attach it (§10.3). | None to running workloads while the controller is down. Changes since the last snapshot (up to 24 h) are lost and are re-applied from manifests. |
 | Worker VM dies | 10 s without heartbeat | `LOST`, then replacements placed (FR-CON-02). | Replicas on that node are down for ~10–15 s plus start time. |
 | Network partition (worker ↔ controller) | 10 s without heartbeat | Replacements placed. On heal, apply the FR-CON-03 rules. | Replicas briefly exceed the target during the partition and converge exactly after it heals. |
 | Agent crash or upgrade | systemd | Agent restarts and adopts its containers (FR-AGE-07). | None. |
@@ -1155,7 +1155,7 @@ The scheduler and reconciler work from an in-memory snapshot of these tables, re
 | **NFR-03** | Zero runtime dependencies: static musl binaries, `rustls` (the `ring` provider simplifies static musl builds), and SQLite compiled in (`rusqlite` with `bundled`). No glibc or OpenSSL on hosts. | `ldd` reports "not a dynamic executable" |
 | **NFR-04** | Scale target (MVP): 50 nodes, 500 workloads, 50 services. | Load test |
 | **NFR-05** | Latency: `apply` → `StartWorkload` dispatched in < 1 s (p99). Node failure → replacement dispatched in ≤ 15 s. | AT-02, AT-06 |
-| **NFR-06** | Durability: an acknowledged `Apply` survives `kill -9` and power loss. Litestream RPO ≤ 10 s. | AT-03, AT-10 |
+| **NFR-06** | Durability: an acknowledged `Apply` survives `kill -9` and power loss. Backup RPO ≤ 24 h with daily snapshots (≤ 10 s with Litestream, [Later]). | AT-03, AT-10 |
 | **NFR-07** | Observability: JSON `tracing` logs. Prometheus `/metrics` on controller `:9400` and agent `127.0.0.1:9401`. Minimum metric set: `valkvork_nodes{status,class}`, `valkvork_workloads{status}`, `valkvork_pending_unplaced_workloads{class}`, `valkvork_allocated_ratio{class,resource}`, `valkvork_service_cpu_utilization{service}`, `valkvork_scaling_actions_total{service,direction}`, `valkvork_schedule_duration_seconds`, `valkvork_agent_reconnects_total`. | Metrics test |
 | **NFR-08** | Platform: Linux x86_64, kernel ≥ 5.10, cgroup v2, Docker Engine ≥ 27.0 with `live-restore`. The native containerd driver (containerd ≥ 1.7) and aarch64 are [P2]. | CI matrix |
 
@@ -1192,7 +1192,7 @@ The scheduler and reconciler work from an in-memory snapshot of these tables, re
 | **M1: Run workloads** | Manifest parse and validation, SQLite and migrations, apply/plan/delete, scheduler, `ContainerRuntime` trait plus `DockerRuntime` start/stop, scale up/down. | AT-01, AT-02, AT-08. |
 | **M2: Resilience** | Node health, `LOST` and replacement, FR-CON-03 reconnect rules, recovery grace, adoption, orphans, local restart, backoff/`DEGRADED`. | AT-03 … AT-06, AT-15. |
 | **M3: Change management + UI** | Rolling updates, drain, autoscaler, scaling and cluster events, ephemeral disk limits, host volumes, metrics. Built-in web UI: read-only pages first, then actions. | AT-07, AT-09, AT-12, AT-13, AT-16. |
-| **M4: Production** | Packer image. Terraform (VPC, worker ASGs per class, controller ASG + EBS + ENI, Litestream/S3, LB target groups, metric publishing, lifecycle hooks). Runbooks. | AT-10, AT-11. NFR load test. |
+| **M4: Production** | Packer image. Terraform (VPC, worker ASGs per class, controller ASG + EBS + ENI, daily EBS snapshots, LB target groups). Litestream, metric publishing and lifecycle hooks are [Later]. Runbooks. | AT-10, AT-11. NFR load test. |
 | **P2** | Native containerd driver (FR-AGE-10), block volumes with fencing, mTLS per-node certs, secrets, health checks, dynamic ports and catalogue, batch/system jobs, RBAC, aarch64. | n/a |
 
 ---

@@ -68,4 +68,4 @@ Every 10 minutes the core prunes history (FR-CON-11):
 
 ## Backups
 
-Backups are not part of the controller. The spec uses Litestream to stream the WAL to S3 (§10.3); that is not set up yet, see [NEXT_STEPS.md](../../NEXT_STEPS.md). Until then, take snapshots of the volume that holds the database.
+Backups are not part of the controller. On the golden image, the cell takes a daily EBS snapshot of the volume that holds the database (7 kept). A snapshot is crash-consistent, which SQLite in WAL mode recovers from like a power loss, and a restore loses up to a day of changes (spec §10.3). Continuous WAL streaming with Litestream is deferred until needed; see [phase-2.md](../phase-2.md#continuous-controller-backups-litestream).

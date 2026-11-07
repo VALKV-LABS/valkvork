@@ -22,6 +22,9 @@ This page collects every P2 and P3 item, and for each one: what it is, what alre
 | [Topology anti-affinity](#topology-anti-affinity-and-failure-domain-spread) | FR-STO-21, §1.4 | P3 | The scheduler's score |
 | [Out-of-band volume reconciliation](#out-of-band-volume-reconciliation) | FR-STO-20 | P3 | Block volumes |
 | [Local NVMe pooling](#local-nvme-pooling) | FR-STO-22 | P3 | Host volumes |
+| [Continuous controller backups (Litestream)](#continuous-controller-backups-litestream) | §10.3, NFR-06 | Later | Daily EBS snapshots of the controller volume |
+| [Infrastructure autoscaling from controller metrics](#infrastructure-autoscaling-from-controller-metrics) | §10.4 | Later | The Prometheus metrics, `node drain`, `node remove`, per-class ASGs |
+| [Automatic removal of dead nodes](#automatic-removal-of-dead-nodes) | FR-CON-08 | Later | `valkvork node remove` |
 
 ## Suggested Order
 
@@ -95,7 +98,7 @@ target = "/data"
 2. The controller, acting as a CA (for example with `rcgen`), signs a short-lived certificate whose subject is the `node_id`, and returns it in `RegisterAck`.
 3. The agent stores it in `data_dir` and uses it as its client identity from then on; it renews before expiry.
 4. The agent listener then requires client certificates, and the controller checks that the certificate's `node_id` matches the one in `Register`. The join token is needed only to enrol.
-5. Removing a node (NEXT_STEPS item 7) revokes its certificate.
+5. Removing a node (`valkvork node remove`) revokes its certificate.
 
 **Questions:** where the CA key lives and how it is backed up; certificate lifetime; a migration window where both modes are accepted.
 
@@ -179,6 +182,40 @@ failures = 3
 *Open decision 8, spec §10.* The MVP is AWS-first. GCP needs: a stateful managed instance group of size 1 for the controller with a persistent disk and a fixed internal IP; Secret Manager instead of SSM in the golden image's bootstrap; Persistent Disk in the block-volume driver; Cloud Monitoring for the infrastructure scaling loop. The golden image already has OCI sources; a GCP source would follow the same pattern.
 
 ---
+
+## Later: Only If Needed
+
+Not scheduled. Each one replaces something that works well enough today, so it is built only when a real need appears.
+
+### Continuous Controller Backups (Litestream)
+
+*Spec §10.3, NFR-06.* **Today:** the cell takes a daily EBS snapshot of the controller's data volume (goldenimage `controller_backup_*`, 7 kept). A restore loses up to a day of desired state: services, versions, replica targets. That is acceptable because the database holds no customer data. Workloads keep their data on the agents, and services can be re-applied from their manifests.
+
+**What Litestream would add:** it streams the SQLite WAL to a versioned S3 bucket, so at most a few seconds are lost, with point-in-time restore. A replacement controller in another AZ could restore on its own at boot (`litestream restore` when the volume is missing or fails `PRAGMA integrity_check`).
+
+**Build it when** losing a day of changes becomes unacceptable, for example when many teams deploy often, or when the controller must recover across AZs without an operator.
+
+**Sketch:** add the `litestream` binary and a systemd unit to the golden image, replicating `/data/valkvork/db/valkvork.db`; an S3 bucket with versioning and a lifecycle rule; IAM for the controller role; and the restore step in the bootstrap, before the controller starts.
+
+### Infrastructure Autoscaling from Controller Metrics
+
+*Spec §10.4, loop B.* **Today:** nodes are added and removed by changing the cell's instance count. The application loop (loop A, the autoscaler) works within the capacity that exists.
+
+**What it would add:** per-class worker ASGs that scale from the controller's own signals, published to CloudWatch:
+- scale out when `valkvork_pending_unplaced_workloads{class} > 0` for 1 minute, or `valkvork_allocated_ratio{class}` is above 0.8;
+- scale in when the ratio stays below 0.4 for 15 minutes.
+
+Every scale-in and instance refresh would pass through an ASG lifecycle hook that runs `valkvork node drain`, waits until the node is empty, lets termination continue, then runs `valkvork node remove`. The admin API listens on the controller's localhost, so the hook runs those commands on the controller, for example through SSM Run Command.
+
+**Build it when** load changes faster than an operator can change node counts. It needs the per-class ASGs (NEXT_STEPS) first.
+
+### Automatic Removal of Dead Nodes
+
+*FR-CON-08 (node removal).* **Today:** a terminated worker stays UNHEALTHY in the node list, its LOST workloads already replaced elsewhere, until an operator runs `valkvork node remove <id>` or clicks **Remove** in the UI. Nothing breaks while it is listed; it is clutter.
+
+**What it would add:** an optional controller setting, for example `remove_unhealthy_nodes_after_hours = 24`, that removes a node once it has been UNHEALTHY that long, exactly as `node remove` does: its LOST workloads become STOPPED (`NODE_REMOVED`), the row is deleted, and an AUDIT event is written with actor `controller`. If the node comes back, it joins as a new node.
+
+**Build it when** nodes are replaced often enough that removing them by hand is a chore, and the scale-in hook above is not in place to call `node remove` itself.
 
 ## Phase 3 (Research)
 
