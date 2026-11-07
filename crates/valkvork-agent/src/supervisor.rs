@@ -318,6 +318,7 @@ impl Supervisor {
         let wid = &cmd.workload_id;
         let alloc = self.alloc_dir(wid);
         std::fs::create_dir_all(&alloc)
+            .and_then(|()| make_alloc_writable(&alloc))
             .map_err(|e| ("ALLOC_DIR_FAILED".to_string(), e.to_string()))?;
 
         let mut mounts = vec![BindMount {
@@ -411,6 +412,49 @@ impl Supervisor {
             .await
             .map_err(|e| ("START_FAILED".to_string(), e.to_string()))?;
         Ok(cid)
+    }
+
+    /// Apply each host volume's `owner` and `mode` from agent.toml, creating
+    /// the directory if needed, so images that run as a non-root user can
+    /// write to it. Only the directory itself changes, never its contents.
+    /// Protected paths, symlinks and non-directories are refused.
+    pub fn prepare_host_volumes(&self) -> Result<(), String> {
+        for (name, hv) in &self.cfg.host_volumes {
+            let err = |e: String| format!("host volume {name} ({}): {e}", hv.path.display());
+            let owner = hv.owner_ids().map_err(err)?;
+            let mode = hv.mode_bits().map_err(err)?;
+            if owner.is_none() && mode.is_none() {
+                continue;
+            }
+            if self.forbidden(&hv.path) {
+                return Err(err("refusing to change a protected path".into()));
+            }
+            std::fs::create_dir_all(&hv.path).map_err(|e| err(e.to_string()))?;
+            let meta = std::fs::symlink_metadata(&hv.path).map_err(|e| err(e.to_string()))?;
+            if meta.file_type().is_symlink() || !meta.is_dir() {
+                return Err(err("must be a directory, not a symlink".into()));
+            }
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                if let Some((uid, gid)) = owner {
+                    std::os::unix::fs::chown(&hv.path, Some(uid), gid)
+                        .map_err(|e| err(format!("chown: {e}")))?;
+                }
+                if let Some(bits) = mode {
+                    std::fs::set_permissions(&hv.path, std::fs::Permissions::from_mode(bits))
+                        .map_err(|e| err(format!("chmod: {e}")))?;
+                }
+            }
+            tracing::info!(
+                volume = %name,
+                path = %hv.path.display(),
+                owner = hv.owner.as_deref().unwrap_or("-"),
+                mode = hv.mode.as_deref().unwrap_or("-"),
+                "prepared host volume"
+            );
+        }
+        Ok(())
     }
 
     fn forbidden(&self, path: &Path) -> bool {
@@ -756,6 +800,21 @@ impl Supervisor {
         }
         out
     }
+}
+
+/// `/alloc` must be writable whatever user the image runs as, so the
+/// directory is world-writable with the sticky bit, like `/tmp`. It is only
+/// mounted into its own container, and the parent `alloc/` stays `root 0711`,
+/// so other host users cannot list it.
+fn make_alloc_writable(dir: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o1777))?;
+    }
+    #[cfg(not(unix))]
+    let _ = dir;
+    Ok(())
 }
 
 fn parse_policy(s: &str) -> Policy {

@@ -21,12 +21,6 @@ What is not built yet. The rest of the [spec](spec.md)'s MVP scope is implemente
 7. **Expire long-UNHEALTHY nodes.** `valkvork node remove <id>` (and **Remove** in the UI) forgets
    a dead node by hand. An optional controller setting could do the same for nodes UNHEALTHY for
    longer than, say, 24 h, for clusters without a lifecycle hook.
-8. **Docker daemon settings in the golden image** to match FR-AGE-01: the `local` log driver
-   (the image uses `json-file`) and `native.cgroupdriver=systemd` set explicitly.
-9. **Writable `/alloc` for non-root containers.** The agent creates each workload's alloc
-    directory as `root 0755`, so an image that runs as a non-root user cannot write to `/alloc`.
-    Options: create it world-writable with the sticky bit (`1777`), or chown it to the image's
-    `USER` read from the image config.
-10. **Container hardening options** for less trusted images: a PID limit, `no-new-privileges`,
+8. **Container hardening options** for less trusted images: a PID limit, `no-new-privileges`,
     capability drops and a read-only root filesystem, as manifest settings or agent defaults.
     Today containers get Docker's defaults (see docs/components/security.md#process-permissions).

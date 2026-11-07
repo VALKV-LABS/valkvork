@@ -69,7 +69,7 @@ The agent **runs as root**, deliberately (FR-STO-03):
 | `/etc/valkvork.d/agent.toml`, `secrets/` (join token, CA) | root, `0640` | Read |
 | `/etc/valkvork.d/registry-auth.json` | `root 0600` | Read |
 | `/var/lib/valkvork/` (`node_id`, `failed/`) | `root 0700` | Read and write |
-| `/var/lib/valkvork/alloc` → `/data/valkvork/alloc/<workload_id>/` | `root 0711`; each workload's directory `root 0755` | Created and deleted by the agent; bind-mounted at `/alloc` |
+| `/var/lib/valkvork/alloc` → `/data/valkvork/alloc/<workload_id>/` | `root 0711`; each workload's directory `root 1777` (world-writable with the sticky bit, like `/tmp`, so images that run as a non-root `USER` can write to `/alloc`; it is mounted only into its own container) | Created and deleted by the agent; bind-mounted at `/alloc` |
 | `/var/run/docker.sock` | root | Read and write, and only the agent |
 
 Network: the agent opens no listening socket except metrics on loopback (FR-ARC-01); it refuses a non-loopback metrics address. Its only outbound connection is to `controller_endpoint`. Docker pulls images using its own network access.
@@ -94,7 +94,7 @@ The agent creates containers with:
 | Restart policy | `no`: the agent restarts containers itself |
 | User namespaces | Not configured: root inside a container is uid 0 on the host, confined by namespaces, capabilities and seccomp |
 
-**`/alloc` is root-owned.** Each workload's directory is created by the agent as `root 0755`, so a container running as a non-root user can read `/alloc` but not write to it. Host volume directories have whatever ownership the operator gave them; the golden image creates them as `root 0755`. Images such as Postgres, whose entrypoint starts as root and changes ownership of its data directory, work. Images that start as a non-root user need writable directories prepared on the host. This is tracked in [NEXT_STEPS.md](../../NEXT_STEPS.md).
+**`/alloc` is writable by any user.** Each workload's directory is created by the agent as `root 1777` (world-writable with the sticky bit, like `/tmp`), so images that run as a non-root `USER` can write to `/alloc`. It is mounted only into its own container, and the parent `alloc/` stays `root 0711`, so other users on the host cannot list it. Host volume directories are `root 0755` unless the operator sets `owner` and `mode` for them in `agent.toml`, which the agent applies at startup (see [configuration.md](configuration.md#agent)). Images such as Postgres, whose entrypoint starts as root and changes ownership of its data directory, need neither. For an image that starts as a non-root user, set `owner` to its numeric uid. Only the operator, never a manifest, decides who owns a host directory, because volumes outlive services and can be shared between them.
 
 Not set, and worth adding for untrusted images (also tracked there): a PID limit, `no-new-privileges`, dropping capabilities, and a read-only root filesystem. Valkvork assumes workloads are trusted code you deploy; it is not a sandbox for hostile tenants.
 

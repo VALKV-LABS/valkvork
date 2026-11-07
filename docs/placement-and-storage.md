@@ -73,6 +73,17 @@ The spec lists these as non-goals for this release (§1.4): multiple labels or t
 
    The agent reports the names in `Register`; `valkvork node list -o json` and the Nodes page show them.
 
+   For an image that runs as a non-root user, give the directory to that user, for example nginx-unprivileged (uid 101) writing logs:
+
+   ```toml
+   [host_volumes.applogs]
+   path  = "/data/applogs"
+   owner = "101:101"        # numeric uid:gid; applied at agent startup
+   mode  = "0750"
+   ```
+
+   Images that start as root, such as Postgres, set up their own directories and need neither.
+
 2. Mount it by name in the manifest (`examples/postgres.toml`):
 
    ```toml
