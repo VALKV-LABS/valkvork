@@ -50,7 +50,7 @@ No Valkvork features. Infrastructure and tooling that Stages 1 and 2 need.
 **Status:**
 - 0.1 and 0.2 are built: goldenimage#11, which also sets `aws-us-west-1-valkvork` to the layout below.
 - 0.4 is built: valkvork#8 (`scripts/dev-cell-upgrade.sh`).
-- 0.3 is built too, in goldenimage#11: `tofu output workload_secret_parameters` lists the parameters after apply.
+- 0.3 is built: goldenimage#12. AWS generates the secrets during apply, and they are kept out of Terraform state. `tofu output workload_secret_parameters` lists the parameters.
 
 **Cell layout for Stages 1 and 2** (`aws-us-west-1-valkvork`, two nodes):
 
