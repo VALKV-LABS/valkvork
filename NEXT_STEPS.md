@@ -1,5 +1,19 @@
 # Next steps
 
+**Current plan: [platform workloads](docs/platform-workloads.md).** It comes before
+everything below and before [phase-2.md](docs/phase-2.md). In stages, it builds what
+Valkvork needs to run the Valkv platform's own services, and verifies each one on the AWS
+dev cell:
+
+0. **Test bed:** separate node groups and workload-secret access in the goldenimage
+   template, and a dev-cell upgrade script.
+1. **Postgres** (`global-pg`): secret references, bind address per port, health checks,
+   `command` and `args`.
+2. **The gateway control plane** (`valkv-apg`): secrets inside values, batch jobs, and a
+   private DNS name for Postgres.
+
+The items below remain, after that plan.
+
 What is not built yet. The rest of the [spec](spec.md)'s MVP scope is implemented and described in [docs/](docs/components/index.md); items tagged [P2], [P3] or [Later] in the spec are deliberately out of scope for now and are collected, with design sketches, in [docs/phase-2.md](docs/phase-2.md).
 
 1. **Roll the dev cell onto an image built from goldenimage `main`.** The cell in us-west-1 runs
