@@ -70,26 +70,48 @@ The Terraform for a cell lives in the [goldenimage](https://github.com/VALKV-LAB
 
 ## Golden Image
 
-The [goldenimage](https://github.com/VALKV-LABS/goldenimage) repository builds the Ubuntu 22.04 worker image with Packer. `-var orchestrator=valkvork` installs Valkvork instead of Nomad, and publishes it separately, as `valkv-generic-valkvork-*` with SSM parameter `/valkv/<cell>/images/generic-valkvork-<arch>`, so Nomad environments are unaffected. One image serves both roles; user data picks one at boot.
+The [goldenimage](https://github.com/VALKV-LABS/goldenimage) repository builds the image with Packer, from Ubuntu 22.04 Minimal with a 15 GiB root disk (Docker data and alloc directories live on the `/data` volume). `-var orchestrator=valkvork` installs Valkvork instead of Nomad, and publishes it separately, as `valkv-generic-valkvork-*` with SSM parameter `/valkv/<cell>/images/generic-valkvork-<arch>`, so Nomad environments are unaffected. One image serves both roles; user data picks one at boot.
 
 | In the image | |
 |---|---|
 | Binaries | `/usr/local/bin/valkvork-controller`, `valkvork-agent`, `valkvork`, version-checked at build time |
 | Docker | `docker-ce` with `live-restore`, overlay2, data root `/data/docker` on the instance's data volume |
+| Config templates | `/usr/local/share/valkvork/controller.toml.tmpl` and `agent.toml.tmpl`: the commented base configuration of every node, from goldenimage `packer/generic/files/valkvork/` |
 | Units | `valkvork-controller.service`, `valkvork-agent.service` (both disabled), `valkv-valkvork-bootstrap.service` |
 | Identity | `/etc/machine-id` truncated as the last build step, so every instance gets its own `node_id` |
 
 At every boot, the bootstrap reads `/etc/valkv/valkvork.env` from user data:
 
 ```bash
-VALKVORK_ROLE=controller            # or agent
+VALKVORK_ROLES=controller,agent     # controller, agent, or both
 VALKVORK_REGION=us-west-2
 VALKVORK_SSM_PREFIX=/valkv/aws-us-west-2/valkvork
-VALKVORK_NODE_CLASS=general         # agent
 VALKVORK_HOST_VOLUMES=pgdata=/data/pgdata   # agent, optional
 ```
 
-It then fetches secrets from SSM under the prefix (`ca_cert`, `join_token`, and `controller/cert`, `controller/key`, `controller/admin_token` for the controller, `registry_auth` optionally for agents). It renders `/etc/valkvork.d/<role>.toml`, validates it with `--check-config`, and starts the role's unit. The controller's database goes on the data volume at `/data/valkvork/db`. The full contract is in the goldenimage README.
+It then fetches secrets from SSM under the prefix (`ca_cert`, `join_token`, and `controller/cert`, `controller/key`, `controller/admin_token` for the controller, `registry_auth` optionally for agents). It renders `/etc/valkvork.d/<role>.toml` from the role's template, validates it with `--check-config`, and starts the role's unit. The controller's database goes on the data volume at `/data/valkvork/db`. The full contract is in the goldenimage README.
+
+The bootstrap fills in only what differs per instance:
+
+| Setting | Source |
+|---|---|
+| `node_class` | The instance's `valkvork-node-class` tag, read from instance metadata (the cell template sets it and enables metadata tags); else `VALKVORK_NODE_CLASS`; else `general`. Retag and reboot to change it |
+| `[reserved]` | Scaled to the instance with GKE's node reservation tiers, for example 0.1 core and ~475 MiB on 2 vCPU / 2 GiB, ~3.5 GiB on 8 vCPU / 32 GiB; `VALKVORK_RESERVED_CPU` / `_MEMORY` override |
+| `advertise_ip` | The instance's private IPv4 |
+| `[host_volumes.*]` | `VALKVORK_HOST_VOLUMES` |
+
+**Operator access.** On the golden image the admin API and web UI listen on the controller's localhost only (`admin_listen_addr = "127.0.0.1:50052"`); no security group or firewall rule admits `:50052`. Forward the port, then use `https://localhost:50052/ui` or point the CLI at `https://localhost:50052` (the controller certificate covers `localhost`):
+
+```bash
+# Session Manager, no open port (the cell's `tofu output ui_port_forward_command`)
+aws ssm start-session --target <controller instance id> \
+  --document-name AWS-StartPortForwardingSession \
+  --parameters portNumber=50052,localPortNumber=50052
+# or SSH
+ssh -L 50052:localhost:50052 ubuntu@<controller address>
+```
+
+On the controller itself, `sudo -i; set -a; . /etc/valkvork.d/cli.env` sets up the CLI.
 
 ## systemd Units
 

@@ -50,7 +50,7 @@ allocatable_cpu_millicores = Docker NCPU × 1000 − ceil(reserved.cpu × 1000)
 allocatable_memory_bytes   = Docker MemTotal − reserved.memory
 ```
 
-`[reserved]` (default 0.25 cores, 384 MiB) keeps room for the OS, dockerd, containerd and the agent. The scheduler places workloads by their requests against this figure. Reading it from Docker means a Docker VM (Colima, Docker Desktop) reports the VM's resources, which is where the containers actually run.
+`[reserved]` (default 0.25 cores, 384 MiB) keeps room for the OS, dockerd, containerd and the agent. The golden image sets it per instance from GKE's node reservation tiers instead (see [deployment.md](../deployment.md#golden-image)). The scheduler places workloads by their requests against this figure. Reading it from Docker means a Docker VM (Colima, Docker Desktop) reports the VM's resources, which is where the containers actually run.
 
 ## Telemetry
 

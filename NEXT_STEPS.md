@@ -4,8 +4,9 @@ What is not built yet. The rest of the [spec](spec.md)'s MVP scope is implemente
 
 1. **Deploy the dev cell.** The golden image is built and on AWS, and the Terraform for a cell
    exists in goldenimage (`environments/template-valkvork`, applied from
-   `environments/aws-us-west-1-valkvork`). Set `ami_id` (or `use_ssm_ami_lookup = true`) and
-   `allowed_cidrs_admin` in `terraform.tfvars`, add a remote state backend, then `terraform apply`.
+   `environments/aws-us-west-1-valkvork`). Set `ami_id` (or `use_ssm_ami_lookup = true`) in
+   `terraform.tfvars`, add a remote state backend, then `terraform apply`. The UI and admin API
+   listen on the controller's localhost: use `tofu output ui_port_forward_command`.
 2. **Auto-scaling groups in the cell template.** The template runs a fixed `node_count` of
    instances. The spec's layout (§10) wants a controller ASG 1/1/1 that re-attaches its EBS volume
    and a fixed-IP ENI, and one worker ASG per node class.
