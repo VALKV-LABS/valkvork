@@ -11,6 +11,7 @@ service AdminService {
   rpc ListNodes(ListNodesRequest) returns (ListNodesResponse);
   rpc DrainNode(DrainNodeRequest) returns (DrainNodeResponse);
   rpc UndrainNode(UndrainNodeRequest) returns (UndrainNodeResponse);
+  rpc RemoveNode(RemoveNodeRequest) returns (RemoveNodeResponse);
   rpc ScaleService(ScaleServiceRequest) returns (ScaleServiceResponse);
   rpc ListEvents(ListEventsRequest) returns (ListEventsResponse);
 }
@@ -164,6 +165,16 @@ message UndrainNodeRequest {
 message UndrainNodeResponse {
   bool accepted = 1;
   string error = 2;
+}
+
+// Forget an UNHEALTHY node; its LOST workloads become STOPPED.
+message RemoveNodeRequest {
+  string node_id = 1;
+}
+
+message RemoveNodeResponse {
+  bool accepted = 1;
+  uint32 workloads_stopped = 2;
 }
 
 message ScaleServiceRequest {

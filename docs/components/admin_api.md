@@ -26,6 +26,7 @@ A tonic interceptor compares it in constant time and answers `UNAUTHENTICATED` o
 | `ListWorkloads` | optional `service_id`, `node_id`, `status` → `WorkloadSummary[]` | Status, reason, restarts, version, node, timestamps |
 | `ListNodes` | optional `node_id`, `node_class` → `NodeSummary[]` | Capacity and allocation, status, draining, workload count, last heartbeat, agent and runtime versions, host volumes |
 | `DrainNode` / `UndrainNode` | `node_id` → `accepted` | Set or clear `draining` (FR-CON-08) |
+| `RemoveNode` | `node_id` → `accepted`, `workloads_stopped` | Forget an UNHEALTHY node: its LOST workloads become STOPPED (`NODE_REMOVED`) and its row is deleted. A HEALTHY node is refused with `FAILED_PRECONDITION` |
 | `ScaleService` | `service_id`, `replicas` → `old_replicas`, `new_replicas` | Set `target_replicas`, clamped to `[min, max]` with autoscaling (FR-CON-10) |
 | `ListEvents` | optional `kind`, `since` (ms), `limit` (default 50, max 1000) → `ClusterEvent[]` | Cluster events, newest first |
 

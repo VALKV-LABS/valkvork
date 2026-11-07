@@ -17,7 +17,7 @@ pub enum CoreMsg {
 
 The gRPC adapters (`grpc.rs`), the web UI (`ui/`) and the metrics endpoint (`http.rs`) hold a cloneable `CoreHandle`. `CoreHandle::ask` sends an `AdminOp` that carries a reply channel and waits for the answer. The core's inbox is bounded (1024 messages), so a burst of requests waits rather than growing memory without limit.
 
-`AdminOp` covers `Apply` (and plan, as a dry run), `Delete`, `Scale`, `SetDraining`, `GetService`, `ListServices`, `ListWorkloads`, `ListNodes`, `Overview`, `ServiceSeries` and `Metrics`. The CLI and the web UI use the same operations, so there is one code path for each action (FR-UI-05).
+`AdminOp` covers `Apply` (and plan, as a dry run), `Delete`, `Scale`, `SetDraining`, `RemoveNode`, `GetService`, `ListServices`, `ListWorkloads`, `ListNodes`, `Overview`, `ServiceSeries` and `Metrics`. The CLI and the web UI use the same operations, so there is one code path for each action (FR-UI-05).
 
 ## In-Memory State
 

@@ -1,5 +1,10 @@
 # Postgres with its data on the "pgdata" host volume (spec §6.3).
 #
+# The volume is single-writer (the default for a writable host volume): only
+# one live workload may use the directory, so an update stops the old Postgres,
+# waits until its container is gone, then starts the new one on the same node.
+# Expect a short outage per update; two processes never share the data.
+#
 # Host volumes are node-local. Keep replicas = 1, and declare [host_volumes.pgdata]
 # on exactly one node (or pin with required_class): if two nodes declared it, a
 # replacement after a node failure could start on the other node with an empty
@@ -21,9 +26,10 @@ container_port = 5432
 host_port      = 15432
 
 [[volumes]]
-type   = "host"
-source = "pgdata"
-target = "/var/lib/postgresql/data"
+type          = "host"
+source        = "pgdata"
+target        = "/var/lib/postgresql/data"
+single_writer = true         # the default; stated here because it matters
 
 [env]
 # Development only: manifests are stored in plaintext, so never put a real

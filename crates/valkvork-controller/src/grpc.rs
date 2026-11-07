@@ -342,6 +342,25 @@ impl pb::admin_service_server::AdminService for AdminApi {
         }))
     }
 
+    async fn remove_node(
+        &self,
+        request: Request<pb::RemoveNodeRequest>,
+    ) -> Result<Response<pb::RemoveNodeResponse>, Status> {
+        let node_id = request.into_inner().node_id;
+        let workloads_stopped = self
+            .core
+            .ask(|reply| AdminOp::RemoveNode {
+                node_id,
+                actor: CLI.into(),
+                reply,
+            })
+            .await?;
+        Ok(Response::new(pb::RemoveNodeResponse {
+            accepted: true,
+            workloads_stopped,
+        }))
+    }
+
     async fn scale_service(
         &self,
         request: Request<pb::ScaleServiceRequest>,

@@ -419,8 +419,20 @@ async function nodePage(id) {
       } catch (err) { msg.replaceChildren(errorBox(err)); }
     },
   }, n.draining ? 'Undrain' : 'Drain');
+  // Only a node that stopped heartbeating can be forgotten.
+  const removeBtn = n.status !== 'UNHEALTHY' ? null : h('button', {
+    type: 'button',
+    class: 'danger',
+    onclick: async () => {
+      if (!window.confirm(`Remove ${n.hostname}? Its lost workloads are marked STOPPED. If the node comes back it joins again as a new node.`)) return;
+      try {
+        await api(`nodes/${enc(id)}/remove`, { method: 'POST' });
+        go('/ui/nodes');
+      } catch (err) { msg.replaceChildren(errorBox(err)); }
+    },
+  }, 'Remove');
   return h('div', {},
-    h('div', { class: 'row' }, h('h1', {}, n.hostname), nodeStatus(n), h('span', { class: 'spacer' }), btn),
+    h('div', { class: 'row' }, h('h1', {}, n.hostname), nodeStatus(n), h('span', { class: 'spacer' }), btn, removeBtn ? [' ', removeBtn] : null),
     h('p', { class: 'sub mono' }, n.node_id),
     msg,
     h('div', { class: 'grid2' },

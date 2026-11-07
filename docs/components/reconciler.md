@@ -14,7 +14,7 @@ Each workload has a **desired state** (`RUN` or `STOP`, the controller's intent)
 | `ASSIGNED` | Bound to a node; `StartWorkload` sent | no |
 | `RUNNING` | The agent reports the container running | no |
 | `STOPPING` | `StopWorkload` sent | no |
-| `LOST` | Its node went UNHEALTHY while ASSIGNED, RUNNING or STOPPING | no |
+| `LOST` | Its node went UNHEALTHY while ASSIGNED, RUNNING or STOPPING. Becomes STOPPED when the node reconnects without it, its service is deleted, or the node is removed | no |
 | `STOPPED` | Stopped on request | yes |
 | `FAILED` | Failed for good: restarts exhausted, pull failed, start timeout, disk limit, container missing | yes |
 
@@ -56,11 +56,22 @@ A **replacing** apply bumps the service's `version` (see [manifests.md](manifest
 
 The RUNNING count never drops below the target (AT-09).
 
+### Stop-First for Single-Writer Volumes
+
+A service that mounts a **single-writer** host volume (any writable host volume not declared `single_writer = false`, see [placement-and-storage.md](../placement-and-storage.md#single-writer-and-shared-volumes)) cannot run its old and new workload side by side. Its updates and drains run in the opposite order:
+
+1. Pick the oldest workload that must move, if fewer than `update.max_parallel` of the service's live workloads are still coming up (not yet RUNNING for `min_healthy_time`).
+2. Check that its replacement could be placed once the old workload is gone. If not, for example a drain where no other node declares the volume, leave it RUNNING and record one `WORKLOAD` event saying why.
+3. Stop the old workload (`ROLLED_OUT` or `DRAINED`) and create its replacement at once. The replacement stays PENDING (`NO_NODE: single-writer host volume pgdata in use on 1`) until the old container is gone, then is placed, usually on the same node.
+4. The rollout stays IN_PROGRESS until the last replacement is healthy.
+
+Each replica is down between its old container stopping and its new one starting. Halting works as above, except that the replica whose new version failed has no old copy to fall back to: it is retried under the failure backoff until the service is fixed, for example by applying the previous manifest again.
+
 **Halting.** If a workload of the current version fails during a rollout, `rollout_status` becomes HALTED. No more outdated workloads are replaced, and the old ones keep running. The next apply that changes anything resets the halt and the rollout resumes or is superseded. There is no automatic rollback.
 
-**Cancelling.** If a workload no longer needs to move (its node was undrained), its in-flight replacement is stopped (`MIGRATION_CANCELLED`), so the service does not keep an extra replica.
+**Cancelling.** If a workload no longer needs to move (its node was undrained), its in-flight replacement is stopped (`MIGRATION_CANCELLED`), so the service does not keep an extra replica. Stop-first moves have nothing to cancel: the old workload is already stopping.
 
-**Drain completion.** A drain is done when the node has no non-terminal workloads. A workload that cannot be placed elsewhere, for example one that needs a host volume only that node has, stays where it is, and its replacement stays PENDING with a `NO_NODE` reason.
+**Drain completion.** A drain is done when the node has no non-terminal workloads. A workload that cannot be placed elsewhere, for example one that needs a host volume only that node has, stays where it is, and its replacement stays PENDING with a `NO_NODE` reason. For a stop-first service no replacement is created; a `WORKLOAD` event explains why the workload was not moved.
 
 ## Failures and Backoff
 

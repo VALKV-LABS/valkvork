@@ -104,24 +104,43 @@ Valkvork never moves, copies, detaches or reattaches storage, and makes no cloud
 | That node comes back | The original container is still there with its data, so it is **re-adopted** and the pending replacement cancelled (FR-CON-03) |
 | The node is terminated for good | The data is gone with it. The replacement waits for a node that declares the volume, and starts with whatever is in that node's directory, usually nothing |
 
-> **Use a volume name only one node declares** for single-writer data such as a database, or pin the service with a unique `required_class`. If two nodes both declared `pgdata`, a replacement after a failure could start on the other node, against a different, probably empty, directory.
+> **Use a volume name only one node declares** for data such as a database, or pin the service with a unique `required_class`. If two nodes both declared `pgdata`, a replacement after a failure could start on the other node, against a different, probably empty, directory.
 
-Keep `replicas = 1` for services on a single-writer host volume: every replica on a node shares the same directory.
+### Single-Writer and Shared Volumes
 
-### Rolling Updates of a Host-Volume Service
+Whether a service is stateful depends on what a volume holds, not on whether it mounts one, so each volume says how it may be shared:
 
-**Limitation.** Rolling updates and drains start the new workload *before* stopping the old one, so the RUNNING count never dips (FR-CON-07). A service whose host volume exists on only one node has nowhere to put that new workload. So a "replacing" apply (new image, env or resources) leaves the new workload PENDING and the old one running; the rollout does not complete. With a static host port it shows `NO_NODE: host_port 15432 in use`. Start-new-first is also the wrong order for a single-writer data directory, because two processes would share it for a moment.
+```toml
+[[volumes]]
+type          = "host"
+source        = "pgdata"
+target        = "/var/lib/postgresql/data"
+single_writer = true      # the default for a writable volume
 
-Until this is addressed (see [NEXT_STEPS.md](../NEXT_STEPS.md)), update such a service by deleting it and applying the new manifest. The data stays in the directory:
-
-```bash
-valkvork delete service postgres-main      # wait until `valkvork status` no longer lists it
-valkvork apply -f postgres.toml            # the new container reads the existing data
+[[volumes]]
+type          = "host"
+source        = "applogs"
+target        = "/var/log/app"
+single_writer = false     # several workloads may write here at once
 ```
 
-### Draining a Node with Host Volumes
+| Volume | Who may use it on a node | Updates and drains |
+|---|---|---|
+| Writable, `single_writer = true` (the **default**) | One live workload at a time, counting one that is still stopping | **Stop-first:** stop the old workload, wait until its container is gone, then start the new one |
+| Writable, `single_writer = false` | Any number of shared users, but not alongside a single-writer user | Start-first, as for stateless services |
+| `read_only = true` | Always shared (`single_writer = true` is rejected) | Start-first |
 
-A drain moves workloads to nodes that declare the same volumes. If none does, the workload stays where it is and its replacement stays PENDING, so the drain never completes. That protects the data, but means such nodes need their data moved by you before they are replaced.
+A service uses stop-first if any of its volumes is single-writer. The default is single-writer because two processes on one data directory can corrupt it for good, while a shared directory wrongly left at the default only costs a short outage per update.
+
+So, for a single-writer volume:
+
+- **Replicas never share it.** With `replicas = 2` on one node, the second stays PENDING with `NO_NODE: single-writer host volume pgdata in use on 1`. This holds across services too.
+- **An update has a short outage** per replica, between the old container stopping (allow for `kill_timeout`) and the new one starting. Rollouts still go `max_parallel` at a time.
+- **A drain only moves the workload if its replacement can be placed elsewhere.** If no other node declares the volume, the workload keeps running on the draining node, a `WORKLOAD` event explains why, and the drain does not complete. Move the data yourself, or undrain.
+
+**Volumes are compared by name, not path.** `pgdata = /data/pgdata` and `redisdata = /data/redisdata` are independent volumes, each with its own single writer, even though they share a parent directory. This is intentional: the agent does not compare paths, so two names for the same directory, or one path inside another (`data = /data` and `pgdata = /data/pgdata`), are also treated as unrelated, and their users are not kept apart. Give each volume its own directory, and do not nest them.
+
+Per-container files that need no sharing, such as logs read while the container runs, belong in `/alloc`, which is private to each workload, or on stdout. A shared volume is for files that must outlive the workload.
 
 ### What Cloud Volumes Would Add (Not Built)
 
@@ -140,7 +159,7 @@ It would create the volume on first placement, attach and mount it as part of th
 
 ## Try It Locally
 
-`make dev-up` declares two host volumes on the local node, `site` and `pgdata`, under `.dev/volumes/`. Set `VALKVORK_DEV_HOST_VOLUMES` (comma separated) and `VALKVORK_DEV_NODE_CLASS` to change them; run `make dev-down` and `make dev-up` again to apply.
+`make dev-up` declares three host volumes on the local node, `site`, `pgdata` and `applogs`, under `.dev/volumes/`. Set `VALKVORK_DEV_HOST_VOLUMES` (comma separated) and `VALKVORK_DEV_NODE_CLASS` to change them; run `make dev-down` and `make dev-up` again to apply.
 
 ```bash
 make dev-up && eval "$(make -s env)" && alias valkvork=target/debug/valkvork
@@ -159,6 +178,16 @@ valkvork delete service postgres-main            # wait until it is gone
 valkvork apply -f examples/postgres.toml         # a new workload and container
 docker exec $(docker ps -q --filter label=valkvork.service_id=postgres-main) \
   psql -U postgres -c "select * from notes"      # → hello
+
+# An update is stop-first: change the image tag to postgres:16.5 in a copy of
+# the manifest and apply it. The old workload stops, the new one starts on the
+# same directory, and the row is still there.
+valkvork apply -f my-postgres.toml
+valkvork workloads --service postgres-main       # old STOPPED (ROLLED_OUT), new RUNNING
+
+# A shared volume: two replicas on one node
+valkvork apply -f examples/shared-logs.toml
+ls .dev/volumes/applogs/                         # access.log, error.log
 
 # Pinning: stays PENDING on a "general" node
 valkvork apply -f examples/pinned.toml

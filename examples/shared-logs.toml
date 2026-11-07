@@ -1,0 +1,27 @@
+# Two nginx replicas writing access logs into one shared host volume.
+#
+# A writable host volume is single-writer by default: only one live workload
+# may use it, and updates stop the old workload before starting the new one.
+# This directory holds append-only logs that several containers can write at
+# once, so it is declared shared with single_writer = false. Replicas can then
+# run side by side on one node, and updates start the new workload first.
+#
+# Placed only on nodes whose agent.toml declares [host_volumes.applogs]. With
+# `make dev-up` the volume is .dev/volumes/applogs/.
+#
+# Logs only needed while a container runs belong in /alloc, which is private to
+# each workload, or on stdout. A shared volume is for files that must outlive it.
+[service]
+id       = "shared-logs"
+image    = "docker.io/library/nginx:1.27-alpine"
+replicas = 2
+
+[resources]
+cpu    = 0.1
+memory = "32MiB"
+
+[[volumes]]
+type          = "host"
+source        = "applogs"
+target        = "/var/log/nginx"
+single_writer = false                    # several workloads may write here

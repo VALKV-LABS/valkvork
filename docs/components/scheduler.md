@@ -16,6 +16,7 @@ For each pass, the core builds a `Snapshot` with one `NodeCapacity` per node:
 | Allocated CPU and memory | Sum of requests of live workloads bound to the node (desired RUN, not terminal, not LOST) |
 | Used host ports | Host ports of every non-terminal, non-LOST workload on the node, including STOPPING ones, because the port stays bound until the container is gone |
 | Host volumes | Names the agent advertised |
+| Host volume users | For each volume, how many non-terminal, non-LOST workloads on the node mount it, and how many of those mounts are single-writer. STOPPING ones count, because the directory is in use until the container is gone |
 | Workloads per service | For the tie-break |
 | Healthy, draining | Node status and flag |
 
@@ -29,7 +30,8 @@ A node is eligible only if all of these hold:
 2. its `node_class` equals the manifest's `required_class`, if one is set;
 3. free CPU and free memory cover the request;
 4. none of the manifest's static `host_port`s is in use on it;
-5. it advertises every host volume the manifest mounts.
+5. it advertises every host volume the manifest mounts;
+6. no single-writer volume the manifest mounts has another user on the node, and no shared volume it mounts has a single-writer user.
 
 ## Score
 
@@ -45,6 +47,7 @@ NO_NODE: no healthy, non-draining nodes
 NO_NODE: no healthy nodes in class gpu
 NO_NODE: insufficient memory on 2, host_port 8080 in use on 1 in class general
 NO_NODE: host volume pgdata missing on 3
+NO_NODE: host volume pgdata missing on 2, single-writer host volume pgdata in use on 1
 ```
 
 It is retried on every pass, so it is placed as soon as capacity appears. Unplaced workloads are counted in `valkvork_pending_unplaced_workloads{class}`, the signal for adding nodes (spec §10.4).

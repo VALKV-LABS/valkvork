@@ -178,6 +178,19 @@ pub struct VolumeSpec {
     pub source: String,
     pub target: String,
     pub read_only: bool,
+    /// Manifest `single_writer = false`: several workloads may use the
+    /// directory at once. Stored inverted and omitted when false, so specs
+    /// stored before the setting existed keep their canonical JSON and hash.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub shared: bool,
+}
+
+impl VolumeSpec {
+    /// Only one live workload may use the directory at a time: writable
+    /// host volumes are single-writer unless declared `single_writer = false`.
+    pub fn single_writer(&self) -> bool {
+        !self.read_only && !self.shared
+    }
 }
 
 /// Canonical form of a validated manifest. Field order and `BTreeMap` make the
@@ -256,6 +269,12 @@ impl ServiceSpec {
         }
     }
 
+    /// Updates and drains stop the old workload before starting its
+    /// replacement when any volume is single-writer.
+    pub fn stop_first(&self) -> bool {
+        self.volumes.iter().any(VolumeSpec::single_writer)
+    }
+
     /// Human-readable field-level diff, used by `plan` output.
     pub fn diff_lines(&self, new: &ServiceSpec) -> Vec<String> {
         let mut out = Vec::new();
@@ -308,6 +327,28 @@ mod tests {
             update: UpdatePolicy::default(),
             restart: RestartPolicy::default(),
         }
+    }
+
+    /// Specs stored before `single_writer` existed keep their hash, so
+    /// re-applying an unchanged manifest after an upgrade is `unchanged`.
+    #[test]
+    fn volume_sharing_flag_keeps_old_hashes() {
+        let mut a = spec();
+        a.volumes.push(VolumeSpec {
+            kind: "host".into(),
+            source: "pgdata".into(),
+            target: "/d".into(),
+            read_only: false,
+            shared: false,
+        });
+        let json = a.canonical_json();
+        assert!(!json.contains("shared"));
+        let old: ServiceSpec = serde_json::from_str(&json).unwrap();
+        assert_eq!(old.spec_hash(), a.spec_hash());
+        assert!(old.stop_first());
+        a.volumes[0].shared = true;
+        assert!(a.canonical_json().contains("\"shared\":true"));
+        assert!(!a.stop_first());
     }
 
     #[test]

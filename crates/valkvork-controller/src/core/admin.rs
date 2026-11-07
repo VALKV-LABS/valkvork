@@ -3,11 +3,12 @@
 
 use super::Core;
 use crate::model::Service;
+use std::collections::HashSet;
 use tokio::sync::oneshot;
 use valkvork_common::errors::{ValidationError, ValidationErrorCode};
 use valkvork_common::models::{
-    now_ms, ChangeKind, EventKind, NodeStatus, RolloutStatus, ServiceStatus, SubjectType,
-    WorkloadStatus,
+    now_ms, ChangeKind, DesiredState, EventKind, NodeStatus, RolloutStatus, ServiceStatus,
+    SubjectType, WorkloadStatus,
 };
 use valkvork_common::validation::parse_manifest_str;
 use valkvork_common::ValkvorkError;
@@ -45,6 +46,13 @@ pub enum AdminOp {
         draining: bool,
         actor: String,
         reply: Reply<()>,
+    },
+    /// Forget an UNHEALTHY node; returns how many of its LOST workloads
+    /// were marked STOPPED.
+    RemoveNode {
+        node_id: String,
+        actor: String,
+        reply: Reply<u32>,
     },
     GetService {
         service_id: String,
@@ -142,6 +150,17 @@ impl Core {
                     let _ = reply.send(res);
                 });
             }
+            AdminOp::RemoveNode {
+                node_id,
+                actor,
+                reply,
+            } => {
+                let res = self.remove_node(&node_id, &actor);
+                self.reconcile();
+                self.after_commit(move || {
+                    let _ = reply.send(res);
+                });
+            }
             AdminOp::GetService { service_id, reply } => {
                 let _ = reply.send(self.service_detail(&service_id));
             }
@@ -200,7 +219,7 @@ impl Core {
                 Some(a) => spec.replicas.clamp(a.min_replicas, a.max_replicas),
                 None => spec.replicas,
             };
-            let (to_place, placeable) = self.feasibility(&spec, target);
+            let (to_place, placeable) = self.feasibility(&spec, target, &HashSet::new());
             let outcome = ApplyOutcome {
                 service_id: id.clone(),
                 version: 1,
@@ -297,7 +316,18 @@ impl Core {
             ChangeKind::Replacing => live.max(new_target),
             _ => new_target.saturating_sub(live),
         };
-        let (to_place, placeable) = self.feasibility(&spec, to_place);
+        // A stop-first rollout frees the old workloads' volumes and ports
+        // before placing their replacements.
+        let freed: HashSet<String> = if change == ChangeKind::Replacing && spec.stop_first() {
+            self.workloads
+                .values()
+                .filter(|w| w.service_id == id && w.is_live())
+                .map(|w| w.workload_id.clone())
+                .collect()
+        } else {
+            HashSet::new()
+        };
+        let (to_place, placeable) = self.feasibility(&spec, to_place, &freed);
         let outcome = ApplyOutcome {
             service_id: id.clone(),
             version,
@@ -356,8 +386,13 @@ impl Core {
     }
 
     /// Simulate placing `count` workloads of `spec` (plan feasibility).
-    fn feasibility(&self, spec: &valkvork_common::models::ServiceSpec, count: u32) -> (u32, u32) {
-        let mut snap = self.snapshot();
+    fn feasibility(
+        &self,
+        spec: &valkvork_common::models::ServiceSpec,
+        count: u32,
+        freed: &HashSet<String>,
+    ) -> (u32, u32) {
+        let mut snap = self.snapshot_excluding(freed);
         let mut placed = 0;
         for _ in 0..count {
             match snap.place(spec) {
@@ -492,6 +527,60 @@ impl Core {
             );
         }
         Ok(())
+    }
+
+    /// Forget a node that is gone for good, e.g. a VM its auto-scaling group
+    /// replaced. Its workloads were already replaced when it went UNHEALTHY;
+    /// the LOST copies become STOPPED so they are pruned like any history. If
+    /// the node ever registers again it joins as a new node, and the
+    /// inventory rules (FR-CON-03) stop any copies it still runs.
+    fn remove_node(&mut self, node_id: &str, actor: &str) -> Result<u32, ValkvorkError> {
+        let e = self
+            .nodes
+            .get(node_id)
+            .ok_or_else(|| ValkvorkError::NotFound(format!("node {node_id}")))?;
+        let host = e.node.hostname.clone();
+        if e.node.status != NodeStatus::Unhealthy {
+            return Err(ValkvorkError::FailedPrecondition(format!(
+                "node {host} is {}; only an UNHEALTHY node can be removed (drain it, then stop its agent or terminate the VM)",
+                e.node.status
+            )));
+        }
+        let on_node: Vec<_> = self
+            .workloads
+            .values()
+            .filter(|w| w.node_id.as_deref() == Some(node_id))
+            .map(|w| (w.workload_id.clone(), w.status.is_terminal()))
+            .collect();
+        let mut stopped = 0;
+        for (wid, terminal) in on_node {
+            if terminal {
+                // History: the database clears node_id on delete; mirror it
+                // without touching updated_at, which drives pruning.
+                if let Some(w) = self.workloads.get_mut(&wid) {
+                    w.node_id = None;
+                }
+                continue;
+            }
+            if let Some(w) = self.wl(&wid) {
+                w.node_id = None;
+                w.desired_state = DesiredState::Stop;
+                w.status = WorkloadStatus::Stopped;
+                w.status_reason = Some("NODE_REMOVED".into());
+                stopped += 1;
+            }
+            self.assigned_at.remove(&wid);
+            self.cpu_samples.remove(&wid);
+        }
+        self.remove_node_entry(node_id);
+        self.event(
+            EventKind::Audit,
+            SubjectType::Node,
+            node_id,
+            format!("remove node {host}, {stopped} lost workloads stopped"),
+            actor,
+        );
+        Ok(stopped)
     }
 
     // ------------------------------------------------------------------
@@ -668,8 +757,16 @@ pub fn spec_to_toml(s: &valkvork_common::models::ServiceSpec) -> String {
     for v in &s.volumes {
         let _ = writeln!(
             o,
-            "[[volumes]]\ntype = {:?}\nsource = {:?}\ntarget = {:?}\nread_only = {}\n",
-            v.kind, v.source, v.target, v.read_only
+            "[[volumes]]\ntype = {:?}\nsource = {:?}\ntarget = {:?}\nread_only = {}\n{}",
+            v.kind,
+            v.source,
+            v.target,
+            v.read_only,
+            if v.shared {
+                "single_writer = false\n"
+            } else {
+                ""
+            }
         );
     }
     if let Some(a) = &s.autoscale {

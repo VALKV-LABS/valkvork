@@ -34,6 +34,8 @@ type      = "host"             # only "host" in this release
 source    = "pgdata"           # a [host_volumes.<name>] entry in agent.toml
 target    = "/var/lib/postgresql/data"
 read_only = false
+# single_writer = false        # default true for writable volumes: one live workload at a time,
+                               # stop-first updates. false = shared (several workloads may use it)
 
 [autoscale]                    # presence enables autoscaling
 min_replicas       = 3

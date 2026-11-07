@@ -76,7 +76,7 @@ Valkvork is a lightweight workload orchestrator and autoscaler written in Rust. 
 | :--- | :--- | :--- |
 | `valkvork-controller` | Control node (1 instance) | Admin API, **built-in web UI**, agent stream server, SQLite state, reconciler, scheduler, autoscaler, metrics. |
 | `valkvork-agent` | Every worker VM | Outbound stream to the controller, telemetry, container lifecycle through the runtime driver (FR-AGE-09), local restarts, disk enforcement. |
-| `valkvork` | Operator laptop or CI | `apply`, `plan`, `delete`, `scale`, `status`, `events`, `node list`, `node drain` / `undrain`. |
+| `valkvork` | Operator laptop or CI | `apply`, `plan`, `delete`, `scale`, `status`, `events`, `node list`, `node drain` / `undrain`, `node remove`. |
 | Web UI | Operator's browser | Served by `valkvork-controller` at `/ui`. Nothing to install (FR-UI). |
 
 ### 2.2 The big picture: who talks to whom
@@ -193,7 +193,7 @@ Every arrow is an in-process channel between Tokio tasks. The **reconciler** is 
      │                │◄───────────── Heartbeat: RUNNING ─│               │
      │                │ status → RUNNING                  │               │
 ```
-Rolling updates (FR-CON-07) and drains (FR-CON-08) follow the same path, with one difference: each new workload must reach `RUNNING` before its predecessor gets `StopWorkload`.
+Rolling updates (FR-CON-07) and drains (FR-CON-08) follow the same path, with one difference: each new workload must reach `RUNNING` before its predecessor gets `StopWorkload` (stop-first for single-writer volumes reverses this, see FR-CON-07).
 
 **Flow 3: a worker dies or is cut off, then comes back.**
 ```
@@ -288,7 +288,7 @@ Each workload row has two fields. **`desired_state`** (`RUN` | `STOP`) is the co
     └────────────────────┘ FAILED ◄─────────────────────── │ STOPPING ──► STOPPED
                                     restarts exhausted     │
        node UNHEALTHY (from ASSIGNED / RUNNING / STOPPING) ▼
-                                                         LOST ──► STOPPED (copy stopped on reconnect)
+                                                         LOST ──► STOPPED (copy stopped on reconnect, or node removed)
                                                            └────► RUNNING (re-adopted, see FR-CON-03)
 ```
 
@@ -424,7 +424,8 @@ Every service has an integer `version`. It is incremented by any apply that chan
     * its `node_class` matches `required_class`, if one is set;
     * `free_cpu ≥ request` and `free_mem ≥ request`, where free = allocatable − Σ requests of workloads with `desired_state = RUN` that are not in a terminal status or `LOST` on that node;
     * every static `host_port` is free on the node;
-    * every required host volume exists on the node.
+    * every required host volume exists on the node;
+    * no **single-writer** host volume it mounts has another user on the node, and no shared one it mounts has a single-writer user. Every non-terminal, non-`LOST` workload counts as a user, including `STOPPING` ones.
   * **Score (least-allocated / spread).** Pick the node with the lowest `max(cpu_alloc_ratio, mem_alloc_ratio)` after placement. Break ties by fewest workloads of the same service on the node, then by `node_id`.
   * Placement is based on **requested** resources (= limits in MVP), not observed usage.
   * A workload that cannot be placed stays `PENDING` with `status_reason` (e.g. `NO_NODE: insufficient memory in class high-perf`). It is retried when capacity changes. Unplaced workloads are exported as a metric that drives infrastructure scaling (§10.4).
@@ -434,9 +435,11 @@ Every service has an integer `version`. It is incremented by any apply that chan
   * When `version` increases, the controller replaces outdated workloads `max_parallel` at a time (default 1). For each one it **starts the new workload first**, waits until the new workload has been `RUNNING` for `min_healthy_time` (default 10 s), then stops the old one.
   * If a new workload reaches `FAILED`, the rollout **halts**: `rollout_status = HALTED`, and the old workloads keep running. The next `apply` resumes or supersedes the rollout. MVP has no automatic rollback.
   * Autoscaling is suspended for a service while its rollout is in progress.
+  * **Stop-first for single-writer volumes.** A host volume is single-writer unless it is `read_only` or declared `single_writer = false`; only one live workload may use it at a time (FR-CON-06). A service that mounts one is updated and drained in the opposite order: stop the old workload and create its replacement, which is placed once the old container is gone. At most `max_parallel` of its live workloads are coming up at once. A workload is only stopped if its replacement could be placed once it is gone; otherwise it keeps running and a `WORKLOAD` event says why. The RUNNING count dips by up to `max_parallel` during such an update. If the new version fails, the halted rollout leaves that replica down, retried under the FR-CON-05 backoff.
 
 * **FR-CON-08 [MVP]: Node drain**
   * `valkvork node drain <node_id>` sets `draining = true` and migrates the node's workloads `max_parallel` at a time, using start-new-then-stop-old like FR-CON-07. The drain is complete when the node has no non-terminal workloads. This is used by worker scale-in and image upgrades (§10.4).
+  * **Node removal:** `valkvork node remove <node_id>` forgets a node that is gone for good, such as a VM its auto-scaling group terminated. Only an `UNHEALTHY` node can be removed; a `HEALTHY` one is refused with `FAILED_PRECONDITION`. Its `LOST` workloads become `STOPPED` with reason `NODE_REMOVED` (their replacements already exist, FR-CON-02), the node row is deleted, and its workload history keeps no node. If the node registers again it joins as a new node, and FR-CON-03 stops any copies it still runs.
 
 * **FR-CON-09 [MVP]: Command dispatch**
   * The controller tracks outstanding commands per node in memory. A command without a `CommandResult` within 30 s is re-sent once. All unresolved commands are re-sent after a reconnect.
@@ -444,7 +447,7 @@ Every service has an integer `version`. It is incremented by any apply that chan
 
 * **FR-CON-10 [MVP]: Admin API and CLI**
   * The controller MUST serve the `AdminService` gRPC API (§11.2) and the built-in web UI (§5.1). Every request requires a bearer token (§9) or a UI session (FR-UI-06).
-  * CLI commands: `apply -f`, `plan -f` (dry-run diff plus placement feasibility), `delete service <id>`, `scale service <id> <n>`, `status [service]`, `workloads [--service]`, `events [--kind]`, `node list`, `node drain <id>`, `node undrain <id>`. Exit codes: `0` success, `1` server or transport error, `2` validation error.
+  * CLI commands: `apply -f`, `plan -f` (dry-run diff plus placement feasibility), `delete service <id>`, `scale service <id> <n>`, `status [service]`, `workloads [--service]`, `events [--kind]`, `node list`, `node drain <id>`, `node undrain <id>`, `node remove <id>`. Exit codes: `0` success, `1` server or transport error, `2` validation error.
   * **Manual scale** (CLI or UI) changes `target_replicas` only. With `[autoscale]`, the value is clamped to `[min, max]` and the autoscaler carries on from it. Without autoscaling, the next `apply` restores the manifest's `replicas` (FR-MAN-02), and `plan` shows this drift beforehand.
   * **Delete:** the service moves to `DELETING`, all its workloads get `desired_state = STOP`, and the service row is removed once every workload is terminal.
 
@@ -475,7 +478,7 @@ Like Nomad, which serves its UI at `/ui`, the controller binary serves an operat
   | **Services** | id, image, version, running/target, CPU utilisation, status, rollout status. | n/a |
   | **Service detail** | Canonical spec (TOML view). Workloads with node, status, reason and restarts. Rollout progress. CPU sparkline (last 60 min). Scaling events. | **Scale**; **Delete** (confirmed by typing the service id) |
   | **Nodes** | id, hostname, class, status, draining, allocation bars, workload count, heartbeat age, agent and runtime versions. | n/a |
-  | **Node detail** | Capacity vs allocated, workloads on the node, host volumes. | **Drain** / **Undrain** |
+  | **Node detail** | Capacity vs allocated, workloads on the node, host volumes. | **Drain** / **Undrain**; **Remove** on an `UNHEALTHY` node |
   | **Workloads** | Filter by service, node or status. Status reason, restart count, age. | n/a |
   | **Events** | Node health changes, failures, deploys and rollouts, scaling, operator actions. Filter by kind. | n/a |
   | **Deploy** | Paste or upload TOML, run **Plan** (diff and placement check), then **Apply**. | **Apply** |
@@ -577,7 +580,7 @@ Validation runs before any database write. A failure writes nothing and returns 
 | VE-04 | `1 ≤ min_replicas ≤ max_replicas`, and `0 < target_cpu_percent < 100`. | `INVALID_AUTOSCALE_SPEC` |
 | VE-05 | Port numbers are in 1–65535 and `host_port` values are unique within the manifest. `host_port` < 1024 returns a warning. | `INVALID_PORT_SPEC` |
 | VE-06 | No unknown keys or tables. | `UNKNOWN_FIELD` |
-| VE-07 | Every `[[volumes]]` entry has a known `type`, an absolute `target`, and a unique `target`. | `INVALID_VOLUME_SPEC` |
+| VE-07 | Every `[[volumes]]` entry has a known `type`, an absolute `target`, and a unique `target`. `single_writer = true` is not combined with `read_only = true`. | `INVALID_VOLUME_SPEC` |
 | VW-01 | **Warning only:** no current node of the required class could fit even one replica, or no node has the required host volume. | `UNSATISFIABLE_NOW` |
 
 ### 6.3 Examples
@@ -642,6 +645,8 @@ memory = "4GiB"
 type   = "host"
 source = "pgdata"        # must be declared in the node's agent.toml
 target = "/var/lib/postgresql/data"
+# single_writer = true   # default for writable volumes: one live workload at a time,
+                         # stop-first updates (FR-CON-07); false = shared
 ```
 
 ### 6.4 Apply-to-running trace (replicas 1 → 3)
@@ -1009,6 +1014,7 @@ service AdminService {
   rpc ListNodes(ListNodesRequest)         returns (ListNodesResponse);
   rpc DrainNode(DrainNodeRequest)         returns (DrainNodeResponse);
   rpc UndrainNode(UndrainNodeRequest)     returns (UndrainNodeResponse);
+  rpc RemoveNode(RemoveNodeRequest)       returns (RemoveNodeResponse);    // FR-CON-08 node removal
   rpc ScaleService(ScaleServiceRequest)   returns (ScaleServiceResponse);  // FR-CON-10 manual scale
   rpc ListEvents(ListEventsRequest)       returns (ListEventsResponse);    // cluster_events feed
 }

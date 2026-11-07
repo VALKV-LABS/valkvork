@@ -126,6 +126,7 @@ pub struct Core {
     dirty_workloads: HashSet<String>,
     deleted_workloads: Vec<String>,
     deleted_services: Vec<String>,
+    deleted_nodes: Vec<String>,
     events: Vec<NewEvent>,
     scaling_events: Vec<NewScalingEvent>,
     heartbeats: Vec<(String, i64)>,
@@ -205,6 +206,7 @@ impl Core {
             dirty_workloads: HashSet::new(),
             deleted_workloads: Vec::new(),
             deleted_services: Vec::new(),
+            deleted_nodes: Vec::new(),
             events: Vec::new(),
             scaling_events: Vec::new(),
             heartbeats: Vec::new(),
@@ -311,6 +313,7 @@ impl Core {
                 .collect(),
             deleted_workloads: std::mem::take(&mut self.deleted_workloads),
             deleted_services: std::mem::take(&mut self.deleted_services),
+            deleted_nodes: std::mem::take(&mut self.deleted_nodes),
             events: std::mem::take(&mut self.events),
             scaling_events: std::mem::take(&mut self.scaling_events),
             heartbeats: std::mem::take(&mut self.heartbeats),
@@ -432,6 +435,16 @@ impl Core {
         self.svc_rt.remove(service_id);
         self.dirty_services.remove(service_id);
         self.deleted_services.push(service_id.to_string());
+    }
+
+    /// Forget a node: drop its in-memory entry and pending commands, and
+    /// delete its row in the next commit.
+    pub(crate) fn remove_node_entry(&mut self, node_id: &str) {
+        self.nodes.remove(node_id);
+        self.dirty_nodes.remove(node_id);
+        self.heartbeats.retain(|(id, _)| id != node_id);
+        self.outstanding.retain(|_, o| o.node_id != node_id);
+        self.deleted_nodes.push(node_id.to_string());
     }
 
     pub(crate) fn in_grace(&self) -> bool {
@@ -620,6 +633,11 @@ impl Core {
 
     /// Capacity snapshot for the scheduler.
     pub(crate) fn snapshot(&self) -> Snapshot {
+        self.snapshot_excluding(&HashSet::new())
+    }
+
+    /// Snapshot as if the `excluded` workloads were already gone.
+    pub(crate) fn snapshot_excluding(&self, excluded: &HashSet<String>) -> Snapshot {
         let mut snap = Snapshot::default();
         for e in self.nodes.values() {
             let n = &e.node;
@@ -638,7 +656,10 @@ impl Core {
         }
         for w in self.workloads.values() {
             let Some(node_id) = &w.node_id else { continue };
-            if w.status.is_terminal() || w.status == WorkloadStatus::Lost {
+            if w.status.is_terminal()
+                || w.status == WorkloadStatus::Lost
+                || excluded.contains(&w.workload_id)
+            {
                 continue;
             }
             if let Some(svc) = self.services.get(&w.service_id) {

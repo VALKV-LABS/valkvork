@@ -28,7 +28,7 @@ The split is a tower layer (`UiLayer`) wrapped around tonic's server, which also
 | Services | `/ui/services` | Id, image, version, running/target, CPU, status, rollout status | |
 | Service detail | `/ui/services/<id>` | Status, rollout progress, a 60-minute CPU sparkline, workloads with node, status, reason and restarts, scaling events, the canonical spec as TOML | **Scale**; **Delete**, enabled only once you type the service id |
 | Nodes | `/ui/nodes` | Id, hostname, class, status and draining, CPU and memory allocation bars, workload count, heartbeat age, agent and runtime versions | |
-| Node detail | `/ui/nodes/<id>` | Capacity and allocation, address, host volumes, the workloads on the node | **Drain** (with a confirmation) / **Undrain** |
+| Node detail | `/ui/nodes/<id>` | Capacity and allocation, address, host volumes, the workloads on the node | **Drain** (with a confirmation) / **Undrain**; **Remove** (with a confirmation) on an UNHEALTHY node |
 | Workloads | `/ui/workloads?service=&node=&status=` | Every workload, filterable | |
 | Events | `/ui/events?kind=` | Cluster events, newest first, filterable by kind | |
 | Deploy | `/ui/deploy` | Paste or upload a manifest | **Plan** (diff, placement check, warnings or validation errors), then **Apply**, enabled only after a successful plan of the same text |
@@ -48,7 +48,7 @@ Every page has a deep-linkable URL. Status is always text plus colour, never col
 3. The page keeps the CSRF token in memory (never in storage) and sends it as `X-Valkvork-CSRF` on every mutating request. A mutating request without it, or with the wrong one, gets **403**.
 4. Sessions live in memory, at most 256 (the one closest to expiry is evicted). A controller restart signs everyone out.
 
-Each session also has a separate random **audit id**. Every action from the UI is recorded in `cluster_events` with actor `ui:<audit id>`. The audit id is not the cookie value, so the event log never reveals a usable session. Apply, scale, delete and drain write the same events whether they come from the CLI or the UI, apart from the actor (AT-16).
+Each session also has a separate random **audit id**. Every action from the UI is recorded in `cluster_events` with actor `ui:<audit id>`. The audit id is not the cookie value, so the event log never reveals a usable session. Apply, scale, delete, drain and node removal write the same events whether they come from the CLI or the UI, apart from the actor (AT-16).
 
 ## JSON API
 
@@ -64,6 +64,7 @@ Internal and unversioned (FR-UI-05); scripts should use the gRPC API or the CLI.
 | `POST /ui/api/services/<id>/delete` `{confirm}` | Delete; `confirm` must equal the id |
 | `GET /ui/api/nodes`, `GET /ui/api/nodes/<id>` | Node list; detail with its workloads |
 | `POST /ui/api/nodes/<id>/drain`, `…/undrain` | Drain or undrain |
+| `POST /ui/api/nodes/<id>/remove` | Remove an UNHEALTHY node (`409` if it is HEALTHY) |
 | `GET /ui/api/workloads?service=&node=&status=` | Workloads |
 | `GET /ui/api/cluster-events?kind=&limit=` | Events (default 100, max 1000) |
 | `POST /ui/api/plan`, `POST /ui/api/apply` `{manifest}` | Plan or apply a manifest |

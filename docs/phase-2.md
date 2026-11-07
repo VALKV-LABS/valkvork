@@ -25,7 +25,7 @@ This page collects every P2 and P3 item, and for each one: what it is, what alre
 
 ## Suggested Order
 
-1. **Finish the MVP gaps that P2 builds on**, from [NEXT_STEPS.md](../NEXT_STEPS.md): node removal (item 7) and stop-first updates (item 9). Block volumes need both.
+1. **The MVP gaps that P2 builds on are done:** node removal (`valkvork node remove`) and stop-first updates for single-writer volumes, which block volumes will reuse.
 2. **Health checks.** Small, self-contained, and they make rollouts, drains and load balancer registration safer.
 3. **Secret references**, then **per-node mTLS**: both close security gaps that production users hit first.
 4. **Block volumes with fencing**: the largest item, and the one that makes stateful services practical.
@@ -69,7 +69,7 @@ target = "/data"
 | Scheduler | New filter: same zone as the volume, if it exists; capacity for attachments per instance type |
 | Reconciler | A per-workload volume step before `StartWorkload`: create if missing → fence the previous holder → attach → start. Rollback on failure |
 | Agent | Find the device by volume id (on Nitro, the NVMe serial), `mkfs` only if blank, mount under `data_dir/volumes/<id>`, bind-mount into the container; unmount on stop |
-| Updates | Single-writer volumes need stop-first rollouts and drains (NEXT_STEPS item 9) |
+| Updates | Stop-first rollouts and drains already exist for single-writer host volumes; a block volume is single-writer, so it reuses them |
 
 **Questions to settle:** multi-attach (io2) or single-writer only; whether a volume outlives `delete service` (probably yes, with an explicit `delete volume`); snapshots and backups; how the controller authenticates to the cloud API in local development.
 
