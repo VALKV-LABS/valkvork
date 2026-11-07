@@ -238,6 +238,22 @@ async fn start_is_idempotent_and_runs() {
     assert!(d.path().join("alloc/w1").is_dir());
 }
 
+/// Images that run as a non-root USER can write to /alloc.
+#[cfg(unix)]
+#[tokio::test]
+async fn alloc_dir_is_writable_by_any_user() {
+    use std::os::unix::fs::PermissionsExt;
+    let d = tempfile::tempdir().unwrap();
+    let s = supervisor(Fake::new(), d.path());
+    s.start(start_cmd("w1", 3)).await.unwrap();
+    settle().await;
+    let mode = std::fs::metadata(d.path().join("alloc/w1"))
+        .unwrap()
+        .permissions()
+        .mode();
+    assert_eq!(mode & 0o7777, 0o1777);
+}
+
 #[tokio::test]
 async fn stop_removes_container_and_alloc_dir() {
     let d = tempfile::tempdir().unwrap();

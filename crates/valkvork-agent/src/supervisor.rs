@@ -318,6 +318,7 @@ impl Supervisor {
         let wid = &cmd.workload_id;
         let alloc = self.alloc_dir(wid);
         std::fs::create_dir_all(&alloc)
+            .and_then(|()| make_alloc_writable(&alloc))
             .map_err(|e| ("ALLOC_DIR_FAILED".to_string(), e.to_string()))?;
 
         let mut mounts = vec![BindMount {
@@ -756,6 +757,21 @@ impl Supervisor {
         }
         out
     }
+}
+
+/// `/alloc` must be writable whatever user the image runs as, so the
+/// directory is world-writable with the sticky bit, like `/tmp`. It is only
+/// mounted into its own container, and the parent `alloc/` stays `root 0711`,
+/// so other host users cannot list it.
+fn make_alloc_writable(dir: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o1777))?;
+    }
+    #[cfg(not(unix))]
+    let _ = dir;
+    Ok(())
 }
 
 fn parse_policy(s: &str) -> Policy {

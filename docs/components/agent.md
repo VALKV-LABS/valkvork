@@ -74,7 +74,7 @@ cgroup files are read directly, never through the Docker stats API, which is too
 | join token file, CA bundle | From the secrets store, at boot |
 | `/etc/valkvork/registry-auth.json` | Optional registry credentials, Docker `config.json` format |
 | `<data_dir>/node_id` | Node identity |
-| `<data_dir>/alloc/<workload_id>/` | Each workload's ephemeral disk, mounted at `/alloc` |
+| `<data_dir>/alloc/<workload_id>/` | Each workload's ephemeral disk, mounted at `/alloc`; mode `1777`, so any container user can write to it |
 | `<data_dir>/failed/<workload_id>` | Marker for a container that failed for good, so adoption does not restart it |
 
 ## Running It
