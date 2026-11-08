@@ -3,8 +3,13 @@
 # building a golden image. For trying a fix during verification; releases
 # still go through a tagged release and a new image.
 #
-#   scripts/dev-cell-upgrade.sh --cell <cell_id> --bucket <s3-bucket> [--region R] [--arch arm64|amd64]
-#   scripts/dev-cell-upgrade.sh --cell aws-us-west-1-valkvork --bucket my-dev-artifacts --region us-west-1
+#   scripts/dev-cell-upgrade.sh --cell <cell_id> --bucket <s3-bucket> [--region R] [--arch arm64|amd64] [--version X.Y.Z]
+#   scripts/dev-cell-upgrade.sh --cell aws-us-west-1-valkvork --bucket my-dev-artifacts --region us-west-1 --version 0.3.0
+#
+# --version is what the binaries report in --version and the agents report to
+# the controller (`valkvork node list --json`). It is stamped only for this
+# build, like a release does; the Cargo.toml files are put back afterwards.
+# Without it they report the committed crate version (0.1.0).
 #
 # What it does:
 #   1. `make dist` for the cell's architecture (static musl binaries, in Docker).
@@ -29,8 +34,9 @@ CELL=""
 BUCKET=""
 REGION="${AWS_REGION:-${AWS_DEFAULT_REGION:-}}"
 ARCH="arm64"
+VERSION=""
 
-usage() { sed -n '2,25p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
+usage() { sed -n '2,29p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
 die() { echo "dev-cell-upgrade: $*" >&2; exit 1; }
 
 while [ $# -gt 0 ]; do
@@ -39,6 +45,7 @@ while [ $# -gt 0 ]; do
     --bucket) BUCKET="$2"; shift 2 ;;
     --region) REGION="$2"; shift 2 ;;
     --arch) ARCH="$2"; shift 2 ;;
+    --version) VERSION="${2#v}"; shift 2 ;;
     -h | --help) usage ;;
     *) echo "unknown argument: $1" >&2; usage 1 ;;
   esac
@@ -47,18 +54,35 @@ done
 [ -n "$BUCKET" ] || die "--bucket is required"
 [ -n "$REGION" ] || die "--region is required (or set AWS_REGION)"
 case "$ARCH" in arm64 | amd64) ;; *) die "--arch must be arm64 or amd64" ;; esac
+[ -z "$VERSION" ] || [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || die "--version must be X.Y.Z, not $VERSION"
 command -v aws >/dev/null || die "aws CLI not found"
 
 work="$(mktemp -d)"
-trap 'rm -r "$work"' EXIT
+# Put back the crate versions if --version stamped them, even on failure.
+restore_versions() {
+  [ -d "$work/manifests" ] || return 0
+  (cd "$work/manifests" && find . -type f) | while read -r f; do
+    cp "$work/manifests/$f" "$ROOT/$f"
+  done
+}
+trap 'restore_versions; rm -r "$work"' EXIT
 
 # ── 1. Build ─────────────────────────────────────────────────────────────────
+if [ -n "$VERSION" ]; then
+  mkdir -p "$work/manifests"
+  (cd "$ROOT" && for f in Cargo.lock crates/*/Cargo.toml; do
+    mkdir -p "$work/manifests/$(dirname "$f")"
+    cp "$f" "$work/manifests/$f"
+  done)
+  "$ROOT/scripts/set-version.sh" "$VERSION" >/dev/null
+fi
 echo "==> Building linux/$ARCH binaries"
 make -C "$ROOT" dist PLATFORM="linux/$ARCH" >/dev/null
+restore_versions
 for bin in valkvork-controller valkvork-agent valkvork; do
   [ -x "$ROOT/dist/$bin" ] || die "dist/$bin missing after make dist"
 done
-version="$(sed -n 's/^version = "\(.*\)"/\1/p' "$ROOT/crates/valkvork-agent/Cargo.toml" | head -1)"
+version="${VERSION:-$(sed -n 's/^version = "\(.*\)"/\1/p' "$ROOT/crates/valkvork-agent/Cargo.toml" | head -1)}"
 rev="$(git -C "$ROOT" rev-parse --short HEAD)$(git -C "$ROOT" diff --quiet || echo -dirty)"
 tarball="$work/valkvork-$rev-linux-$ARCH.tar.gz"
 tar -C "$ROOT/dist" -czf "$tarball" valkvork-controller valkvork-agent valkvork
