@@ -153,6 +153,7 @@ impl Core {
                     conn: None,
                     cpu_usage_percent: 0.0,
                     used_memory_bytes: 0,
+                    features: Vec::new(),
                 };
                 (entry.node.node_id.clone(), entry)
             })
@@ -668,7 +669,8 @@ impl Core {
                     n.allocatable_cpu_millicores,
                     n.allocatable_memory_bytes,
                     &n.host_volumes,
-                ),
+                )
+                .with_features(&e.features),
             );
         }
         for w in self.workloads.values() {

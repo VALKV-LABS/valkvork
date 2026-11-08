@@ -155,11 +155,9 @@ mod tests {
         assert!(probe(true, ok).run().await.is_ok());
         assert!(probe(true, redirect).run().await.is_ok());
         assert_eq!(probe(true, broken).run().await.unwrap_err(), "HTTP 503");
-        // Nothing listening.
-        let closed = {
-            let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
-            l.local_addr().unwrap()
-        };
+        // Nothing listening: port 1 refuses (a just-released ephemeral port
+        // could be reused by a parallel test).
+        let closed: SocketAddr = "127.0.0.1:1".parse().unwrap();
         assert!(probe(false, closed)
             .run()
             .await

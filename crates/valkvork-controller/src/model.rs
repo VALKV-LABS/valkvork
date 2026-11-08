@@ -39,6 +39,8 @@ pub struct NodeEntry {
     pub conn: Option<(u64, AgentSender)>,
     pub cpu_usage_percent: f64,
     pub used_memory_bytes: u64,
+    /// From the agent's last Register; empty until it registers.
+    pub features: Vec<String>,
 }
 
 #[derive(Debug, Clone)]

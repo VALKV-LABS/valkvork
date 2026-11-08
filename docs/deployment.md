@@ -165,7 +165,7 @@ The controller image runs as uid 65532, so its database directory must be writab
 
 ## Upgrades
 
-- **Upgrade order.** Upgrade the controller first, then roll the workers (spec §11.2). Restarting the controller enters the recovery grace period and never touches running workloads. Proto fields are only ever added, so agents built from older code keep working.
+- **Upgrade order.** Upgrade the controller first, then roll the workers (spec §11.2). Restarting the controller enters the recovery grace period and never touches running workloads. Proto fields are only ever added, so agents built from older code keep working. A service that uses a newer manifest feature (`[secrets]`, `[check]`, `host_ip`, `command`) is placed only on agents that report that feature, so it waits as PENDING (`agent lacks … (upgrade it)`) until its nodes are upgraded, instead of running without it.
 - **Workers** are immutable: drain a node (`valkvork node drain <id>`), wait until it has no workloads, then replace it with an instance of the new image. Restarting an agent in place also works: it re-adopts its containers.
 - **Database** migrations run automatically at controller start and are forward-only. Snapshot the volume before upgrading.
 

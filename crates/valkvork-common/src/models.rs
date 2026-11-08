@@ -254,6 +254,33 @@ pub struct ServiceSpec {
     pub check: Option<CheckSpec>,
 }
 
+/// Manifest features an agent must support to run a workload that uses them.
+/// Agents list theirs in `Register`; the scheduler places a workload only on a
+/// node whose agent has every feature its spec uses. Protobuf ignores fields
+/// a receiver does not know, so without this an older agent would start the
+/// container without its secrets, check or bind address.
+pub const AGENT_FEATURES: &[&str] = &["command", "health_checks", "host_ip", "secrets"];
+
+impl ServiceSpec {
+    /// The `AGENT_FEATURES` this spec uses.
+    pub fn required_features(&self) -> Vec<&'static str> {
+        let mut f = Vec::new();
+        if self.command.is_some() || self.entrypoint.is_some() {
+            f.push("command");
+        }
+        if self.check.is_some() {
+            f.push("health_checks");
+        }
+        if self.ports.iter().any(|p| p.host_ip.is_some()) {
+            f.push("host_ip");
+        }
+        if !self.secrets.is_empty() {
+            f.push("secrets");
+        }
+        f
+    }
+}
+
 /// Classification of the difference between a stored spec and a new one
 /// (FR-MAN-02).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

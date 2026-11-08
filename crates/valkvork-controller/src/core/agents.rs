@@ -73,6 +73,7 @@ impl Core {
                 conn: Some((conn_id, tx.clone())),
                 cpu_usage_percent: 0.0,
                 used_memory_bytes: 0,
+                features: r.features.clone(),
             },
         );
         self.touch_node(&node_id);

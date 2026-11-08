@@ -62,6 +62,19 @@ fn stops(msgs: &[pb::controller_message::Msg]) -> Vec<String> {
         .collect()
 }
 
+/// Agents support every feature, except nodes whose id starts with "old",
+/// which behave like an agent from before the features existed.
+fn features_for(id: &str) -> Vec<String> {
+    if id.starts_with("old") {
+        vec![]
+    } else {
+        valkvork_common::models::AGENT_FEATURES
+            .iter()
+            .map(|f| f.to_string())
+            .collect()
+    }
+}
+
 static CONN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
 fn register_with(
@@ -96,6 +109,7 @@ fn register_full(
         host_volumes,
         inventory,
         runtime: "docker/27.3.1".into(),
+        features: features_for(id),
     };
     c.handle(CoreMsg::AgentConnected {
         register,
@@ -1129,4 +1143,32 @@ fn rollout_waits_for_the_health_check() {
         WorkloadStatus::Stopping,
         "healthy long enough"
     );
+}
+
+/// A workload using secrets is never placed on an agent that does not
+/// support them; it waits with a reason, and plain services still run there.
+#[test]
+fn features_need_an_agent_that_supports_them() {
+    let mut c = core();
+    let mut old = register(&mut c, "old-1");
+    apply(
+        &mut c,
+        &manifest("pg", "postgres:16", 1, "[secrets]\nPW = \"ssm:/x\"\n"),
+    );
+    apply(&mut c, &manifest("plain", "nginx:1", 1, ""));
+    let pending = by_status(&c, "pg", WorkloadStatus::Pending);
+    assert_eq!(pending.len(), 1, "not placed on the old agent");
+    let reason = pending[0].status_reason.clone().unwrap_or_default();
+    assert!(reason.contains("agent lacks secrets"), "{reason}");
+    assert_eq!(by_status(&c, "plain", WorkloadStatus::Assigned).len(), 1);
+    old.take();
+
+    // A current agent joins: the workload goes there.
+    // (register_with keeps the messages register() would drain.)
+    let mut new = register_with(&mut c, "new-1", "general", TOKEN, vec![]);
+    c.reconcile();
+    c.finish().unwrap();
+    let starts = new.starts();
+    assert_eq!(starts.len(), 1);
+    assert_eq!(starts[0].service_id, "pg");
 }
