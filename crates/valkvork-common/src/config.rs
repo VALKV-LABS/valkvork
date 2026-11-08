@@ -249,7 +249,8 @@ impl AgentConfig {
 pub struct SecretsConfig {
     /// The AWS CLI, which resolves `ssm:` references with the instance's role.
     pub aws_cli: PathBuf,
-    /// Region for `ssm:` references. Unset: the CLI's own default.
+    /// Region for `ssm:` references. Unset: the instance's region from the
+    /// EC2 metadata service, or off EC2 the CLI's own default.
     pub aws_region: Option<String>,
     /// Directories `file:` references may read from. Empty (the default)
     /// disables `file:` references: the agent runs as root, so a manifest

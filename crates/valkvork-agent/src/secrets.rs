@@ -8,15 +8,51 @@
 use std::path::Path;
 use std::process::Stdio;
 use std::time::Duration;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::sync::OnceCell;
 use valkvork_common::config::SecretsConfig;
+
+/// The EC2 instance metadata service.
+const IMDS: &str = "169.254.169.254:80";
 
 pub struct SecretResolver {
     cfg: SecretsConfig,
+    imds: String,
+    /// `cfg.aws_region`, or the instance's region from the metadata service,
+    /// looked up once.
+    region: OnceCell<Option<String>>,
 }
 
 impl SecretResolver {
     pub fn new(cfg: SecretsConfig) -> Self {
-        Self { cfg }
+        Self {
+            cfg,
+            imds: IMDS.to_string(),
+            region: OnceCell::new(),
+        }
+    }
+
+    /// The region for ssm: references. Unset in agent.toml: this instance's
+    /// region (IMDSv2), as on the golden image, else the CLI's own default.
+    async fn region(&self) -> Option<String> {
+        self.region
+            .get_or_init(|| async {
+                if let Some(r) = &self.cfg.aws_region {
+                    return Some(r.clone());
+                }
+                let found = imds_region(&self.imds).await;
+                match &found {
+                    Some(r) => {
+                        tracing::info!(region = %r, "secrets: region from instance metadata")
+                    }
+                    None => tracing::info!(
+                        "secrets: no instance metadata; the AWS CLI chooses the region"
+                    ),
+                }
+                found
+            })
+            .await
+            .clone()
     }
 
     /// The value behind `reference`.
@@ -64,8 +100,8 @@ impl SecretResolver {
             "--output",
             "text",
         ]);
-        if let Some(region) = &self.cfg.aws_region {
-            cmd.args(["--region", region]);
+        if let Some(region) = self.region().await {
+            cmd.args(["--region", &region]);
         }
         cmd.env("AWS_PAGER", "")
             .stdin(Stdio::null())
@@ -83,6 +119,52 @@ impl SecretResolver {
         let value = String::from_utf8(out.stdout).map_err(|_| "value is not UTF-8".to_string())?;
         Ok(strip_newline(value))
     }
+}
+
+/// This instance's region from IMDSv2, or None off EC2 (2 s limit).
+async fn imds_region(addr: &str) -> Option<String> {
+    let attempt = async {
+        let token = http(
+            addr,
+            "PUT",
+            "/latest/api/token",
+            "X-aws-ec2-metadata-token-ttl-seconds: 60",
+        )
+        .await?;
+        let region = http(
+            addr,
+            "GET",
+            "/latest/meta-data/placement/region",
+            &format!("X-aws-ec2-metadata-token: {token}"),
+        )
+        .await?;
+        let region = region.trim().to_string();
+        let valid = !region.is_empty()
+            && region.len() < 32
+            && region
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-');
+        valid.then_some(region)
+    };
+    tokio::time::timeout(Duration::from_secs(2), attempt)
+        .await
+        .ok()
+        .flatten()
+}
+
+/// A minimal HTTP/1.1 request to the metadata service: the body of a 200.
+async fn http(addr: &str, method: &str, path: &str, header: &str) -> Option<String> {
+    let mut conn = tokio::net::TcpStream::connect(addr).await.ok()?;
+    let req = format!(
+        "{method} {path} HTTP/1.1\r\nHost: 169.254.169.254\r\n{header}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+    );
+    conn.write_all(req.as_bytes()).await.ok()?;
+    let mut buf = Vec::new();
+    conn.take(16 * 1024).read_to_end(&mut buf).await.ok()?;
+    let text = String::from_utf8(buf).ok()?;
+    let (head, body) = text.split_once("\r\n\r\n")?;
+    head.split_whitespace().nth(1).filter(|s| *s == "200")?;
+    Some(body.to_string())
 }
 
 /// One trailing newline is formatting, not part of the value.
@@ -157,6 +239,50 @@ mod tests {
             .unwrap_err()
             .contains("timed out"));
         assert!(r.resolve("vault:x").await.is_err());
+    }
+
+    /// Without aws_region, the region comes from the metadata service once.
+    #[tokio::test]
+    async fn region_from_instance_metadata() {
+        use tokio::net::TcpListener;
+        let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = l.local_addr().unwrap().to_string();
+        tokio::spawn(async move {
+            while let Ok((mut s, _)) = l.accept().await {
+                let mut buf = [0u8; 1024];
+                let n = s.read(&mut buf).await.unwrap();
+                let req = String::from_utf8_lossy(&buf[..n]).to_string();
+                let body = if req.starts_with("PUT /latest/api/token") {
+                    "tok123"
+                } else if req.starts_with("GET /latest/meta-data/placement/region")
+                    && req.contains("X-aws-ec2-metadata-token: tok123")
+                {
+                    "us-west-1"
+                } else {
+                    ""
+                };
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = s.write_all(resp.as_bytes()).await;
+            }
+        });
+        let d = tempfile::tempdir().unwrap();
+        let mut r = resolver(d.path(), vec![]);
+        r.cfg.aws_region = None;
+        r.imds = addr;
+        assert_eq!(r.resolve("ssm:/ok").await.unwrap(), "s3cr3t");
+        let args = std::fs::read_to_string(d.path().join("args")).unwrap();
+        assert!(args.contains("--region us-west-1"), "{args}");
+
+        // Off EC2: no metadata service, no --region.
+        let mut off = resolver(d.path(), vec![]);
+        off.cfg.aws_region = None;
+        off.imds = "127.0.0.1:1".into();
+        assert_eq!(off.resolve("ssm:/ok").await.unwrap(), "s3cr3t");
+        let args = std::fs::read_to_string(d.path().join("args")).unwrap();
+        assert!(!args.contains("--region"), "{args}");
     }
 
     #[tokio::test]

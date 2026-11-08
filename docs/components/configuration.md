@@ -69,7 +69,7 @@ memory = "384MiB"
 
 [secrets]                  # how manifests' [secrets] references are resolved
 aws_cli         = "aws"    # runs `aws ssm get-parameter` for ssm: references, with the instance role
-# aws_region    = "us-west-1"   # default: the CLI's own region resolution
+# aws_region    = "us-west-1"   # default: the instance's region (EC2 metadata), else the CLI's default
 file_dirs       = []       # directories file: references may read; empty disables file: references
 timeout_seconds = 15       # per reference
 

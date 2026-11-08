@@ -104,7 +104,7 @@ The check needs a published port; there are no exec checks yet.
 
 | Scheme | Resolved by | Needs |
 |---|---|---|
-| `ssm:<name>` | `aws ssm get-parameter --with-decryption`, run by the agent with the node's instance role | The role may read the parameter; agent.toml `secrets.aws_region` or the CLI's default region |
+| `ssm:<name>` | `aws ssm get-parameter --with-decryption`, run by the agent with the node's instance role, in the instance's region (agent.toml `secrets.aws_region` overrides it) | The role may read the parameter |
 | `file:<path>` | Reading the file on the node; one trailing newline is dropped | The file is inside a directory in agent.toml `secrets.file_dirs`. Off by default |
 
 If a reference cannot be resolved, the workload fails before anything is pulled or created, with `SECRET_UNRESOLVED: <NAME> (<reference>): <cause>` in its status and the event log. The cause never contains a value. The service's failure backoff then applies, as for a failed image pull.
