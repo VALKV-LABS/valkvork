@@ -34,9 +34,9 @@ const link = (href, text) => h('a', { href, 'data-link': true }, text);
 const enc = encodeURIComponent;
 
 const STATUS_CLASS = {
-  RUNNING: 'ok', HEALTHY: 'ok', ACTIVE: 'ok', created: 'ok',
+  RUNNING: 'ok', HEALTHY: 'ok', ACTIVE: 'ok', created: 'ok', COMPLETED: 'ok',
   PENDING: 'warn', ASSIGNED: 'warn', STOPPING: 'warn', IN_PROGRESS: 'warn', DELETING: 'warn', DRAINING: 'warn',
-  'scale-only': 'warn', 'policy-only': 'warn', replacing: 'warn',
+  'scale-only': 'warn', 'policy-only': 'warn', replacing: 'warn', rerun: 'warn',
   FAILED: 'bad', LOST: 'bad', UNHEALTHY: 'bad', DEGRADED: 'bad', HALTED: 'bad',
 };
 // Status is always text plus colour, never colour alone (FR-UI-08).
@@ -324,7 +324,7 @@ function workloadHeaders({ service = false, node = true } = {}) {
 async function servicePage(id) {
   const { service: s, cpu_series, scaling_events } = await api(`services/${enc(id)}`);
   const msg = h('div');
-  const live = s.workloads.filter((w) => !['STOPPED', 'FAILED'].includes(w.status));
+  const live = s.workloads.filter((w) => !['STOPPED', 'FAILED', 'COMPLETED'].includes(w.status));
   const current = live.filter((w) => w.service_version === s.version && w.status === 'RUNNING').length;
 
   const replicas = h('input', { type: 'number', min: 0, value: s.target_replicas, 'aria-label': 'Replicas' });
@@ -454,7 +454,7 @@ async function nodePage(id) {
     table(workloadHeaders({ service: true, node: false }), workloadRows(workloads, { service: true, node: false })));
 }
 
-const STATUSES = ['', 'PENDING', 'ASSIGNED', 'RUNNING', 'STOPPING', 'LOST', 'STOPPED', 'FAILED'];
+const STATUSES = ['', 'PENDING', 'ASSIGNED', 'RUNNING', 'STOPPING', 'LOST', 'STOPPED', 'FAILED', 'COMPLETED'];
 
 async function workloadsPage(params) {
   const q = new URLSearchParams();

@@ -58,6 +58,7 @@ enum WorkloadState {
   WORKLOAD_STATE_RESTARTING = 3;       // local restart policy in progress
   WORKLOAD_STATE_STOPPED = 4;          // stopped on request
   WORKLOAD_STATE_FAILED = 5;           // see reason
+  WORKLOAD_STATE_COMPLETED = 6;        // a batch workload exited 0; never restarted
 }
 
 message WorkloadStatus {
@@ -94,8 +95,13 @@ message StartWorkload {
   // Environment variables the agent resolves before creating the container:
   // name -> reference ("ssm:<parameter>" or "file:<path>"). Values never
   // reach the controller.
+  // [env] values may contain ${secret:NAME}, NAME a key of this map; the
+  // agent substitutes the resolved value.
   map<string, string> secrets = 16;
   HealthCheck check = 17;              // unset: no health check
+  // Runs to completion: exit 0 is COMPLETED, not restarted. Other exits
+  // follow the restart policy, as for services.
+  bool batch = 18;
 }
 
 // The agent probes the workload through one of its published ports, at the

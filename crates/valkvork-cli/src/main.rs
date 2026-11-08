@@ -516,6 +516,14 @@ fn print_plan(r: &pb::PlanResponse) {
                 r.max_parallel
             ),
         ),
+        ChangeKind::Rerun => (
+            "~",
+            format!(
+                "version {} → {}   [batch: run again]",
+                r.version.saturating_sub(1),
+                r.version
+            ),
+        ),
         ChangeKind::ScaleOnly => ("~", format!("version {}   [scale-only]", r.version)),
         ChangeKind::PolicyOnly => ("~", format!("version {}   [policy-only]", r.version)),
     };

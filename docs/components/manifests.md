@@ -11,6 +11,7 @@ A manifest is a TOML file that declares one service: what to run, how many, with
 id           = "frontend-web"                        # required; DNS label, immutable
 image        = "docker.io/library/nginx:1.27.2-alpine-slim"   # required; OCI reference, digest allowed
 replicas     = 3                                     # required; >= 0
+# type       = "batch"                               # "service" (default) or "batch": runs to completion
 kill_timeout = "10s"                                 # SIGTERM → SIGKILL grace period
 # entrypoint = ["docker-entrypoint.sh"]              # replaces the image's ENTRYPOINT
 # command    = ["postgres", "-c", "wal_level=logical"]   # replaces the image's CMD, keeps its entrypoint
@@ -96,7 +97,19 @@ With `[check]`, the agent probes the workload through one of its published ports
 - **Rollouts and drains wait for health.** A replacement counts once it has been `HEALTHY` for `min_healthy_time`, not merely running.
 - Health shows in `valkvork status` and `valkvork workloads` (`HEALTH`), the UI, and the metric `valkvork_workload_health`.
 
-The check needs a published port; there are no exec checks yet.
+The check needs a published port; there are no exec checks yet. A `tcp` check only proves the port accepts connections: the kernel accepts them for a listening socket even while the process is frozen or hung, so it detects a process that exited or stopped listening, not one that stopped answering. Use `http` where the service has an endpoint.
+
+### Batch Jobs
+
+`type = "batch"` runs each of `replicas` workloads to completion, for one-off work such as creating databases or running migrations.
+
+- **Exit 0 is `COMPLETED`.** The workload is terminal and never replaced, and its container is removed. The service keeps its completed runs in `valkvork workloads` (pruned like stopped ones).
+- **Any other exit** is restarted in place under `[restart]`, as for a service. When that is used up, the workload is `FAILED` and the controller starts a new one under the failure backoff (5 s, doubling to 5 min), so a job that waits for something keeps being retried.
+- **Applying it again runs it again.** Once a run has finished, an unchanged manifest is the change `rerun`: a new version with new workloads. While a run is in progress, an unchanged apply changes nothing.
+- **A changed manifest supersedes a run in progress:** its workloads are stopped (`SUPERSEDED`) and the new version's start.
+- No `[check]` and no `[autoscale]`. A batch job needs an agent with the `batch` feature.
+
+Nothing waits for a batch job: a service that needs its result must cope until it has run (retry at start, or fail and be restarted).
 
 ### Secrets
 
@@ -108,6 +121,18 @@ The check needs a published port; there are no exec checks yet.
 | `file:<path>` | Reading the file on the node; one trailing newline is dropped | The file is inside a directory in agent.toml `secrets.file_dirs`. Off by default |
 
 If a reference cannot be resolved, the workload fails before anything is pulled or created, with `SECRET_UNRESOLVED: <NAME> (<reference>): <cause>` in its status and the event log. The cause never contains a value. The service's failure backoff then applies, as for a failed image pull.
+
+**A secret inside a value.** An `[env]` value can contain `${secret:NAME}`, where `NAME` is a key of `[secrets]`. The agent substitutes the resolved value at container start, so a connection URL can embed a password:
+
+```toml
+[secrets]
+POSTGRES_PASSWORD = "ssm:/valkv/<cell>/workloads/POSTGRES_PASSWORD"
+
+[env]
+DATABASE_URL = "postgresql://valkv:${secret:POSTGRES_PASSWORD}@postgres.valkvork.internal:5432/app"
+```
+
+The controller stores and shows the value as written, with the reference, never the secret. `NAME` is also set as its own variable, as every `[secrets]` entry is. `${secret:` always starts a reference; there is no escape. The secret is inserted as is, so it must be valid where it is used (the goldenimage generates alphanumeric values).
 
 A changed reference is a replacing change. A changed **value** is read when a container is next created, so rotate a value by updating the parameter, then replacing the workloads (re-apply with any replacing change, or `valkvork scale` down and up). Restarts under the restart policy reuse the container, and with it the old value.
 
@@ -121,7 +146,7 @@ Validation runs before any database write. A failure writes nothing, returns gRP
 
 | Rule | Checks | Code |
 |---|---|---|
-| VE-01 | `cpu > 0`, `memory ≥ 4MiB`, `disk > 0`, `replicas ≥ 0`, valid durations and sizes, `max_parallel ≥ 1`, `entrypoint` and `command` not empty when given | `INVALID_RESOURCE_SPEC` |
+| VE-01 | `cpu > 0`, `memory ≥ 4MiB`, `disk > 0`, `replicas ≥ 0`, valid durations and sizes, `max_parallel ≥ 1`, `entrypoint` and `command` not empty when given; `service.type` is `service` or `batch`, and a batch job has no `[check]` or `[autoscale]` | `INVALID_RESOURCE_SPEC` |
 | VE-02 | `image` is a valid OCI reference (`[registry[:port]/]path[:tag][@sha256:digest]`). A missing tag becomes `:latest` with a **warning** | `INVALID_IMAGE_REF` |
 | VE-03 | `service.id` matches `^[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?$` | `INVALID_SERVICE_ID` |
 | VE-04 | `1 ≤ min_replicas ≤ max_replicas`, `0 < target_cpu_percent < 100` | `INVALID_AUTOSCALE_SPEC` |
@@ -129,7 +154,7 @@ Validation runs before any database write. A failure writes nothing, returns gRP
 | VE-06 | No unknown keys or tables (`deny_unknown_fields`). The path names the table, e.g. `service.replica` or `ports.hostport` | `UNKNOWN_FIELD` |
 | VE-07 | Each volume has a known `type`, a source, an absolute `target`, and a unique `target` | `INVALID_VOLUME_SPEC` |
 | VE-09 | `check.type` is `tcp` or `http`; `check.port` names a `[[ports]]` entry; `path` only for `http`, starting with `/`; `failures` 1–1000 | `INVALID_CHECK_SPEC` |
-| VE-08 | Each secret's name is an environment variable name not also in `[env]`, and its reference is `ssm:<parameter name>` or `file:<absolute path>` | `INVALID_SECRET_REF` |
+| VE-08 | Each secret's name is an environment variable name not also in `[env]`, and its reference is `ssm:<parameter name>` or `file:<absolute path>`. Every `${secret:NAME}` in an `[env]` value is closed and names a `[secrets]` key | `INVALID_SECRET_REF` |
 | VW-01 | **Warning** at apply or plan: no current healthy node of the class could fit one replica, or none has the host volumes | `UNSATISFIABLE_NOW` |
 
 Example:
@@ -159,6 +184,7 @@ Applying to an existing service compares the stored spec with the new one (FR-MA
 | `scale-only` | Only `replicas` differs, or a manual scale drifted from the manifest | `target_replicas` updated; version unchanged |
 | `policy-only` | `[autoscale]` or `[update]` differs | Stored; running workloads untouched; version unchanged |
 | `replacing` | Anything else: image, resources, env, ports, volumes, restart policy, kill timeout, class | `version` + 1 and a rolling update |
+| `rerun` | A batch job whose run has finished, applied unchanged | `version` + 1: it runs again |
 
 Without `[autoscale]`, an apply restores the manifest's `replicas` after a manual `valkvork scale`, and `plan` shows that drift. With `[autoscale]`, `replicas` is only the initial count: later applies clamp the current target into `[min, max]` but never reset it (FR-MAN-04).
 

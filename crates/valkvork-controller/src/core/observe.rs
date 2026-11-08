@@ -207,7 +207,14 @@ impl Core {
     pub(crate) fn overview(&mut self) -> Overview {
         let mut workloads: BTreeMap<String, u32> = BTreeMap::new();
         for s in [
-            "PENDING", "ASSIGNED", "RUNNING", "STOPPING", "LOST", "STOPPED", "FAILED",
+            "PENDING",
+            "ASSIGNED",
+            "RUNNING",
+            "STOPPING",
+            "LOST",
+            "STOPPED",
+            "FAILED",
+            "COMPLETED",
         ] {
             workloads.insert(s.into(), 0);
         }
@@ -317,7 +324,14 @@ impl Core {
             "Workloads by status.",
         );
         let mut by_status: BTreeMap<&str, u32> = [
-            "PENDING", "ASSIGNED", "RUNNING", "STOPPING", "LOST", "STOPPED", "FAILED",
+            "PENDING",
+            "ASSIGNED",
+            "RUNNING",
+            "STOPPING",
+            "LOST",
+            "STOPPED",
+            "FAILED",
+            "COMPLETED",
         ]
         .into_iter()
         .map(|s| (s, 0))

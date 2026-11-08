@@ -1172,3 +1172,103 @@ fn features_need_an_agent_that_supports_them() {
     assert_eq!(starts.len(), 1);
     assert_eq!(starts[0].service_id, "pg");
 }
+
+fn batch_manifest(id: &str, replicas: u32) -> String {
+    format!(
+        "[service]\nid = \"{id}\"\ntype = \"batch\"\nimage = \"postgres:16\"\nreplicas = {replicas}\n\n[resources]\ncpu = 0.1\nmemory = \"64MiB\"\n"
+    )
+}
+
+/// A batch workload that exits 0 is COMPLETED and never replaced. Applying
+/// the same manifest again while it runs changes nothing; after it finished,
+/// it runs again as a new version.
+#[test]
+fn batch_completes_once_and_reruns_on_apply() {
+    let mut c = core();
+    let mut a = register(&mut c, "a");
+    apply(&mut c, &batch_manifest("init", 1));
+    let starts = a.starts();
+    assert_eq!(starts.len(), 1);
+    assert!(starts[0].batch, "the agent is told it is a batch workload");
+    let wid = starts[0].workload_id.clone();
+
+    // Re-applying mid-run: unchanged.
+    let again = apply(&mut c, &batch_manifest("init", 1));
+    assert_eq!(again.change, ChangeKind::Unchanged);
+
+    // It finishes without ever being reported RUNNING (a fast job).
+    heartbeat(&mut c, &a, vec![status(&wid, WorkloadState::Completed)]);
+    assert_eq!(c.workloads[&wid].status, WorkloadStatus::Completed);
+    assert!(stops(&a.take()).contains(&wid), "its container is removed");
+    c.reconcile();
+    c.finish().unwrap();
+    assert!(a.starts().is_empty(), "a completed run is not replaced");
+    heartbeat(&mut c, &a, vec![]);
+    assert_eq!(c.workloads[&wid].status, WorkloadStatus::Completed);
+
+    // Applying it again now runs it again.
+    let rerun = apply(&mut c, &batch_manifest("init", 1));
+    assert_eq!((rerun.change, rerun.version), (ChangeKind::Rerun, 2));
+    let starts = a.starts();
+    assert_eq!(starts.len(), 1);
+    assert_eq!(starts[0].service_version, 2);
+}
+
+/// A failed batch workload is replaced under the failure backoff; a new
+/// version supersedes a run still in progress.
+#[test]
+fn failed_batch_is_retried_and_new_version_supersedes() {
+    let mut c = core();
+    let mut a = register(&mut c, "a");
+    apply(&mut c, &batch_manifest("init", 1));
+    let first = a.starts()[0].workload_id.clone();
+    heartbeat(&mut c, &a, vec![status(&first, WorkloadState::Failed)]);
+    assert_eq!(c.workloads[&first].status, WorkloadStatus::Failed);
+    a.take();
+    // Past the backoff, a new run is created.
+    c.svc_rt.get_mut("init").unwrap().last_failure =
+        Some(std::time::Instant::now() - std::time::Duration::from_secs(60));
+    c.reconcile();
+    c.finish().unwrap();
+    let second = a.starts();
+    assert_eq!(second.len(), 1);
+    let second = second[0].workload_id.clone();
+    assert_ne!(second, first);
+    heartbeat(&mut c, &a, vec![status(&second, WorkloadState::Running)]);
+
+    // A changed manifest while it runs: the old run is stopped, a new one starts.
+    let changed = batch_manifest("init", 1).replace("postgres:16", "postgres:17");
+    let out = apply(&mut c, &changed);
+    assert_eq!(out.change, ChangeKind::Replacing);
+    let msgs = a.take();
+    assert!(stops(&msgs).contains(&second));
+    assert_eq!(
+        c.workloads[&second].status_reason.as_deref(),
+        Some("SUPERSEDED")
+    );
+    let new: Vec<_> = msgs
+        .into_iter()
+        .filter_map(|m| match m {
+            pb::controller_message::Msg::StartWorkload(s) => Some(s),
+            _ => None,
+        })
+        .collect();
+    assert_eq!((new.len(), new[0].service_version), (1, 2));
+}
+
+/// A database from before COMPLETED existed is migrated with its workloads.
+#[test]
+fn migration_adds_completed_status() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("v.db");
+    let wid = {
+        let mut c = Core::new(cfg(), Db::open(&path).unwrap(), TOKEN.into()).unwrap();
+        let mut a = register(&mut c, "a");
+        apply(&mut c, &batch_manifest("init", 1));
+        let wid = a.starts()[0].workload_id.clone();
+        heartbeat(&mut c, &a, vec![status(&wid, WorkloadState::Completed)]);
+        wid
+    };
+    let c = Core::new(cfg(), Db::open(&path).unwrap(), TOKEN.into()).unwrap();
+    assert_eq!(c.workloads[&wid].status, WorkloadStatus::Completed);
+}

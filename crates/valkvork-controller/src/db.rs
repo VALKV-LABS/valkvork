@@ -11,9 +11,10 @@ use valkvork_common::models::{now_ms, EventKind, ServiceSpec, SubjectType};
 use valkvork_common::ValkvorkError;
 
 /// Versioned migrations. Append only: never edit an applied entry.
-const MIGRATIONS: &[(i64, &str)] = &[(
-    1,
-    r#"
+const MIGRATIONS: &[(i64, &str)] = &[
+    (
+        1,
+        r#"
 CREATE TABLE nodes (
     node_id                    TEXT PRIMARY KEY,
     hostname                   TEXT NOT NULL,
@@ -99,7 +100,39 @@ CREATE INDEX idx_workloads_status         ON workloads(status);
 CREATE INDEX idx_nodes_class_status       ON nodes(node_class, status);
 CREATE INDEX idx_scaling_events_service   ON scaling_events(service_id, created_at);
 "#,
-)];
+    ),
+    (
+        2,
+        // COMPLETED (batch workloads). SQLite cannot change a CHECK, so the
+        // table is rebuilt. Nothing references workloads.
+        r#"
+CREATE TABLE workloads_v2 (
+    workload_id          TEXT PRIMARY KEY,
+    service_id           TEXT NOT NULL REFERENCES services(service_id) ON DELETE CASCADE,
+    service_version      INTEGER NOT NULL,
+    node_id              TEXT REFERENCES nodes(node_id) ON DELETE SET NULL,
+    container_id         TEXT,
+    desired_state        TEXT NOT NULL DEFAULT 'RUN' CHECK (desired_state IN ('RUN', 'STOP')),
+    status               TEXT NOT NULL DEFAULT 'PENDING'
+                         CHECK (status IN ('PENDING', 'ASSIGNED', 'RUNNING', 'STOPPING', 'LOST', 'STOPPED', 'FAILED', 'COMPLETED')),
+    status_reason        TEXT,
+    replaces_workload_id TEXT,
+    restart_count        INTEGER NOT NULL DEFAULT 0,
+    created_at           INTEGER NOT NULL,
+    started_at           INTEGER,
+    updated_at           INTEGER NOT NULL
+);
+INSERT INTO workloads_v2 SELECT workload_id, service_id, service_version, node_id, container_id,
+    desired_state, status, status_reason, replaces_workload_id, restart_count, created_at,
+    started_at, updated_at FROM workloads;
+DROP TABLE workloads;
+ALTER TABLE workloads_v2 RENAME TO workloads;
+CREATE INDEX idx_workloads_service_status ON workloads(service_id, status);
+CREATE INDEX idx_workloads_node           ON workloads(node_id) WHERE node_id IS NOT NULL;
+CREATE INDEX idx_workloads_status         ON workloads(status);
+"#,
+    ),
+];
 
 fn db_err(e: impl std::fmt::Display) -> ValkvorkError {
     ValkvorkError::Database(e.to_string())
@@ -516,7 +549,7 @@ impl Db {
                     "SELECT workload_id FROM (
                         SELECT workload_id, updated_at,
                                ROW_NUMBER() OVER (PARTITION BY service_id ORDER BY updated_at DESC) AS rn
-                        FROM workloads WHERE status IN ('STOPPED', 'FAILED')
+                        FROM workloads WHERE status IN ('STOPPED', 'FAILED', 'COMPLETED')
                      ) WHERE rn > 10 AND updated_at < ?1",
                 )
                 .map_err(db_err)?;
@@ -652,5 +685,57 @@ impl EventReader {
             })
             .map_err(db_err)?;
         rows.collect::<Result<_, _>>().map_err(db_err)
+    }
+}
+
+#[cfg(test)]
+mod migration_tests {
+    use super::*;
+
+    /// A v1 database with a service and a workload: migration 2 keeps them
+    /// and allows COMPLETED.
+    #[test]
+    fn v1_database_migrates_with_its_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v1.db");
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(MIGRATIONS[0].1).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY, applied_at INTEGER NOT NULL);
+                 INSERT INTO schema_migrations VALUES (1, 0);
+                 INSERT INTO services (service_id, spec_json, spec_hash, image, cpu_millicores,
+                     memory_bytes, target_replicas, created_at, updated_at)
+                     VALUES ('web', '{}', 'h', 'nginx:1', 100, 1048576, 1, 0, 0);
+                 INSERT INTO workloads (workload_id, service_id, service_version, status, created_at, updated_at)
+                     VALUES ('w1', 'web', 1, 'RUNNING', 0, 0);",
+            )
+            .unwrap();
+        }
+        let db = Db::open(&path).unwrap();
+        let (status, n): (String, i64) = db
+            .conn
+            .query_row(
+                "SELECT status, (SELECT MAX(version) FROM schema_migrations) FROM workloads WHERE workload_id = 'w1'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!((status.as_str(), n), ("RUNNING", 2));
+        db.conn
+            .execute(
+                "UPDATE workloads SET status = 'COMPLETED' WHERE workload_id = 'w1'",
+                [],
+            )
+            .unwrap();
+        assert!(
+            db.conn
+                .execute(
+                    "UPDATE workloads SET status = 'BOGUS' WHERE workload_id = 'w1'",
+                    []
+                )
+                .is_err(),
+            "the CHECK is still there"
+        );
     }
 }

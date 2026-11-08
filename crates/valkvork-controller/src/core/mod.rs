@@ -489,6 +489,7 @@ impl Core {
                         .iter()
                         .map(|(k, v)| (k.clone(), v.clone()))
                         .collect(),
+                    batch: s.is_batch(),
                     check: s.check.as_ref().map(|c| pb::HealthCheck {
                         r#type: c.kind.clone(),
                         port_name: c.port.clone(),
@@ -735,7 +736,10 @@ impl Core {
                 // it when the node registers again.
                 w.status_reason = Some(reason.to_string());
             }
-            WorkloadStatus::Stopping | WorkloadStatus::Stopped | WorkloadStatus::Failed => {}
+            WorkloadStatus::Stopping
+            | WorkloadStatus::Stopped
+            | WorkloadStatus::Failed
+            | WorkloadStatus::Completed => {}
         }
     }
 

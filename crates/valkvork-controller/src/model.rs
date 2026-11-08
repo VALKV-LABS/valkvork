@@ -120,7 +120,10 @@ impl Workload {
         self.desired_state == DesiredState::Run
             && !matches!(
                 self.status,
-                WorkloadStatus::Stopped | WorkloadStatus::Failed | WorkloadStatus::Lost
+                WorkloadStatus::Stopped
+                    | WorkloadStatus::Failed
+                    | WorkloadStatus::Lost
+                    | WorkloadStatus::Completed
             )
     }
 

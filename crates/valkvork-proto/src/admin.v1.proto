@@ -23,14 +23,14 @@ message ApplyRequest {
 message ApplyResponse {
   string service_id = 1;
   uint64 version = 2;
-  string change = 3;  // created | unchanged | scale-only | policy-only | replacing
+  string change = 3;  // created | unchanged | scale-only | policy-only | replacing | rerun
   repeated string warnings = 4;
 }
 
 message PlanResponse {
   string service_id = 1;
   uint64 version = 2;
-  string change = 3;  // created | unchanged | scale-only | policy-only | replacing
+  string change = 3;  // created | unchanged | scale-only | policy-only | replacing | rerun
   bool feasible = 4;
   string reason = 5;
   repeated string warnings = 6;

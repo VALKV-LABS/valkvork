@@ -292,14 +292,27 @@ impl Core {
         if change == ChangeKind::ScaleOnly && autoscaled && new_target == existing.target_replicas {
             change = ChangeKind::Unchanged; // `replicas` is ignored once autoscaled
         }
+        // A finished batch run applied again runs again, as a new version.
+        if change == ChangeKind::Unchanged
+            && spec.is_batch()
+            && !self
+                .workloads
+                .values()
+                .any(|w| w.service_id == id && w.is_live())
+        {
+            change = ChangeKind::Rerun;
+        }
         let halted = existing.rollout_status == RolloutStatus::Halted;
-        let version = if change == ChangeKind::Replacing {
+        let version = if matches!(change, ChangeKind::Replacing | ChangeKind::Rerun) {
             existing.version + 1
         } else {
             existing.version
         };
 
         let mut diff = existing.spec.diff_lines(&spec);
+        if change == ChangeKind::Rerun {
+            diff.push("batch run: the previous run has finished; this runs it again".into());
+        }
         if new_target != existing.target_replicas && !diff.iter().any(|d| d.starts_with("replicas"))
         {
             diff.push(format!(
@@ -314,6 +327,7 @@ impl Core {
             .count() as u32;
         let to_place = match change {
             ChangeKind::Replacing => live.max(new_target),
+            ChangeKind::Rerun => new_target,
             _ => new_target.saturating_sub(live),
         };
         // A stop-first rollout frees the old workloads' volumes and ports
@@ -340,8 +354,10 @@ impl Core {
             max_parallel: spec.update.max_parallel,
         };
 
-        let nothing_to_write =
-            hash == existing.spec_hash && new_target == existing.target_replicas && !halted;
+        let nothing_to_write = hash == existing.spec_hash
+            && new_target == existing.target_replicas
+            && !halted
+            && change != ChangeKind::Rerun;
         if dry_run || nothing_to_write {
             // AT-01: an identical re-apply writes nothing and sends nothing.
             return Ok(outcome);
@@ -372,6 +388,9 @@ impl Core {
                 format!("{id} replicas {} → {new_target}", existing.target_replicas)
             }
             ChangeKind::PolicyOnly => format!("{id} policy updated"),
+            ChangeKind::Rerun => {
+                format!("{id} v{} → v{version} (batch: run again)", existing.version)
+            }
             _ => format!("{id} re-applied"),
         };
         self.event(EventKind::Deploy, SubjectType::Service, &id, msg, actor);
@@ -737,6 +756,9 @@ pub fn spec_to_toml(s: &valkvork_common::models::ServiceSpec) -> String {
         "[service]\nid = {:?}\nimage = {:?}\nreplicas = {}\nkill_timeout = \"{}s\"",
         s.id, s.image, s.replicas, s.kill_timeout_seconds
     );
+    if s.is_batch() {
+        let _ = writeln!(o, "type = \"batch\"");
+    }
     for (key, list) in [("entrypoint", &s.entrypoint), ("command", &s.command)] {
         if let Some(l) = list {
             let _ = writeln!(o, "{key} = {}", toml_list(l));

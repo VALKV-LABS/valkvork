@@ -274,6 +274,7 @@ mod tests {
     fn spec(cpu: u32, mem_mib: u64) -> ServiceSpec {
         ServiceSpec {
             id: "svc".into(),
+            service_type: Default::default(),
             image: "img:1".into(),
             entrypoint: None,
             command: None,

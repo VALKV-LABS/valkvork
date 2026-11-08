@@ -80,6 +80,8 @@ pub enum WorkloadStatus {
     Lost,
     Stopped,
     Failed,
+    /// A batch workload that exited 0 (terminal, never restarted).
+    Completed,
 }
 string_enum!(WorkloadStatus {
     Pending => "PENDING",
@@ -89,11 +91,15 @@ string_enum!(WorkloadStatus {
     Lost => "LOST",
     Stopped => "STOPPED",
     Failed => "FAILED",
+    Completed => "COMPLETED",
 });
 
 impl WorkloadStatus {
     pub fn is_terminal(&self) -> bool {
-        matches!(self, WorkloadStatus::Stopped | WorkloadStatus::Failed)
+        matches!(
+            self,
+            WorkloadStatus::Stopped | WorkloadStatus::Failed | WorkloadStatus::Completed
+        )
     }
 }
 
@@ -224,6 +230,14 @@ pub struct CheckSpec {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ServiceSpec {
     pub id: String,
+    /// `service` (long-running, the default) or `batch` (runs to
+    /// completion). Omitted for services (stable hashes).
+    #[serde(
+        rename = "type",
+        default,
+        skip_serializing_if = "ServiceType::is_service"
+    )]
+    pub service_type: ServiceType,
     pub image: String,
     /// Replaces the image's entrypoint. Omitted when unset (stable hashes).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -259,7 +273,76 @@ pub struct ServiceSpec {
 /// node whose agent has every feature its spec uses. Protobuf ignores fields
 /// a receiver does not know, so without this an older agent would start the
 /// container without its secrets, check or bind address.
-pub const AGENT_FEATURES: &[&str] = &["command", "health_checks", "host_ip", "secrets"];
+pub const AGENT_FEATURES: &[&str] = &[
+    "batch",
+    "command",
+    "health_checks",
+    "host_ip",
+    "secret_values",
+    "secrets",
+];
+
+/// What a service's workloads do when their process exits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ServiceType {
+    /// Long-running: every exit is a failure, restarted under the policy.
+    #[default]
+    Service,
+    /// Runs to completion: exit 0 is COMPLETED and is never restarted.
+    Batch,
+}
+
+impl ServiceType {
+    pub fn is_service(&self) -> bool {
+        *self == ServiceType::Service
+    }
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ServiceType::Service => "service",
+            ServiceType::Batch => "batch",
+        }
+    }
+}
+
+/// The names in an [env] value's `${secret:NAME}` references, in order.
+pub fn secret_refs(value: &str) -> Vec<&str> {
+    let mut out = Vec::new();
+    let mut rest = value;
+    while let Some(i) = rest.find("${secret:") {
+        let after = &rest[i + "${secret:".len()..];
+        match after.find('}') {
+            Some(j) => {
+                out.push(&after[..j]);
+                rest = &after[j + 1..];
+            }
+            None => break,
+        }
+    }
+    out
+}
+
+/// Replace each `${secret:NAME}` in `value` with `lookup(NAME)`. An unclosed
+/// reference or an unknown name is an error naming it.
+pub fn interpolate_secrets<'a>(
+    value: &str,
+    lookup: impl Fn(&str) -> Option<&'a str>,
+) -> Result<String, String> {
+    let mut out = String::with_capacity(value.len());
+    let mut rest = value;
+    while let Some(i) = rest.find("${secret:") {
+        out.push_str(&rest[..i]);
+        let after = &rest[i + "${secret:".len()..];
+        let j = after
+            .find('}')
+            .ok_or_else(|| "unclosed ${secret:".to_string())?;
+        let name = &after[..j];
+        out.push_str(lookup(name).ok_or_else(|| format!("no secret {name:?}"))?);
+        rest = &after[j + 1..];
+    }
+    out.push_str(rest);
+    Ok(out)
+}
 
 impl ServiceSpec {
     /// The `AGENT_FEATURES` this spec uses.
@@ -277,7 +360,17 @@ impl ServiceSpec {
         if !self.secrets.is_empty() {
             f.push("secrets");
         }
+        if self.env.values().any(|v| v.contains("${secret:")) {
+            f.push("secret_values");
+        }
+        if self.service_type == ServiceType::Batch {
+            f.push("batch");
+        }
         f
+    }
+
+    pub fn is_batch(&self) -> bool {
+        self.service_type == ServiceType::Batch
     }
 }
 
@@ -290,6 +383,9 @@ pub enum ChangeKind {
     ScaleOnly,
     PolicyOnly,
     Replacing,
+    /// A batch service whose run has finished, applied again unchanged: a
+    /// new version, so it runs once more.
+    Rerun,
 }
 string_enum!(ChangeKind {
     Created => "created",
@@ -297,6 +393,7 @@ string_enum!(ChangeKind {
     ScaleOnly => "scale-only",
     PolicyOnly => "policy-only",
     Replacing => "replacing",
+    Rerun => "rerun",
 });
 
 impl ServiceSpec {
@@ -312,6 +409,7 @@ impl ServiceSpec {
     /// True when every replacement-requiring field (spec §3.3) is equal.
     pub fn same_replacement_fields(&self, other: &ServiceSpec) -> bool {
         self.image == other.image
+            && self.service_type == other.service_type
             && self.entrypoint == other.entrypoint
             && self.command == other.command
             && self.cpu_millicores == other.cpu_millicores
@@ -385,6 +483,7 @@ mod tests {
     fn spec() -> ServiceSpec {
         ServiceSpec {
             id: "web".into(),
+            service_type: ServiceType::Service,
             image: "nginx:1.27".into(),
             entrypoint: None,
             command: None,
@@ -456,5 +555,39 @@ mod tests {
         ] {
             assert_eq!(s.parse::<WorkloadStatus>().unwrap().as_str(), s);
         }
+    }
+
+    #[test]
+    fn secret_references_in_values() {
+        let v = "postgresql://valkv:${secret:PW}@db:5432/x?k=${secret:K}";
+        assert_eq!(secret_refs(v), vec!["PW", "K"]);
+        assert_eq!(secret_refs("no refs, ${other}"), Vec::<&str>::new());
+        let look = |n: &str| match n {
+            "PW" => Some("p4ss"),
+            "K" => Some("key"),
+            _ => None,
+        };
+        assert_eq!(
+            interpolate_secrets(v, look).unwrap(),
+            "postgresql://valkv:p4ss@db:5432/x?k=key"
+        );
+        assert_eq!(interpolate_secrets("plain", look).unwrap(), "plain");
+        assert!(interpolate_secrets("${secret:NOPE}", look)
+            .unwrap_err()
+            .contains("NOPE"));
+        assert!(interpolate_secrets("${secret:PW", look).is_err());
+    }
+
+    /// A service spec's hash is unchanged by the new type field; a batch
+    /// spec's is not.
+    #[test]
+    fn service_type_keeps_old_hashes() {
+        let a = spec();
+        assert!(!a.canonical_json().contains("\"type\""));
+        let mut b = spec();
+        b.service_type = ServiceType::Batch;
+        assert!(b.canonical_json().contains("\"type\":\"batch\""));
+        assert!(!a.same_replacement_fields(&b));
+        assert_eq!(b.required_features(), vec!["batch"]);
     }
 }

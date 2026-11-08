@@ -10,8 +10,9 @@
 # /var/tmp/vk-e2e on the Docker host itself (so Postgres can own its data
 # directory; folders shared from macOS cannot be chowned). Each run uses a new
 # run-<time> directory there. It uses ports 50061, 50062, 9410, 9411, 15432
-# and 18080 on the Docker host and the service ids global-pg, bad-secret and
-# web-check, so do not run it next to a dev cluster with those services.
+# and 18080 on the Docker host and the service ids global-pg, bad-secret,
+# web-check, pg-init and pg-fail, so do not run it next to a dev cluster with
+# those services.
 set -eu
 W=/var/tmp/vk-e2e/run-$(date +%s)
 BIN=/dist
@@ -20,7 +21,7 @@ pass() { echo "PASS: $*"; }
 
 # Remove this test's containers however it ends.
 cleanup() {
-  for svc in global-pg bad-secret web-check; do
+  for svc in global-pg bad-secret web-check pg-init pg-fail; do
     for c in $(docker ps -aq --filter "label=valkvork.service_id=$svc"); do
       docker stop "$c" >/dev/null 2>&1 || true
       docker rm "$c" >/dev/null 2>&1 || true
@@ -269,6 +270,69 @@ vk events | grep -q 'web-check workload UNHEALTHY' || fail "no UNHEALTHY event"
 vk events | grep -q 'web-check workload FAILED: UNHEALTHY' || fail "not FAILED after its restarts"
 pass "http check failing (404): restarted under the policy, then FAILED UNHEALTHY"
 vk delete service web-check >/dev/null
+
+# ── a batch job, with a secret inside a value ───────────────────────────────
+cat > "$W/init.toml" <<EOF
+[service]
+id       = "pg-init"
+type     = "batch"
+image    = "docker.io/library/postgres:16.4-alpine"
+replicas = 1
+command  = ["sh", "-c", "psql \"\$DATABASE_URL\" -v ON_ERROR_STOP=1 -c 'create table if not exists runs(at timestamptz default now()); insert into runs default values'"]
+
+[resources]
+cpu    = 0.1
+memory = "64MiB"
+
+[secrets]
+POSTGRES_PASSWORD = "file:$W/secrets/pg_password"
+
+[env]
+DATABASE_URL = "postgresql://valkv:\${secret:POSTGRES_PASSWORD}@$IP:15432/valkv_global"
+EOF
+vk apply -f "$W/init.toml" >/dev/null
+for _ in $(seq 60); do vk workloads 2>/dev/null | grep pg-init | grep -q COMPLETED && break; sleep 1; done
+vk workloads | grep pg-init
+vk workloads | grep pg-init | grep -q COMPLETED || { tail -20 "$W/agent.log"; fail "pg-init did not complete"; }
+[ "$($PSQL 'select count(*) from runs')" = "1" ] || fail "the job's insert is missing"
+vk status pg-init | grep -qF 'DATABASE_URL = "postgresql://valkv:${secret:POSTGRES_PASSWORD}@' || fail "status does not show the reference"
+if vk status pg-init | grep -qF "$PW"; then fail "status shows the password"; fi
+sleep 3
+[ -z "$(docker ps -aq --filter label=valkvork.service_id=pg-init)" ] || fail "the completed container was not removed"
+pass "batch job COMPLETED once, connecting with \${secret:...} in its URL; not shown, container removed"
+
+vk plan -f "$W/init.toml" | grep -q 'batch: run again' || fail "plan does not say it runs again"
+vk apply -f "$W/init.toml" >/dev/null
+for _ in $(seq 60); do [ "$($PSQL 'select count(*) from runs')" = "2" ] && break; sleep 1; done
+[ "$($PSQL 'select count(*) from runs')" = "2" ] || fail "re-apply did not run it again"
+for _ in $(seq 30); do [ "$(vk workloads | grep -c 'pg-init.*COMPLETED')" = "2" ] && break; sleep 1; done
+[ "$(vk workloads | grep -c 'pg-init.*COMPLETED')" = "2" ] || fail "not two COMPLETED runs"
+pass "re-applying a finished batch job runs it again (v2), and it completes"
+vk delete service pg-init >/dev/null
+
+cat > "$W/fail.toml" <<EOF
+[service]
+id       = "pg-fail"
+type     = "batch"
+image    = "docker.io/library/postgres:16.4-alpine"
+replicas = 1
+command  = ["sh", "-c", "exit 3"]
+
+[resources]
+cpu    = 0.1
+memory = "64MiB"
+
+[restart]
+attempts = 1
+delay    = "1s"
+EOF
+vk apply -f "$W/fail.toml" >/dev/null
+for _ in $(seq 60); do vk events 2>/dev/null | grep -q 'pg-fail workload FAILED' && break; sleep 1; done
+vk workloads | grep pg-fail | head -3
+vk workloads | grep pg-fail | grep -q 'FAILED' || fail "a failing batch job did not fail"
+vk workloads | grep pg-fail | grep -E 'FAILED +- +1 ' >/dev/null || fail "it was not restarted once under its policy first"
+pass "a batch job exiting 3 is restarted under its policy, then FAILED (and retried by the controller)"
+vk delete service pg-fail >/dev/null
 
 vk delete service global-pg >/dev/null
 for _ in $(seq 30); do [ -z "$(docker ps -aq --filter label=valkvork.service_id=global-pg)" ] && break; sleep 1; done
