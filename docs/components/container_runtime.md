@@ -53,6 +53,8 @@ pub trait ContainerRuntime: Send + Sync + 'static {
 
 The entry is chosen by the image's registry: the part before the first `/` when it contains a `.` or `:` or is `localhost`, else Docker Hub (`docker.io`, `index.docker.io`, `https://index.docker.io/v1/`). `username`/`password` fields are accepted as well as `auth`. A missing file means anonymous pulls.
 
+**Amazon ECR** (`<account>.dkr.ecr.<region>.amazonaws.com/...`) needs no entry. When the file has none for the registry, the agent logs in with `aws ecr get-login-password --region <region>` (agent.toml `secrets.aws_cli`), using the node's instance role, which needs `ecr:GetAuthorizationToken` and read access to the repository (`AmazonEC2ContainerRegistryReadOnly`). The login is reused for 6 hours; ECR's are valid for 12. A failed login fails the start with `IMAGE_PULL_FAILED: ECR login: <cause>`.
+
 ## Docker Host Requirements
 
 For the guarantees in the spec, the Docker daemon on workers should use (FR-AGE-01, spec §10.2):

@@ -67,6 +67,8 @@ A service that mounts a **single-writer** host volume (any writable host volume 
 
 Each replica is down between its old container stopping and its new one starting. Halting works as above, except that the replica whose new version failed has no old copy to fall back to: it is retried under the failure backoff until the service is fixed, for example by applying the previous manifest again.
 
+**When the replacement has nowhere else to go.** A start-new-then-stop-old update of a service with a static host port, on a class with one node, can never place the new workload while the old one holds the port. When a replacement is PENDING and could be placed once the workload it replaces is gone, that workload is stopped first, with a `DEPLOY` event saying so, as in a stop-first update. With room on another node the update still starts the new workload first.
+
 **Halting.** If a workload of the current version fails during a rollout, `rollout_status` becomes HALTED. No more outdated workloads are replaced, and the old ones keep running. The next apply that changes anything resets the halt and the rollout resumes or is superseded. There is no automatic rollback.
 
 **Cancelling.** If a workload no longer needs to move (its node was undrained), its in-flight replacement is stopped (`MIGRATION_CANCELLED`), so the service does not keep an extra replica. Stop-first moves have nothing to cancel: the old workload is already stopping.

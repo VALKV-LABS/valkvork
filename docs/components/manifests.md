@@ -132,6 +132,23 @@ Nothing waits for a batch job: a service that needs its result must cope until i
 
 If a reference cannot be resolved, the workload fails before anything is pulled or created, with `SECRET_UNRESOLVED: <NAME> (<reference>): <cause>` in its status and the event log. The cause never contains a value. The service's failure backoff then applies, as for a failed image pull.
 
+**Node values.** An `[env]` value can contain `${node.NAME}`, which the agent replaces with its own node's value at container start, for a replica that must say where it is reachable or needs an identity that survives redeploys:
+
+| `${node.…}` | Value |
+|---|---|
+| `advertise_ip` | The node's address (agent.toml `advertise_ip`, else the one facing the controller) |
+| `id` | The agent's node id: a UUID derived from `/etc/machine-id`, stable for the instance |
+| `class` | The node's class |
+| `hostname` | The node's hostname |
+
+```toml
+[env]
+INGRESS_API_URL = "http://${node.advertise_ip}:4000/ingress"
+SQLDB_NODE_ID   = "${node.id}"
+```
+
+Validation (VE-01, `INVALID_RESOURCE_SPEC` at `env.<KEY>`) rejects an unknown name or an unclosed reference. Such a workload needs an agent with the `node_values` feature.
+
 **A secret inside a value.** An `[env]` value can contain `${secret:NAME}`, where `NAME` is a key of `[secrets]`. The agent substitutes the resolved value at container start, so a connection URL can embed a password:
 
 ```toml

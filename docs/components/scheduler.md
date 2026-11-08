@@ -19,7 +19,7 @@ For each pass, the core builds a `Snapshot` with one `NodeCapacity` per node:
 | Host volume users | For each volume, how many non-terminal, non-LOST workloads on the node mount it, and how many of those mounts are single-writer. STOPPING ones count, because the directory is in use until the container is gone |
 | Workloads per service | For the tie-break |
 | Healthy, draining | Node status and flag |
-| Agent features | The manifest features the node's agent listed in its Register (`batch`, `command`, `ephemeral_volumes`, `health_checks`, `host_ip`, `secret_values`, `secrets`) |
+| Agent features | The manifest features the node's agent listed in its Register (`batch`, `command`, `ephemeral_volumes`, `health_checks`, `host_ip`, `node_values`, `secret_values`, `secrets`) |
 
 Each placement calls `Snapshot::reserve`, so placements within one pass account for each other.
 
