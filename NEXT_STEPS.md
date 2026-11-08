@@ -1,6 +1,7 @@
 # Next steps
 
-**Current plan: [platform workloads](docs/platform-workloads.md).** It comes before
+**Current plan: [platform workloads](docs/platform-workloads.md).** Stages 0–2 are done
+and verified on AWS (2026-11-08); Stage 3 (`global-cp`) is next. It comes before
 everything below and before [phase-2.md](docs/phase-2.md). In stages, it builds what
 Valkvork needs to run the Valkv platform's own services, and verifies each one on the AWS
 dev cell:
@@ -45,6 +46,11 @@ that should be revisited once Stage 2 is verified:
   and `/proc/<pid>/environ`, and rotatable without a restart.
 - **Caching resolved secrets** on the agent, so a restart while SSM is unreachable can still
   start the container.
+- **`exec` health checks** (finding F2): a `tcp` check can't detect a hung process, so
+  Postgres's check can't catch a frozen database. `type = "exec"` running `pg_isready` in
+  the container would.
+- **Retrying a failed in-place restart** (finding F4) under the restart policy, instead of
+  failing the workload at once.
 - **Containers' access to the node's role.** Every container on a node can use its instance
   role, so it can read every secret that node can. Look at per-workload credentials, or
   blocking the metadata service from containers that don't need it.
