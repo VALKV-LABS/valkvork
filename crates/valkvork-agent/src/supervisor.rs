@@ -12,6 +12,7 @@ use crate::runtime::{
     BindMount, ContainerRuntime, ContainerSpec, PublishedPort, RunState, RuntimeEvent,
     LABEL_WORKLOAD,
 };
+use crate::secrets::SecretResolver;
 use crate::telemetry::{dir_size, read_container, CpuRate};
 use futures::StreamExt;
 use pb::WorkloadState;
@@ -109,6 +110,8 @@ pub struct SupervisorConfig {
     /// The address reported to the controller; ports with
     /// `host_ip = "advertise"` are published on it.
     pub advertise_ip: String,
+    /// Resolves [secrets] references at container start.
+    pub secrets: Arc<SecretResolver>,
 }
 
 pub struct Supervisor {
@@ -350,6 +353,22 @@ impl Supervisor {
             });
         }
 
+        // Secrets first: a reference that cannot be resolved fails the start
+        // before the image is pulled. Values go only into the container's env.
+        let mut secret_env = Vec::with_capacity(cmd.secrets.len());
+        let mut names: Vec<&String> = cmd.secrets.keys().collect();
+        names.sort();
+        for name in names {
+            let reference = &cmd.secrets[name];
+            let value = self.cfg.secrets.resolve(reference).await.map_err(|e| {
+                (
+                    format!("SECRET_UNRESOLVED: {name} ({reference}): {e}"),
+                    format!("secret {name} ({reference}): {e}"),
+                )
+            })?;
+            secret_env.push((name.clone(), value));
+        }
+
         let auth = crate::runtime::registry_credentials(&self.cfg.registry_auth_file, &cmd.image);
         self.rt.pull(&cmd.image, auth).await.map_err(|e| match e {
             RuntimeError::Unavailable(d) => ("RUNTIME_UNAVAILABLE".to_string(), d),
@@ -384,6 +403,7 @@ impl Supervisor {
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect();
         env.sort();
+        env.extend(secret_env);
         env.push(("VALKVORK_WORKLOAD_ID".into(), wid.clone()));
         env.push(("VALKVORK_SERVICE_ID".into(), cmd.service_id.clone()));
         let mut ports = Vec::with_capacity(cmd.ports.len());

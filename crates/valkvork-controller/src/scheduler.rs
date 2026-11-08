@@ -252,6 +252,7 @@ mod tests {
             disk_bytes: 1 << 30,
             required_class: None,
             env: Default::default(),
+            secrets: Default::default(),
             ports: vec![],
             volumes: vec![],
             autoscale: None,

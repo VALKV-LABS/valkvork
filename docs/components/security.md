@@ -146,7 +146,12 @@ The Docker socket gives root on the host (FR-SEC-06). Only the agent uses it; do
 
 ## Secrets in Manifests
 
-`[env]` values are stored in plaintext in SQLite and appear in `valkvork status <service>` and the UI. Do not put secrets in manifests in this release (FR-SEC-04); secret references are planned.
+`[env]` values are stored in plaintext in SQLite and appear in `valkvork status <service>` and the UI: never put secrets in `[env]`. Use `[secrets]` references instead (FR-SEC-04; see [manifests.md](manifests.md#secrets)):
+
+- **The controller never sees a value.** It stores and sends only references (`ssm:…`, `file:…`). The database, the API, the CLI, the UI and events show the reference.
+- **The agent resolves them at container start.** For `ssm:` it runs the AWS CLI with the node's instance role. `file:` references are allowed only inside agent.toml `secrets.file_dirs`, and are off by default, because the agent runs as root. Values are never logged, written to disk by Valkvork, or reported back. Errors name the reference and the cause.
+- **On the node, values are ordinary environment variables.** Root can read them with `docker inspect`, and the workload's processes and their children can read them. Delivery as files on an in-memory filesystem, which avoids both, is planned.
+- **Containers share the node's role.** A container can reach the instance metadata service and use the node's role, so any workload on a node can read every parameter that role may read. On a node that also runs the controller, that includes the controller's own secrets. Run only trusted workloads there, and give each node group's role only the prefixes its workloads need.
 
 ## Network
 

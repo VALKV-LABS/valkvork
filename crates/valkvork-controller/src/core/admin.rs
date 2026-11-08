@@ -753,6 +753,13 @@ pub fn spec_to_toml(s: &valkvork_common::models::ServiceSpec) -> String {
         }
         o.push('\n');
     }
+    if !s.secrets.is_empty() {
+        let _ = writeln!(o, "[secrets]");
+        for (k, v) in &s.secrets {
+            let _ = writeln!(o, "{k} = {v:?}");
+        }
+        o.push('\n');
+    }
     for p in &s.ports {
         let _ = writeln!(
             o,
@@ -838,6 +845,9 @@ name = "postgres"
 container_port = 5432
 host_port = 5432
 host_ip = "advertise"
+
+[secrets]
+POSTGRES_PASSWORD = "ssm:/valkv/dev/workloads/POSTGRES_PASSWORD"
 
 [[ports]]
 name = "admin"

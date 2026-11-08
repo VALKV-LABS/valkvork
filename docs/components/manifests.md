@@ -26,6 +26,10 @@ required_class = "general"     # only nodes whose agent.toml node_class matches
 [env]
 LOG_LEVEL = "info"             # plaintext: not for secrets
 
+[secrets]                      # environment variables resolved by the agent at container start
+DB_PASSWORD = "ssm:/valkv/prod/workloads/DB_PASSWORD"   # SSM Parameter Store, decrypted
+API_TOKEN   = "file:/etc/valkvork.d/workload-secrets/api-token"   # a file in agent.toml secrets.file_dirs
+
 [[ports]]
 name           = "http"
 container_port = 80
@@ -72,6 +76,21 @@ Durations are `<n>s`, `<n>m`, `<n>h`, or a bare number of seconds. Sizes are an 
 
 `host_ip = "advertise"` publishes the port on the address the agent reports to the controller (agent.toml `advertise_ip`, or the address it reaches the controller from). Use it on instances with public IPs, so a port is reachable on the private network only. `host_ip = "127.0.0.1"` keeps a port on the node itself. A port's host address does not change the scheduler's view: a `host_port` is still taken on the node whatever address it binds.
 
+### Secrets
+
+`[secrets]` maps environment variable names to references. The controller stores, returns and shows only the references, never the values: `valkvork status`, the UI, events and the database contain the reference. The agent resolves each one just before it creates the container and passes the value as an environment variable:
+
+| Scheme | Resolved by | Needs |
+|---|---|---|
+| `ssm:<name>` | `aws ssm get-parameter --with-decryption`, run by the agent with the node's instance role | The role may read the parameter; agent.toml `secrets.aws_region` or the CLI's default region |
+| `file:<path>` | Reading the file on the node; one trailing newline is dropped | The file is inside a directory in agent.toml `secrets.file_dirs`. Off by default |
+
+If a reference cannot be resolved, the workload fails before anything is pulled or created, with `SECRET_UNRESOLVED: <NAME> (<reference>): <cause>` in its status and the event log. The cause never contains a value. The service's failure backoff then applies, as for a failed image pull.
+
+A changed reference is a replacing change. A changed **value** is read when a container is next created, so rotate a value by updating the parameter, then replacing the workloads (re-apply with any replacing change, or `valkvork scale` down and up). Restarts under the restart policy reuse the container, and with it the old value.
+
+Values reach Docker as ordinary environment variables, so root on the node can read them with `docker inspect`, and the process can read its own `/proc/<pid>/environ`. Every container on a node can also use the node's instance role, and so read any parameter that role can (see [security.md](security.md#secrets-in-manifests)).
+
 `cpu` is both the scheduler's reservation and a hard limit: `cpu = 0.5` reserves 500 millicores on a node and caps the container at half a core's worth of CPU time across all cores. `memory` likewise is reserved, and the container is OOM-killed above it, with no swap.
 
 ## Validation
@@ -87,6 +106,7 @@ Validation runs before any database write. A failure writes nothing, returns gRP
 | VE-05 | Ports in 1–65535; `host_port` unique within the manifest; `host_port < 1024` is a **warning**; `host_ip` is an IP address or `"advertise"` | `INVALID_PORT_SPEC` |
 | VE-06 | No unknown keys or tables (`deny_unknown_fields`). The path names the table, e.g. `service.replica` or `ports.hostport` | `UNKNOWN_FIELD` |
 | VE-07 | Each volume has a known `type`, a source, an absolute `target`, and a unique `target` | `INVALID_VOLUME_SPEC` |
+| VE-08 | Each secret's name is an environment variable name not also in `[env]`, and its reference is `ssm:<parameter name>` or `file:<absolute path>` | `INVALID_SECRET_REF` |
 | VW-01 | **Warning** at apply or plan: no current healthy node of the class could fit one replica, or none has the host volumes | `UNSATISFIABLE_NOW` |
 
 Example:

@@ -112,7 +112,12 @@ metrics_listen_addr = "127.0.0.1:$AGENT_METRICS_PORT"
 [reserved]
 cpu    = 0.5
 memory = "512MiB"
+
+# Manifests' [secrets] may use file: references to files in .dev/secrets/.
+[secrets]
+file_dirs = ["$DEV/secrets"]
 EOF
+  install -d -m 0700 "$DEV/secrets"
 
   render_volumes "$DEV/agent.toml" "$DEV/volumes" "$HOST_VOLUMES"
   # Content for examples/static-site.toml, written once so edits survive.
@@ -320,6 +325,9 @@ metrics_listen_addr = "127.0.0.1:$mport"
 [reserved]
 cpu    = 0.25
 memory = "256MiB"
+
+[secrets]
+file_dirs = ["$DEV/secrets"]
 EOF
   render_volumes "$dir/agent.toml" "$dir/volumes" "${VALKVORK_DEV_NODE_VOLUMES:-}"
 

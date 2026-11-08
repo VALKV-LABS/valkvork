@@ -483,6 +483,11 @@ impl Core {
                     memory_bytes: s.memory_bytes,
                     disk_bytes: s.disk_bytes,
                     env: s.env.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
+                    secrets: s
+                        .secrets
+                        .iter()
+                        .map(|(k, v)| (k.clone(), v.clone()))
+                        .collect(),
                     ports: s
                         .ports
                         .iter()

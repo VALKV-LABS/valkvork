@@ -7,10 +7,12 @@
 //! * [`connection`]: the outbound stream to the controller with backoff
 //!   (FR-ARC-01, FR-AGE-05).
 //! * [`identity`]: node id, hostname, address and capacity (FR-AGE-02).
+//! * [`secrets`]: resolution of workloads' secret references (FR-SEC-04).
 
 pub mod connection;
 pub mod identity;
 pub mod metrics;
 pub mod runtime;
+pub mod secrets;
 pub mod supervisor;
 pub mod telemetry;

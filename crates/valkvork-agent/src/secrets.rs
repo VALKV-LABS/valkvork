@@ -1,0 +1,193 @@
+//! Resolution of workloads' secret references (FR-SEC-04).
+//!
+//! The controller stores and sends only references; the agent resolves them
+//! just before it creates a container and passes the values as environment
+//! variables. Values are never logged, stored or reported back. Errors name
+//! the reference and the cause, never a value.
+
+use std::path::Path;
+use std::process::Stdio;
+use std::time::Duration;
+use valkvork_common::config::SecretsConfig;
+
+pub struct SecretResolver {
+    cfg: SecretsConfig,
+}
+
+impl SecretResolver {
+    pub fn new(cfg: SecretsConfig) -> Self {
+        Self { cfg }
+    }
+
+    /// The value behind `reference`.
+    pub async fn resolve(&self, reference: &str) -> Result<String, String> {
+        if let Some(param) = reference.strip_prefix("ssm:") {
+            self.ssm(param).await
+        } else if let Some(path) = reference.strip_prefix("file:") {
+            self.file(Path::new(path))
+        } else {
+            Err("unknown reference scheme".into())
+        }
+    }
+
+    fn file(&self, path: &Path) -> Result<String, String> {
+        if self.cfg.file_dirs.is_empty() {
+            return Err(
+                "file: references are disabled on this node (agent.toml secrets.file_dirs)".into(),
+            );
+        }
+        // Resolve symlinks and "..": the file itself must be inside an allowed directory.
+        let real = path.canonicalize().map_err(|e| e.to_string())?;
+        let allowed = self
+            .cfg
+            .file_dirs
+            .iter()
+            .filter_map(|d| d.canonicalize().ok())
+            .any(|d| real.starts_with(&d));
+        if !allowed {
+            return Err("not inside an allowed directory (agent.toml secrets.file_dirs)".into());
+        }
+        let text = std::fs::read_to_string(&real).map_err(|e| e.to_string())?;
+        Ok(strip_newline(text))
+    }
+
+    async fn ssm(&self, param: &str) -> Result<String, String> {
+        let mut cmd = tokio::process::Command::new(&self.cfg.aws_cli);
+        cmd.args([
+            "ssm",
+            "get-parameter",
+            "--with-decryption",
+            "--name",
+            param,
+            "--query",
+            "Parameter.Value",
+            "--output",
+            "text",
+        ]);
+        if let Some(region) = &self.cfg.aws_region {
+            cmd.args(["--region", region]);
+        }
+        cmd.env("AWS_PAGER", "")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
+        let run = cmd.output();
+        let out = tokio::time::timeout(Duration::from_secs(self.cfg.timeout_seconds), run)
+            .await
+            .map_err(|_| format!("timed out after {}s", self.cfg.timeout_seconds))?
+            .map_err(|e| format!("cannot run {}: {e}", self.cfg.aws_cli.display()))?;
+        if !out.status.success() {
+            return Err(last_line(&out.stderr));
+        }
+        let value = String::from_utf8(out.stdout).map_err(|_| "value is not UTF-8".to_string())?;
+        Ok(strip_newline(value))
+    }
+}
+
+/// One trailing newline is formatting, not part of the value.
+fn strip_newline(mut s: String) -> String {
+    if s.ends_with('\n') {
+        s.pop();
+        if s.ends_with('\r') {
+            s.pop();
+        }
+    }
+    s
+}
+
+/// The CLI's error, e.g. "An error occurred (ParameterNotFound) when calling
+/// the GetParameter operation: ...", shortened.
+fn last_line(stderr: &[u8]) -> String {
+    let text = String::from_utf8_lossy(stderr);
+    let line = text
+        .lines()
+        .rev()
+        .map(str::trim)
+        .find(|l| !l.is_empty())
+        .unwrap_or("failed without an error message");
+    line.chars().take(300).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+    use std::path::PathBuf;
+
+    fn resolver(dir: &Path, file_dirs: Vec<PathBuf>) -> SecretResolver {
+        // A stand-in for the AWS CLI: prints the parameter's value or fails
+        // like the real one, and records its arguments.
+        let cli = dir.join("aws");
+        std::fs::write(
+            &cli,
+            format!(
+                "#!/bin/sh\necho \"$@\" > {log}\nfor a; do last=$a; case $prev in --name) name=$a;; esac; prev=$a; done\n\
+                 case $name in\n  /ok) printf 's3cr3t\\n';;\n  /multi) printf 'line1\\nline2\\n';;\n  /slow) sleep 5;;\n  \
+                 *) echo 'An error occurred (ParameterNotFound) when calling the GetParameter operation: Parameter not found.' >&2; exit 254;;\nesac\n",
+                log = dir.join("args").display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&cli, std::fs::Permissions::from_mode(0o755)).unwrap();
+        SecretResolver::new(SecretsConfig {
+            aws_cli: cli,
+            aws_region: Some("us-west-1".into()),
+            file_dirs,
+            timeout_seconds: 1,
+        })
+    }
+
+    #[tokio::test]
+    async fn ssm_values_errors_and_timeouts() {
+        let d = tempfile::tempdir().unwrap();
+        let r = resolver(d.path(), vec![]);
+        assert_eq!(r.resolve("ssm:/ok").await.unwrap(), "s3cr3t");
+        let args = std::fs::read_to_string(d.path().join("args")).unwrap();
+        assert!(
+            args.contains("--with-decryption") && args.contains("--region us-west-1"),
+            "{args}"
+        );
+        assert_eq!(r.resolve("ssm:/multi").await.unwrap(), "line1\nline2");
+        let e = r.resolve("ssm:/missing").await.unwrap_err();
+        assert!(e.contains("ParameterNotFound"), "{e}");
+        assert!(r
+            .resolve("ssm:/slow")
+            .await
+            .unwrap_err()
+            .contains("timed out"));
+        assert!(r.resolve("vault:x").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn files_only_from_allowed_directories() {
+        let d = tempfile::tempdir().unwrap();
+        let allowed = d.path().join("secrets");
+        std::fs::create_dir(&allowed).unwrap();
+        std::fs::write(allowed.join("pw"), "hunter2\n").unwrap();
+        std::fs::write(d.path().join("outside"), "nope").unwrap();
+        std::os::unix::fs::symlink(d.path().join("outside"), allowed.join("link")).unwrap();
+
+        let disabled = resolver(d.path(), vec![]);
+        let pw = format!("file:{}", allowed.join("pw").display());
+        assert!(disabled
+            .resolve(&pw)
+            .await
+            .unwrap_err()
+            .contains("disabled"));
+
+        let r = resolver(d.path(), vec![allowed.clone()]);
+        assert_eq!(r.resolve(&pw).await.unwrap(), "hunter2");
+        for bad in [
+            d.path().join("outside"),
+            allowed.join("link"),
+            allowed.join("../outside"),
+        ] {
+            let e = r
+                .resolve(&format!("file:{}", bad.display()))
+                .await
+                .unwrap_err();
+            assert!(e.contains("allowed directory"), "{}: {e}", bad.display());
+        }
+    }
+}

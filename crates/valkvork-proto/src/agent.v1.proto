@@ -89,6 +89,10 @@ message StartWorkload {
   uint32 kill_timeout_seconds = 13;
   repeated string entrypoint = 14;     // empty: the image's
   repeated string command = 15;        // empty: the image's
+  // Environment variables the agent resolves before creating the container:
+  // name -> reference ("ssm:<parameter>" or "file:<path>"). Values never
+  // reach the controller.
+  map<string, string> secrets = 16;
 }
 
 message PortMapping {

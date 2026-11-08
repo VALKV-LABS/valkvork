@@ -28,6 +28,8 @@ struct RawManifest {
     #[serde(default)]
     env: BTreeMap<String, String>,
     #[serde(default)]
+    secrets: BTreeMap<String, String>,
+    #[serde(default)]
     ports: Vec<RawPort>,
     #[serde(default)]
     volumes: Vec<RawVolume>,
@@ -332,6 +334,17 @@ fn canonicalise(raw: RawManifest, out: &mut Vec<ValidationError>) -> Option<Serv
         }
     }
 
+    for (name, reference) in &raw.secrets {
+        if let Err(msg) = check_secret(name, reference, &raw.env) {
+            out.push(ValidationError::new(
+                Code::InvalidSecretRef,
+                &format!("secrets.{name}"),
+                &msg,
+            ));
+            ok = false;
+        }
+    }
+
     for (field, list) in [
         ("service.entrypoint", &raw.service.entrypoint),
         ("service.command", &raw.service.command),
@@ -369,6 +382,7 @@ fn canonicalise(raw: RawManifest, out: &mut Vec<ValidationError>) -> Option<Serv
             .and_then(|c| c.required_class)
             .filter(|c| !c.is_empty()),
         env: raw.env,
+        secrets: raw.secrets,
         ports,
         volumes: raw
             .volumes
@@ -386,6 +400,39 @@ fn canonicalise(raw: RawManifest, out: &mut Vec<ValidationError>) -> Option<Serv
         restart,
     };
     ok.then_some(spec)
+}
+
+/// VE-08: a secret is an environment variable name not also set in [env],
+/// with an `ssm:<parameter name>` or `file:<absolute path>` reference.
+fn check_secret(name: &str, reference: &str, env: &BTreeMap<String, String>) -> Result<(), String> {
+    static NAME: OnceLock<Regex> = OnceLock::new();
+    static SSM: OnceLock<Regex> = OnceLock::new();
+    let name_re = NAME.get_or_init(|| Regex::new(r"^[A-Za-z_][A-Za-z0-9_]*$").unwrap());
+    // SSM parameter names: letters, digits and _.-/; a hierarchy starts with "/".
+    let ssm_re =
+        SSM.get_or_init(|| Regex::new(r"^/?[A-Za-z0-9_.\-]+(/[A-Za-z0-9_.\-]+)*$").unwrap());
+    if !name_re.is_match(name) {
+        return Err(format!("{name:?} is not a valid environment variable name"));
+    }
+    if env.contains_key(name) {
+        return Err(format!("{name} is set in both [env] and [secrets]"));
+    }
+    if let Some(param) = reference.strip_prefix("ssm:") {
+        if !ssm_re.is_match(param) {
+            return Err(format!("{reference:?} is not a valid SSM parameter name"));
+        }
+    } else if let Some(path) = reference.strip_prefix("file:") {
+        if !path.starts_with('/') {
+            return Err(format!(
+                "{reference:?}: a file reference needs an absolute path"
+            ));
+        }
+    } else {
+        return Err(format!(
+            "{reference:?}: references start with \"ssm:\" or \"file:\""
+        ));
+    }
+    Ok(())
 }
 
 /// Images without a tag or digest default to `:latest` (VE-02). The canonical
@@ -859,8 +906,36 @@ target_cpu_percent = 75
     #[test]
     fn new_fields_keep_old_hashes() {
         let json = parse_manifest_str(VALID).unwrap().spec.canonical_json();
-        for key in ["\"command\"", "\"entrypoint\"", "\"host_ip\""] {
+        for key in [
+            "\"command\"",
+            "\"entrypoint\"",
+            "\"host_ip\"",
+            "\"secrets\"",
+        ] {
             assert!(!json.contains(key), "{key} in {json}");
+        }
+    }
+
+    #[test]
+    fn secrets() {
+        let ok = format!(
+            "{VALID}\n[secrets]\nPOSTGRES_PASSWORD = \"ssm:/valkv/dev/workloads/POSTGRES_PASSWORD\"\nTOKEN = \"file:/run/secrets/token\"\nPLAIN = \"ssm:plain-name\"\n"
+        );
+        let spec = parse_manifest_str(&ok).unwrap().spec;
+        assert_eq!(spec.secrets.len(), 3);
+        assert_eq!(spec.secrets["TOKEN"], "file:/run/secrets/token");
+
+        for (secret, why) in [
+            ("1BAD = \"ssm:/x\"", "name"),
+            ("A = \"ssm:/x\"", "also in [env]"),
+            ("X = \"vault:secret/x\"", "scheme"),
+            ("X = \"file:relative/path\"", "relative path"),
+            ("X = \"ssm:/has space\"", "SSM name"),
+            ("X = \"ssm:\"", "empty SSM name"),
+        ] {
+            let m = format!("{VALID}\n[secrets]\n{secret}\n");
+            let (code, _) = err_code(&m);
+            assert_eq!(code, Code::InvalidSecretRef, "{why}: {secret}");
         }
     }
 }

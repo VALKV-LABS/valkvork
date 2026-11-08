@@ -177,6 +177,8 @@ pub struct AgentConfig {
     pub metrics_listen_addr: Option<SocketAddr>,
     pub reserved: ReservedResources,
     pub host_volumes: BTreeMap<String, HostVolume>,
+    /// How workloads' [secrets] references are resolved.
+    pub secrets: SecretsConfig,
 }
 
 impl Default for AgentConfig {
@@ -195,6 +197,7 @@ impl Default for AgentConfig {
             metrics_listen_addr: Some("127.0.0.1:9401".parse().unwrap()),
             reserved: ReservedResources::default(),
             host_volumes: BTreeMap::new(),
+            secrets: SecretsConfig::default(),
         }
     }
 }
@@ -221,6 +224,14 @@ impl AgentConfig {
             hv.mode_bits()
                 .map_err(|e| ValkvorkError::Config(format!("host_volumes.{name}.mode: {e}")))?;
         }
+        for dir in &self.secrets.file_dirs {
+            if !dir.is_absolute() {
+                return Err(ValkvorkError::Config(format!(
+                    "secrets.file_dirs: {} must be an absolute path",
+                    dir.display()
+                )));
+            }
+        }
         if let Some(addr) = self.metrics_listen_addr {
             if !addr.ip().is_loopback() {
                 return Err(ValkvorkError::Config(format!(
@@ -229,6 +240,33 @@ impl AgentConfig {
             }
         }
         Ok(())
+    }
+}
+
+/// Resolution of workloads' secret references (agent.toml `[secrets]`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct SecretsConfig {
+    /// The AWS CLI, which resolves `ssm:` references with the instance's role.
+    pub aws_cli: PathBuf,
+    /// Region for `ssm:` references. Unset: the CLI's own default.
+    pub aws_region: Option<String>,
+    /// Directories `file:` references may read from. Empty (the default)
+    /// disables `file:` references: the agent runs as root, so a manifest
+    /// could otherwise read any file on the node.
+    pub file_dirs: Vec<PathBuf>,
+    /// Limit for resolving one reference.
+    pub timeout_seconds: u64,
+}
+
+impl Default for SecretsConfig {
+    fn default() -> Self {
+        Self {
+            aws_cli: PathBuf::from("aws"),
+            aws_region: None,
+            file_dirs: Vec::new(),
+            timeout_seconds: 15,
+        }
     }
 }
 

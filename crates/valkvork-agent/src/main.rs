@@ -112,6 +112,9 @@ async fn run(args: Args) -> Result<(), ValkvorkError> {
             protected_paths,
             host_volumes: cfg.host_volumes.clone(),
             advertise_ip: node.ip_address.clone(),
+            secrets: Arc::new(valkvork_agent::secrets::SecretResolver::new(
+                cfg.secrets.clone(),
+            )),
         },
     );
     supervisor

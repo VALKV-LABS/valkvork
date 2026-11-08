@@ -218,6 +218,11 @@ pub struct ServiceSpec {
     pub disk_bytes: u64,
     pub required_class: Option<String>,
     pub env: BTreeMap<String, String>,
+    /// Environment variables whose values the agent resolves at container
+    /// start: name -> reference (`ssm:<parameter>` or `file:<path>`). Only
+    /// the references are stored. Omitted when empty (stable hashes).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub secrets: BTreeMap<String, String>,
     pub ports: Vec<PortSpec>,
     pub volumes: Vec<VolumeSpec>,
     pub autoscale: Option<AutoscaleSpec>,
@@ -263,6 +268,7 @@ impl ServiceSpec {
             && self.disk_bytes == other.disk_bytes
             && self.required_class == other.required_class
             && self.env == other.env
+            && self.secrets == other.secrets
             && self.ports == other.ports
             && self.volumes == other.volumes
             && self.restart == other.restart
@@ -337,6 +343,7 @@ mod tests {
             disk_bytes: 1 << 30,
             required_class: None,
             env: BTreeMap::new(),
+            secrets: BTreeMap::new(),
             ports: vec![],
             volumes: vec![],
             autoscale: None,

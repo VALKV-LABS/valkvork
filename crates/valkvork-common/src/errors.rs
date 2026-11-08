@@ -70,6 +70,7 @@ pub enum ValidationErrorCode {
     InvalidPortSpec,
     UnknownField,
     InvalidVolumeSpec,
+    InvalidSecretRef,
     UnsatisfiableNow,
 }
 
@@ -83,6 +84,7 @@ impl std::fmt::Display for ValidationErrorCode {
             ValidationErrorCode::InvalidPortSpec => "INVALID_PORT_SPEC",
             ValidationErrorCode::UnknownField => "UNKNOWN_FIELD",
             ValidationErrorCode::InvalidVolumeSpec => "INVALID_VOLUME_SPEC",
+            ValidationErrorCode::InvalidSecretRef => "INVALID_SECRET_REF",
             ValidationErrorCode::UnsatisfiableNow => "UNSATISFIABLE_NOW",
         })
     }

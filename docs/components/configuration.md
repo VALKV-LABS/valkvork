@@ -67,6 +67,12 @@ metrics_listen_addr = "127.0.0.1:9401"       # must be loopback; omit to disable
 cpu    = 0.25
 memory = "384MiB"
 
+[secrets]                  # how manifests' [secrets] references are resolved
+aws_cli         = "aws"    # runs `aws ssm get-parameter` for ssm: references, with the instance role
+# aws_region    = "us-west-1"   # default: the CLI's own region resolution
+file_dirs       = []       # directories file: references may read; empty disables file: references
+timeout_seconds = 15       # per reference
+
 [host_volumes.pgdata]      # one table per volume manifests can mount by name
 path      = "/data/pgdata"
 read_only = false
@@ -75,6 +81,8 @@ read_only = false
 ```
 
 When `owner` or `mode` is set, the agent creates the directory if it is missing and applies them at every startup, so an image that runs as a non-root user can write to the volume. Only the directory itself changes, never the files in it. Both must be numeric (`owner = "nginx"` is rejected, since names differ between the host and the image), and `--check-config` validates them. The agent refuses to change a symlink, a non-directory, or a protected path such as Docker's data directory.
+
+`file:` references are off unless `secrets.file_dirs` lists directories: the agent runs as root, so a manifest could otherwise read any file on the node, such as the controller's TLS key. A file must resolve, after symlinks, to a path inside one of them. `--check-config` requires them to be absolute.
 
 `data_dir` must be visible to the Docker daemon at the same path, because the agent bind-mounts alloc directories from it. On a normal Linux host it is. With Docker in a VM (Colima, Docker Desktop), use a path under your home directory, which those share.
 

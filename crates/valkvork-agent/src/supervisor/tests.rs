@@ -186,11 +186,35 @@ impl Fake {
     }
 }
 
+/// A supervisor whose `file:` secrets may come from `dir/secrets`.
+fn supervisor_with_secrets(rt: Arc<Fake>, dir: &Path) -> Arc<Supervisor> {
+    let secrets = dir.join("secrets");
+    std::fs::create_dir_all(&secrets).unwrap();
+    Supervisor::new(
+        rt,
+        SupervisorConfig {
+            advertise_ip: "10.0.0.5".into(),
+            secrets: Arc::new(crate::secrets::SecretResolver::new(
+                valkvork_common::config::SecretsConfig {
+                    file_dirs: vec![secrets],
+                    ..Default::default()
+                },
+            )),
+            data_dir: dir.to_path_buf(),
+            registry_auth_file: dir.join("none.json"),
+            docker_socket: PathBuf::from("/var/run/docker.sock"),
+            protected_paths: vec![],
+            host_volumes: BTreeMap::new(),
+        },
+    )
+}
+
 fn supervisor(rt: Arc<Fake>, dir: &Path) -> Arc<Supervisor> {
     Supervisor::new(
         rt,
         SupervisorConfig {
             advertise_ip: "10.0.0.5".into(),
+            secrets: Arc::new(crate::secrets::SecretResolver::new(Default::default())),
             data_dir: dir.to_path_buf(),
             registry_auth_file: dir.join("none.json"),
             docker_socket: PathBuf::from("/var/run/docker.sock"),
@@ -381,6 +405,7 @@ async fn forbidden_host_volume_is_refused() {
         rt.clone(),
         SupervisorConfig {
             advertise_ip: "10.0.0.5".into(),
+            secrets: Arc::new(crate::secrets::SecretResolver::new(Default::default())),
             data_dir: d.path().to_path_buf(),
             registry_auth_file: d.path().join("none.json"),
             docker_socket: PathBuf::from("/var/run/docker.sock"),
@@ -471,6 +496,7 @@ fn supervisor_with(dir: &Path, vols: Vec<(&str, HostVolume)>) -> Arc<Supervisor>
         Fake::new(),
         SupervisorConfig {
             advertise_ip: "10.0.0.5".into(),
+            secrets: Arc::new(crate::secrets::SecretResolver::new(Default::default())),
             data_dir: dir.to_path_buf(),
             registry_auth_file: dir.join("none.json"),
             docker_socket: PathBuf::from("/var/run/docker.sock"),
@@ -578,4 +604,49 @@ async fn passes_command_and_bind_addresses() {
     assert_eq!(spec.entrypoint, None, "unset keeps the image's entrypoint");
     let ips: Vec<Option<&str>> = spec.ports.iter().map(|p| p.host_ip.as_deref()).collect();
     assert_eq!(ips, vec![Some("10.0.0.5"), Some("127.0.0.1"), None]);
+}
+
+/// A resolved secret becomes an environment variable of the container.
+#[tokio::test]
+async fn secrets_become_environment_variables() {
+    let d = tempfile::tempdir().unwrap();
+    let rt = Fake::new();
+    let s = supervisor_with_secrets(rt.clone(), d.path());
+    std::fs::write(d.path().join("secrets/pw"), "hunter2\n").unwrap();
+    let mut cmd = start_cmd("w1", 3);
+    cmd.env.insert("PGDATA".into(), "/data".into());
+    cmd.secrets.insert(
+        "POSTGRES_PASSWORD".into(),
+        format!("file:{}", d.path().join("secrets/pw").display()),
+    );
+    s.start(cmd).await.unwrap();
+    settle().await;
+    assert_eq!(state_of(&s, "w1").unwrap().0, WorkloadState::Running);
+    let env = rt.last_created().env;
+    assert!(
+        env.contains(&("POSTGRES_PASSWORD".into(), "hunter2".into())),
+        "{env:?}"
+    );
+    assert!(env.contains(&("PGDATA".into(), "/data".into())));
+}
+
+/// An unresolvable reference fails the start before anything is created, and
+/// the reason names the reference.
+#[tokio::test]
+async fn unresolvable_secret_fails_the_start() {
+    let d = tempfile::tempdir().unwrap();
+    let rt = Fake::new();
+    let s = supervisor_with_secrets(rt.clone(), d.path());
+    let mut cmd = start_cmd("w1", 3);
+    cmd.secrets
+        .insert("TOKEN".into(), "file:/etc/shadow".into());
+    s.start(cmd).await.unwrap();
+    settle().await;
+    let (state, reason, _) = state_of(&s, "w1").unwrap();
+    assert_eq!(state, WorkloadState::Failed);
+    assert!(
+        reason.starts_with("SECRET_UNRESOLVED: TOKEN (file:/etc/shadow)"),
+        "{reason}"
+    );
+    assert_eq!(rt.count(), 0, "nothing is created");
 }
