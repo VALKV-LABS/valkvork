@@ -62,6 +62,9 @@ pub enum RunState {
     Created,
     Running,
     Restarting,
+    /// Frozen (`docker pause`): the process is alive but gets no CPU. Not an
+    /// exit; a health check is what notices that it stopped answering.
+    Paused,
     Exited,
     Other,
 }
@@ -178,6 +181,7 @@ fn run_state(s: Option<&str>) -> RunState {
         "created" => RunState::Created,
         "running" => RunState::Running,
         "restarting" => RunState::Restarting,
+        "paused" => RunState::Paused,
         "exited" | "dead" => RunState::Exited,
         _ => RunState::Other,
     }
