@@ -5,7 +5,7 @@
 #
 #   scripts/dev-cell-upgrade.sh --cell <cell_id> --bucket <s3-bucket> [--region R] [--arch arm64|amd64] [--version X.Y.Z]
 #   scripts/dev-cell-upgrade.sh --cell aws-us-west-1-valkvork --bucket my-dev-artifacts --region us-west-1 --version 0.3.0
-#
+#   scripts/dev-cell-upgrade.sh --cell aws-us-west-1-valkvork --bucket valkvorktest --region us-west-1 --version 0.3.0
 # --version is what the binaries report in --version and the agents report to
 # the controller (`valkvork node list --json`). It is stamped only for this
 # build, like a release does; the Cargo.toml files are put back afterwards.
