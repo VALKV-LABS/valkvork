@@ -111,6 +111,10 @@ async fn run(args: Args) -> Result<(), ValkvorkError> {
             docker_socket: cfg.docker_socket.clone(),
             protected_paths,
             host_volumes: cfg.host_volumes.clone(),
+            advertise_ip: node.ip_address.clone(),
+            secrets: Arc::new(valkvork_agent::secrets::SecretResolver::new(
+                cfg.secrets.clone(),
+            )),
         },
     );
     supervisor
@@ -132,6 +136,7 @@ async fn run(args: Args) -> Result<(), ValkvorkError> {
     tokio::spawn(supervisor.clone().run_events());
     tokio::spawn(supervisor.clone().run_resync());
     tokio::spawn(supervisor.clone().run_disk_checks());
+    tokio::spawn(supervisor.clone().run_health_checks());
     if let Some(addr) = cfg.metrics_listen_addr {
         tokio::spawn(valkvork_agent::metrics::serve(addr, supervisor.clone()));
     }

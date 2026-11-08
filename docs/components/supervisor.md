@@ -17,6 +17,7 @@ One entry per workload, keyed by workload id:
 | restart count, recent restarts | For the restart policy |
 | restart policy, kill timeout, disk limit | From the command or labels |
 | stopping | A stop was requested; exits are expected and never restarted |
+| health check, health, consecutive failures | From the command or the `valkvork.check` label; see [Health Checks](#health-checks) |
 | CPU, memory, disk | Latest telemetry |
 
 `report()` turns these into the `WorkloadStatus` list sent in every heartbeat and in `Register`.
@@ -31,10 +32,12 @@ StartWorkload
     1. create <data_dir>/alloc/<workload_id>/
     2. resolve volumes: each source must be a [host_volumes] entry in agent.toml,
        and must not be a protected path            → else FAILED HOST_VOLUME_NOT_FOUND / FORBIDDEN_MOUNT
-    3. pull the image with registry credentials    → else FAILED IMAGE_PULL_FAILED
-    4. create vk-<workload_id>                     → else FAILED CREATE_FAILED
-    5. start it                                    → else FAILED START_FAILED
-    6. RUNNING
+    3. resolve [secrets] references                → else FAILED SECRET_UNRESOLVED: NAME (ref): cause
+    4. pull the image with registry credentials    → else FAILED IMAGE_PULL_FAILED
+    5. resolve bind addresses and the health check → else FAILED HOST_IP_UNAVAILABLE / CHECK_INVALID
+    6. create vk-<workload_id>                     → else FAILED CREATE_FAILED
+    7. start it                                    → else FAILED START_FAILED
+    8. RUNNING; health STARTING if it has a check
 ```
 
 The container gets:
@@ -44,12 +47,13 @@ The container gets:
 | Name | `vk-<workload_id>` (unique, so a repeated create finds the existing one) |
 | CPU | `NanoCpus = millicores × 1,000,000` |
 | Memory | `Memory = MemorySwap = memory_bytes`: no swap |
-| Environment | The manifest's `[env]`, plus `VALKVORK_WORKLOAD_ID` and `VALKVORK_SERVICE_ID` |
-| Ports | `PortBindings` for each `[[ports]]` entry, TCP |
+| Entrypoint, command | The manifest's `entrypoint` and `command`, or the image's |
+| Environment | The manifest's `[env]`, the resolved `[secrets]`, plus `VALKVORK_WORKLOAD_ID` and `VALKVORK_SERVICE_ID` |
+| Ports | `PortBindings` for each `[[ports]]` entry, TCP, on its `host_ip` (`"advertise"` becomes the node's address; unset: every address) |
 | Mounts | `/alloc` → the alloc directory, plus one bind mount per volume |
 | Restart policy | `no`: the agent owns restarts |
 | Privileged | never |
-| Labels | `valkvork.workload_id`, `valkvork.service_id`, `valkvork.service_version`, `valkvork.restart` (`attempts/interval/delay`), `valkvork.kill_timeout`, `valkvork.disk_bytes` |
+| Labels | `valkvork.workload_id`, `valkvork.service_id`, `valkvork.service_version`, `valkvork.restart` (`attempts/interval/delay`), `valkvork.kill_timeout`, `valkvork.disk_bytes`, and `valkvork.check` when it has a health check |
 
 The labels carry everything the agent needs to manage the container after it restarts, so no local database is needed.
 
@@ -72,12 +76,25 @@ The agent learns about exits from Docker's event stream (`die` and `oom` events,
 ```
 attempts used in the last `interval` < `attempts`?
   yes → RESTARTING, wait `delay`, start the same container again → RUNNING
-  no  → FAILED with reason OOM_KILLED (after an oom event) or EXITED; leave the container stopped
+  no  → FAILED with reason OOM_KILLED (after an oom event), UNHEALTHY (stopped for its check) or EXITED;
+        leave the container stopped
 ```
 
 The default policy is 3 attempts within 5 minutes, 5 s apart. An exit with code 0 counts as a failure too, since services are meant to run forever. This works with the controller unreachable. Replacing a FAILED workload is the controller's decision; it then asks the agent to remove the container.
 
 A failed workload also gets a marker file, `<data_dir>/failed/<workload_id>`, holding the reason.
+
+## Health Checks
+
+Every second, the agent starts the probes that are due: one per RUNNING workload with a check, every `interval`, never two at once for one workload. A probe connects to the published port at its bind address (`127.0.0.1` for every address), and for `http` sends `GET <path>` and reads the status line.
+
+| Result | Effect |
+|---|---|
+| Pass | `HEALTHY`; the failure count resets |
+| Fail before the first pass, within `grace` of the start | Not counted; stays `STARTING` |
+| Fail | Count it. At `failures` in a row: `UNHEALTHY`, stop the container with the kill timeout. Its exit goes through the restart policy with reason `UNHEALTHY` |
+
+Each (re)start begins again at `STARTING`, and a probe still running from before the restart is ignored. Health travels in every heartbeat's `WorkloadStatus`, and an adopted container keeps its check through the `valkvork.check` label.
 
 ## Adoption
 

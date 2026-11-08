@@ -169,6 +169,11 @@ pub struct PortSpec {
     pub name: String,
     pub container_port: u16,
     pub host_port: u16,
+    /// Host address to publish on: an IP, or `"advertise"` for the node's
+    /// advertised address. Unset: every address (0.0.0.0). Omitted when unset,
+    /// so specs stored before it existed keep their hash.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_ip: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -193,12 +198,40 @@ impl VolumeSpec {
     }
 }
 
+/// A health check (`[check]`): the agent probes the workload through one of
+/// its published ports.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CheckSpec {
+    /// `tcp` (connects) or `http` (GET, healthy on 2xx and 3xx).
+    #[serde(rename = "type")]
+    pub kind: String,
+    /// A `[[ports]]` name.
+    pub port: String,
+    /// HTTP path; only for `http`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    pub interval_seconds: u32,
+    pub timeout_seconds: u32,
+    /// Consecutive failures that make the workload unhealthy and restart it.
+    pub failures: u32,
+    /// After a start, failures before the first success are not counted
+    /// for this long.
+    pub grace_seconds: u32,
+}
+
 /// Canonical form of a validated manifest. Field order and `BTreeMap` make the
 /// JSON serialisation deterministic, which `spec_hash` relies on (FR-MAN-02).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ServiceSpec {
     pub id: String,
     pub image: String,
+    /// Replaces the image's entrypoint. Omitted when unset (stable hashes).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub entrypoint: Option<Vec<String>>,
+    /// Replaces the image's default command (Docker CMD), keeping its
+    /// entrypoint. Omitted when unset (stable hashes).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command: Option<Vec<String>>,
     pub replicas: u32,
     pub kill_timeout_seconds: u32,
     pub cpu_millicores: u32,
@@ -206,11 +239,46 @@ pub struct ServiceSpec {
     pub disk_bytes: u64,
     pub required_class: Option<String>,
     pub env: BTreeMap<String, String>,
+    /// Environment variables whose values the agent resolves at container
+    /// start: name -> reference (`ssm:<parameter>` or `file:<path>`). Only
+    /// the references are stored. Omitted when empty (stable hashes).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub secrets: BTreeMap<String, String>,
     pub ports: Vec<PortSpec>,
     pub volumes: Vec<VolumeSpec>,
     pub autoscale: Option<AutoscaleSpec>,
     pub update: UpdatePolicy,
     pub restart: RestartPolicy,
+    /// Omitted when unset (stable hashes).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub check: Option<CheckSpec>,
+}
+
+/// Manifest features an agent must support to run a workload that uses them.
+/// Agents list theirs in `Register`; the scheduler places a workload only on a
+/// node whose agent has every feature its spec uses. Protobuf ignores fields
+/// a receiver does not know, so without this an older agent would start the
+/// container without its secrets, check or bind address.
+pub const AGENT_FEATURES: &[&str] = &["command", "health_checks", "host_ip", "secrets"];
+
+impl ServiceSpec {
+    /// The `AGENT_FEATURES` this spec uses.
+    pub fn required_features(&self) -> Vec<&'static str> {
+        let mut f = Vec::new();
+        if self.command.is_some() || self.entrypoint.is_some() {
+            f.push("command");
+        }
+        if self.check.is_some() {
+            f.push("health_checks");
+        }
+        if self.ports.iter().any(|p| p.host_ip.is_some()) {
+            f.push("host_ip");
+        }
+        if !self.secrets.is_empty() {
+            f.push("secrets");
+        }
+        f
+    }
 }
 
 /// Classification of the difference between a stored spec and a new one
@@ -244,15 +312,19 @@ impl ServiceSpec {
     /// True when every replacement-requiring field (spec §3.3) is equal.
     pub fn same_replacement_fields(&self, other: &ServiceSpec) -> bool {
         self.image == other.image
+            && self.entrypoint == other.entrypoint
+            && self.command == other.command
             && self.cpu_millicores == other.cpu_millicores
             && self.memory_bytes == other.memory_bytes
             && self.disk_bytes == other.disk_bytes
             && self.required_class == other.required_class
             && self.env == other.env
+            && self.secrets == other.secrets
             && self.ports == other.ports
             && self.volumes == other.volumes
             && self.restart == other.restart
             && self.kill_timeout_seconds == other.kill_timeout_seconds
+            && self.check == other.check
     }
 
     /// Classify `new` against `self` (the stored spec), ignoring live target
@@ -314,6 +386,8 @@ mod tests {
         ServiceSpec {
             id: "web".into(),
             image: "nginx:1.27".into(),
+            entrypoint: None,
+            command: None,
             replicas: 1,
             kill_timeout_seconds: 10,
             cpu_millicores: 500,
@@ -321,11 +395,13 @@ mod tests {
             disk_bytes: 1 << 30,
             required_class: None,
             env: BTreeMap::new(),
+            secrets: BTreeMap::new(),
             ports: vec![],
             volumes: vec![],
             autoscale: None,
             update: UpdatePolicy::default(),
             restart: RestartPolicy::default(),
+            check: None,
         }
     }
 

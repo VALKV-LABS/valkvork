@@ -120,4 +120,15 @@ make test        # unit and behaviour tests, no Docker needed
 make ci          # fmt check, clippy -D warnings, tests: what CI runs
 make dist        # static musl binaries in dist/ (PLATFORM=linux/amd64 to cross-build)
 make image       # valkvork-controller:dev and valkvork-agent:dev images
+make e2e         # end-to-end against your Docker, about 2 minutes
 ```
+
+`make e2e` builds the Linux binaries and runs a controller, an agent and the CLI against real Docker (`scripts/e2e-docker.sh`). It runs Postgres with a `[secrets]` password, `host_ip = "advertise"`, a `command` and a `tcp` health check. Then it checks that:
+
+- the password works, and appears in no status, database or log;
+- an unresolvable secret fails cleanly;
+- a replacing update keeps the data;
+- an agent restart adopts the container and its check passes again;
+- an `http` check that keeps failing restarts the container, then fails it.
+
+It works in `/var/tmp/vk-e2e` on the Docker host, and cleans up its containers.

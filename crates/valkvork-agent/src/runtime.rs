@@ -31,6 +31,14 @@ pub struct BindMount {
     pub read_only: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PublishedPort {
+    pub container_port: u16,
+    pub host_port: u16,
+    /// Host address to bind; None for every address.
+    pub host_ip: Option<String>,
+}
+
 /// What to create (FR-AGE-04).
 #[derive(Debug, Clone)]
 pub struct ContainerSpec {
@@ -39,8 +47,12 @@ pub struct ContainerSpec {
     pub cpu_millicores: u32,
     pub memory_bytes: u64,
     pub env: Vec<(String, String)>,
-    /// (container_port, host_port), TCP.
-    pub ports: Vec<(u16, u16)>,
+    /// None: the image's.
+    pub entrypoint: Option<Vec<String>>,
+    /// None: the image's.
+    pub command: Option<Vec<String>>,
+    /// TCP ports to publish.
+    pub ports: Vec<PublishedPort>,
     pub mounts: Vec<BindMount>,
     pub labels: HashMap<String, String>,
 }
@@ -232,14 +244,14 @@ impl ContainerRuntime for DockerRuntime {
     async fn create(&self, spec: &ContainerSpec) -> Result<String> {
         let mut port_bindings = HashMap::new();
         let mut exposed = HashMap::new();
-        for (container, host) in &spec.ports {
-            let key = format!("{container}/tcp");
+        for p in &spec.ports {
+            let key = format!("{}/tcp", p.container_port);
             exposed.insert(key.clone(), HashMap::new());
             port_bindings.insert(
                 key,
                 Some(vec![PortBinding {
-                    host_ip: None,
-                    host_port: Some(host.to_string()),
+                    host_ip: p.host_ip.clone(),
+                    host_port: Some(p.host_port.to_string()),
                 }]),
             );
         }
@@ -272,6 +284,8 @@ impl ContainerRuntime for DockerRuntime {
         let config = Config {
             image: Some(spec.image.clone()),
             env: Some(spec.env.iter().map(|(k, v)| format!("{k}={v}")).collect()),
+            entrypoint: spec.entrypoint.clone(),
+            cmd: spec.command.clone(),
             labels: Some(spec.labels.clone()),
             exposed_ports: Some(exposed),
             host_config: Some(host_config),

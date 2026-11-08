@@ -310,6 +310,7 @@ function workloadRows(ws, { service = false, node = true } = {}) {
     w.service_version,
     node ? (w.node_id ? link(`/ui/nodes/${enc(w.node_id)}`, short(w.node_id)) : '—') : null,
     badge(w.status),
+    w.health ? badge(w.health) : '—',
     h('span', {}, w.status_reason || ''),
     w.restart_count,
     age(w.created_at),
@@ -317,7 +318,7 @@ function workloadRows(ws, { service = false, node = true } = {}) {
 }
 
 function workloadHeaders({ service = false, node = true } = {}) {
-  return ['Workload', service ? 'Service' : null, '#Version', node ? 'Node' : null, 'Status', 'Reason', '#Restarts', 'Age'].filter((x) => x);
+  return ['Workload', service ? 'Service' : null, '#Version', node ? 'Node' : null, 'Status', 'Health', 'Reason', '#Restarts', 'Age'].filter((x) => x);
 }
 
 async function servicePage(id) {

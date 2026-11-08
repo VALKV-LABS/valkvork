@@ -17,6 +17,8 @@ pub struct NodeCapacity {
     pub allocatable_cpu: u32,
     pub allocatable_mem: u64,
     pub host_volumes: HashSet<String>,
+    /// Manifest features the node's agent supports.
+    pub features: HashSet<String>,
     pub alloc_cpu: u64,
     pub alloc_mem: u64,
     pub used_ports: HashSet<u16>,
@@ -44,6 +46,7 @@ impl NodeCapacity {
             allocatable_cpu,
             allocatable_mem,
             host_volumes: host_volumes.iter().cloned().collect(),
+            features: HashSet::new(),
             alloc_cpu: 0,
             alloc_mem: 0,
             used_ports: HashSet::new(),
@@ -85,6 +88,16 @@ struct Rejections {
     volume_count: usize,
     volume_busy: Option<String>,
     volume_busy_count: usize,
+    feature: Option<&'static str>,
+    feature_count: usize,
+}
+
+impl NodeCapacity {
+    /// The manifest features the node's agent reported.
+    pub fn with_features(mut self, features: &[String]) -> Self {
+        self.features = features.iter().cloned().collect();
+        self
+    }
 }
 
 impl Snapshot {
@@ -115,6 +128,7 @@ impl Snapshot {
         let mem = spec.memory_bytes;
         let mut rej = Rejections::default();
         let mut best: Option<(f64, u32, &str)> = None;
+        let needs = spec.required_features();
 
         for n in self.nodes.values() {
             rej.total += 1;
@@ -131,6 +145,11 @@ impl Snapshot {
                     rej.class += 1;
                     continue;
                 }
+            }
+            if let Some(f) = needs.iter().find(|f| !n.features.contains(**f)) {
+                rej.feature = Some(f);
+                rej.feature_count += 1;
+                continue;
             }
             if n.alloc_cpu + cpu > n.allocatable_cpu as u64 {
                 rej.cpu += 1;
@@ -223,6 +242,12 @@ fn reason(spec: &ServiceSpec, r: &Rejections) -> String {
         if let Some(v) = &r.volume {
             parts.push(format!("host volume {v} missing on {}", r.volume_count));
         }
+        if let Some(f) = r.feature {
+            parts.push(format!(
+                "agent lacks {f} (upgrade it) on {}",
+                r.feature_count
+            ));
+        }
         if let Some(v) = &r.volume_busy {
             parts.push(format!(
                 "single-writer host volume {v} in use on {}",
@@ -239,10 +264,19 @@ mod tests {
     use super::*;
     use valkvork_common::models::{PortSpec, RestartPolicy, UpdatePolicy, VolumeSpec};
 
+    fn all_features() -> Vec<String> {
+        valkvork_common::models::AGENT_FEATURES
+            .iter()
+            .map(|f| f.to_string())
+            .collect()
+    }
+
     fn spec(cpu: u32, mem_mib: u64) -> ServiceSpec {
         ServiceSpec {
             id: "svc".into(),
             image: "img:1".into(),
+            entrypoint: None,
+            command: None,
             replicas: 1,
             kill_timeout_seconds: 10,
             cpu_millicores: cpu,
@@ -250,11 +284,13 @@ mod tests {
             disk_bytes: 1 << 30,
             required_class: None,
             env: Default::default(),
+            secrets: Default::default(),
             ports: vec![],
             volumes: vec![],
             autoscale: None,
             update: UpdatePolicy::default(),
             restart: RestartPolicy::default(),
+            check: None,
         }
     }
 
@@ -271,7 +307,8 @@ mod tests {
                     *cpu,
                     mem_mib << 20,
                     &[],
-                ),
+                )
+                .with_features(&all_features()),
             );
         }
         s
@@ -323,6 +360,7 @@ mod tests {
             name: "http".into(),
             container_port: 80,
             host_port: 8080,
+            host_ip: None,
         });
         s.reserve("a", &p, true);
         s.reserve("b", &p, true);

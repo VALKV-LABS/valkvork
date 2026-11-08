@@ -73,6 +73,7 @@ impl Core {
                 conn: Some((conn_id, tx.clone())),
                 cpu_usage_percent: 0.0,
                 used_memory_bytes: 0,
+                features: r.features.clone(),
             },
         );
         self.touch_node(&node_id);
@@ -381,6 +382,8 @@ impl Core {
             }
         }
 
+        self.apply_health(wid, st);
+
         match state {
             WorkloadState::Running if status == WorkloadStatus::Assigned => {
                 if let Some(w) = self.wl(wid) {
@@ -422,6 +425,36 @@ impl Core {
                 _ => {}
             },
             _ => {}
+        }
+    }
+
+    /// Track the reported health. Not persisted: agents report it every
+    /// heartbeat, so it is back within seconds of a controller restart.
+    fn apply_health(&mut self, wid: &str, st: &pb::WorkloadStatus) {
+        use crate::model::Health;
+        let health = match pb::HealthState::try_from(st.health).unwrap_or_default() {
+            pb::HealthState::Unspecified => Health::Unknown,
+            pb::HealthState::Starting => Health::Starting,
+            pb::HealthState::Healthy => Health::Healthy,
+            pb::HealthState::Unhealthy => Health::Unhealthy,
+        };
+        let Some(w) = self.workloads.get_mut(wid) else {
+            return;
+        };
+        if w.health == health {
+            return;
+        }
+        w.health = health;
+        w.healthy_since = (health == Health::Healthy).then(now_ms);
+        if health == Health::Unhealthy {
+            let svc_id = w.service_id.clone();
+            self.event(
+                EventKind::Workload,
+                SubjectType::Workload,
+                wid,
+                format!("{svc_id} workload UNHEALTHY: health check failed; the agent restarts it"),
+                CONTROLLER,
+            );
         }
     }
 

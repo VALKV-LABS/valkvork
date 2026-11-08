@@ -321,6 +321,8 @@ impl Db {
                     created_at: r.get(10)?,
                     started_at: r.get(11)?,
                     updated_at: r.get(12)?,
+                    health: Default::default(),
+                    healthy_since: None,
                 })
             })
             .map_err(db_err)?;

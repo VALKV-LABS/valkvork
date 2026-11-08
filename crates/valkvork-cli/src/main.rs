@@ -570,7 +570,9 @@ fn print_workloads(ws: &[pb::WorkloadSummary], with_service: bool) {
     if with_service {
         headers.push("SERVICE");
     }
-    headers.extend(["VER", "NODE", "STATUS", "RESTARTS", "AGE", "REASON"]);
+    headers.extend([
+        "VER", "NODE", "STATUS", "HEALTH", "RESTARTS", "AGE", "REASON",
+    ]);
     let now = chrono::Utc::now().timestamp_millis() as u64;
     let rows = ws
         .iter()
@@ -587,6 +589,11 @@ fn print_workloads(ws: &[pb::WorkloadSummary], with_service: bool) {
                     short(&w.node_id)
                 },
                 w.status.clone(),
+                if w.health.is_empty() {
+                    "-".into()
+                } else {
+                    w.health.clone()
+                },
                 w.restart_count.to_string(),
                 age(now.saturating_sub(w.created_at)),
                 w.status_reason.clone(),

@@ -6,7 +6,7 @@
 
 use crate::errors::{ValidationError, ValidationErrorCode as Code};
 use crate::models::{
-    AutoscaleSpec, PortSpec, RestartPolicy, ServiceSpec, UpdatePolicy, VolumeSpec,
+    AutoscaleSpec, CheckSpec, PortSpec, RestartPolicy, ServiceSpec, UpdatePolicy, VolumeSpec,
 };
 use crate::units::{parse_duration, parse_size};
 use regex::Regex;
@@ -28,6 +28,8 @@ struct RawManifest {
     #[serde(default)]
     env: BTreeMap<String, String>,
     #[serde(default)]
+    secrets: BTreeMap<String, String>,
+    #[serde(default)]
     ports: Vec<RawPort>,
     #[serde(default)]
     volumes: Vec<RawVolume>,
@@ -37,6 +39,26 @@ struct RawManifest {
     update: Option<RawUpdate>,
     #[serde(default)]
     restart: Option<RawRestart>,
+    #[serde(default)]
+    check: Option<RawCheck>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawCheck {
+    #[serde(rename = "type")]
+    kind: String,
+    port: String,
+    #[serde(default)]
+    path: Option<String>,
+    #[serde(default)]
+    interval: Option<String>,
+    #[serde(default)]
+    timeout: Option<String>,
+    #[serde(default)]
+    failures: Option<i64>,
+    #[serde(default)]
+    grace: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -47,6 +69,10 @@ struct RawService {
     replicas: i64,
     #[serde(default)]
     kill_timeout: Option<String>,
+    #[serde(default)]
+    entrypoint: Option<Vec<String>>,
+    #[serde(default)]
+    command: Option<Vec<String>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -71,6 +97,8 @@ struct RawPort {
     name: String,
     container_port: i64,
     host_port: i64,
+    #[serde(default)]
+    host_ip: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -231,10 +259,21 @@ fn canonicalise(raw: RawManifest, out: &mut Vec<ValidationError>) -> Option<Serv
             ));
             ok = false;
         }
+        if let Some(ip) = &p.host_ip {
+            if ip != "advertise" && ip.parse::<std::net::IpAddr>().is_err() {
+                out.push(ValidationError::new(
+                    Code::InvalidPortSpec,
+                    &format!("ports[{i}].host_ip"),
+                    &format!("{ip:?} is not an IP address or \"advertise\""),
+                ));
+                ok = false;
+            }
+        }
         ports.push(PortSpec {
             name: p.name.clone(),
             container_port: p.container_port.clamp(0, 65535) as u16,
             host_port: p.host_port.clamp(0, 65535) as u16,
+            host_ip: p.host_ip.clone(),
         });
     }
 
@@ -315,9 +354,82 @@ fn canonicalise(raw: RawManifest, out: &mut Vec<ValidationError>) -> Option<Serv
         }
     }
 
+    let check = raw.check.map(|c| {
+        let mut bad = |field: &str, msg: String| {
+            out.push(ValidationError::new(
+                Code::InvalidCheckSpec,
+                &format!("check.{field}"),
+                &msg,
+            ));
+            ok = false;
+        };
+        let http = c.kind == "http";
+        if !http && c.kind != "tcp" {
+            bad("type", format!("{:?}: use \"tcp\" or \"http\"", c.kind));
+        }
+        if !raw.ports.iter().any(|p| p.name == c.port) {
+            bad(
+                "port",
+                format!("{:?} is not the name of a [[ports]] entry", c.port),
+            );
+        }
+        match (&c.path, http) {
+            (Some(p), true) if !p.starts_with('/') => {
+                bad("path", format!("{p:?} must start with \"/\""))
+            }
+            (Some(_), false) => bad("path", "path applies to http checks".into()),
+            _ => {}
+        }
+        let failures = c.failures.unwrap_or(3);
+        if !(1..=1000).contains(&failures) {
+            bad("failures", "failures must be 1 to 1000".into());
+        }
+        CheckSpec {
+            kind: c.kind,
+            port: c.port,
+            path: if http {
+                Some(c.path.unwrap_or_else(|| "/".into()))
+            } else {
+                None
+            },
+            interval_seconds: duration_field("check.interval", c.interval.as_deref(), 10, out)
+                .max(1),
+            timeout_seconds: duration_field("check.timeout", c.timeout.as_deref(), 2, out).max(1),
+            failures: failures.clamp(1, 1000) as u32,
+            grace_seconds: duration_field("check.grace", c.grace.as_deref(), 0, out),
+        }
+    });
+
+    for (name, reference) in &raw.secrets {
+        if let Err(msg) = check_secret(name, reference, &raw.env) {
+            out.push(ValidationError::new(
+                Code::InvalidSecretRef,
+                &format!("secrets.{name}"),
+                &msg,
+            ));
+            ok = false;
+        }
+    }
+
+    for (field, list) in [
+        ("service.entrypoint", &raw.service.entrypoint),
+        ("service.command", &raw.service.command),
+    ] {
+        if list.as_ref().is_some_and(|l| l.is_empty()) {
+            out.push(ValidationError::new(
+                Code::InvalidResourceSpec,
+                field,
+                "must not be empty; leave it out to use the image's",
+            ));
+            ok = false;
+        }
+    }
+
     let spec = ServiceSpec {
         id: raw.service.id,
         image: normalise_image(&raw.service.image),
+        entrypoint: raw.service.entrypoint,
+        command: raw.service.command,
         replicas: raw.service.replicas.max(0) as u32,
         kill_timeout_seconds: duration_field(
             "service.kill_timeout",
@@ -336,6 +448,7 @@ fn canonicalise(raw: RawManifest, out: &mut Vec<ValidationError>) -> Option<Serv
             .and_then(|c| c.required_class)
             .filter(|c| !c.is_empty()),
         env: raw.env,
+        secrets: raw.secrets,
         ports,
         volumes: raw
             .volumes
@@ -351,8 +464,42 @@ fn canonicalise(raw: RawManifest, out: &mut Vec<ValidationError>) -> Option<Serv
         autoscale,
         update,
         restart,
+        check,
     };
     ok.then_some(spec)
+}
+
+/// VE-08: a secret is an environment variable name not also set in [env],
+/// with an `ssm:<parameter name>` or `file:<absolute path>` reference.
+fn check_secret(name: &str, reference: &str, env: &BTreeMap<String, String>) -> Result<(), String> {
+    static NAME: OnceLock<Regex> = OnceLock::new();
+    static SSM: OnceLock<Regex> = OnceLock::new();
+    let name_re = NAME.get_or_init(|| Regex::new(r"^[A-Za-z_][A-Za-z0-9_]*$").unwrap());
+    // SSM parameter names: letters, digits and _.-/; a hierarchy starts with "/".
+    let ssm_re =
+        SSM.get_or_init(|| Regex::new(r"^/?[A-Za-z0-9_.\-]+(/[A-Za-z0-9_.\-]+)*$").unwrap());
+    if !name_re.is_match(name) {
+        return Err(format!("{name:?} is not a valid environment variable name"));
+    }
+    if env.contains_key(name) {
+        return Err(format!("{name} is set in both [env] and [secrets]"));
+    }
+    if let Some(param) = reference.strip_prefix("ssm:") {
+        if !ssm_re.is_match(param) {
+            return Err(format!("{reference:?} is not a valid SSM parameter name"));
+        }
+    } else if let Some(path) = reference.strip_prefix("file:") {
+        if !path.starts_with('/') {
+            return Err(format!(
+                "{reference:?}: a file reference needs an absolute path"
+            ));
+        }
+    } else {
+        return Err(format!(
+            "{reference:?}: references start with \"ssm:\" or \"file:\""
+        ));
+    }
+    Ok(())
 }
 
 /// Images without a tag or digest default to `:latest` (VE-02). The canonical
@@ -774,5 +921,154 @@ target_cpu_percent = 75
             parse_manifest_str(&std::fs::read_to_string(dir.join("shared-logs.toml")).unwrap())
                 .unwrap();
         assert!(!logs.spec.stop_first());
+    }
+
+    #[test]
+    fn command_entrypoint_and_bind_address() {
+        let m = VALID
+            .replace(
+                "replicas = 3\n",
+                "replicas = 3\nentrypoint = [\"/bin/sh\", \"-c\"]\ncommand = [\"postgres\", \"-c\", \"wal_level=logical\"]\n",
+            )
+            .replace("host_port      = 8080", "host_port      = 8080\nhost_ip        = \"advertise\"");
+        let p = parse_manifest_str(&m).unwrap();
+        assert_eq!(
+            p.spec.entrypoint.as_deref(),
+            Some(&["/bin/sh".to_string(), "-c".to_string()][..])
+        );
+        assert_eq!(p.spec.command.as_ref().unwrap()[2], "wal_level=logical");
+        assert_eq!(p.spec.ports[0].host_ip.as_deref(), Some("advertise"));
+
+        let ip = VALID.replace(
+            "host_port      = 8080",
+            "host_port      = 8080\nhost_ip = \"127.0.0.1\"",
+        );
+        assert_eq!(
+            parse_manifest_str(&ip).unwrap().spec.ports[0]
+                .host_ip
+                .as_deref(),
+            Some("127.0.0.1")
+        );
+    }
+
+    #[test]
+    fn rejects_bad_command_and_bind_address() {
+        let empty = VALID.replace("replicas = 3\n", "replicas = 3\ncommand = []\n");
+        assert_eq!(
+            err_code(&empty),
+            (Code::InvalidResourceSpec, "service.command".into())
+        );
+        let bad = VALID.replace(
+            "host_port      = 8080",
+            "host_port      = 8080\nhost_ip = \"localhost\"",
+        );
+        assert_eq!(
+            err_code(&bad),
+            (Code::InvalidPortSpec, "ports[0].host_ip".into())
+        );
+    }
+
+    /// Specs without the new fields serialise as before, so their hashes do
+    /// not change and re-applying them after an upgrade is `unchanged`.
+    #[test]
+    fn new_fields_keep_old_hashes() {
+        let json = parse_manifest_str(VALID).unwrap().spec.canonical_json();
+        for key in [
+            "\"command\"",
+            "\"entrypoint\"",
+            "\"host_ip\"",
+            "\"secrets\"",
+            "\"check\"",
+        ] {
+            assert!(!json.contains(key), "{key} in {json}");
+        }
+    }
+
+    #[test]
+    fn secrets() {
+        let ok = format!(
+            "{VALID}\n[secrets]\nPOSTGRES_PASSWORD = \"ssm:/valkv/dev/workloads/POSTGRES_PASSWORD\"\nTOKEN = \"file:/run/secrets/token\"\nPLAIN = \"ssm:plain-name\"\n"
+        );
+        let spec = parse_manifest_str(&ok).unwrap().spec;
+        assert_eq!(spec.secrets.len(), 3);
+        assert_eq!(spec.secrets["TOKEN"], "file:/run/secrets/token");
+
+        for (secret, why) in [
+            ("1BAD = \"ssm:/x\"", "name"),
+            ("A = \"ssm:/x\"", "also in [env]"),
+            ("X = \"vault:secret/x\"", "scheme"),
+            ("X = \"file:relative/path\"", "relative path"),
+            ("X = \"ssm:/has space\"", "SSM name"),
+            ("X = \"ssm:\"", "empty SSM name"),
+        ] {
+            let m = format!("{VALID}\n[secrets]\n{secret}\n");
+            let (code, _) = err_code(&m);
+            assert_eq!(code, Code::InvalidSecretRef, "{why}: {secret}");
+        }
+    }
+
+    #[test]
+    fn health_checks() {
+        let tcp = format!("{VALID}\n[check]\ntype = \"tcp\"\nport = \"http\"\n");
+        let c = parse_manifest_str(&tcp).unwrap().spec.check.unwrap();
+        assert_eq!((c.kind.as_str(), c.path.as_deref()), ("tcp", None));
+        assert_eq!(
+            (
+                c.interval_seconds,
+                c.timeout_seconds,
+                c.failures,
+                c.grace_seconds
+            ),
+            (10, 2, 3, 0)
+        );
+
+        let http = format!(
+            "{VALID}\n[check]\ntype = \"http\"\nport = \"http\"\npath = \"/healthz\"\ninterval = \"5s\"\nfailures = 2\ngrace = \"1m\"\n"
+        );
+        let c = parse_manifest_str(&http).unwrap().spec.check.unwrap();
+        assert_eq!(
+            (
+                c.path.as_deref(),
+                c.interval_seconds,
+                c.failures,
+                c.grace_seconds
+            ),
+            (Some("/healthz"), 5, 2, 60)
+        );
+        let root = format!("{VALID}\n[check]\ntype = \"http\"\nport = \"http\"\n");
+        assert_eq!(
+            parse_manifest_str(&root)
+                .unwrap()
+                .spec
+                .check
+                .unwrap()
+                .path
+                .as_deref(),
+            Some("/")
+        );
+
+        for (check, field) in [
+            ("type = \"grpc\"\nport = \"http\"", "check.type"),
+            ("type = \"tcp\"\nport = \"nope\"", "check.port"),
+            (
+                "type = \"tcp\"\nport = \"http\"\npath = \"/x\"",
+                "check.path",
+            ),
+            (
+                "type = \"http\"\nport = \"http\"\npath = \"healthz\"",
+                "check.path",
+            ),
+            (
+                "type = \"tcp\"\nport = \"http\"\nfailures = 0",
+                "check.failures",
+            ),
+        ] {
+            let m = format!("{VALID}\n[check]\n{check}\n");
+            assert_eq!(
+                err_code(&m),
+                (Code::InvalidCheckSpec, field.into()),
+                "{check}"
+            );
+        }
     }
 }

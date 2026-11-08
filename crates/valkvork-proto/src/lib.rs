@@ -2,6 +2,9 @@
 
 // tonic's API returns `Result<_, tonic::Status>`; Status is large by design.
 #![allow(clippy::result_large_err)]
+// Generated message enums: one command per message, sent rarely, so the size
+// difference between StartWorkload and the other variants does not matter.
+#![allow(clippy::large_enum_variant)]
 
 pub mod v1 {
     include!(concat!(env!("OUT_DIR"), "/agent/valkvork.v1.rs"));

@@ -35,6 +35,7 @@ message Register {
   repeated string host_volumes = 9;
   repeated WorkloadStatus inventory = 10; // every Valkvork container on the host
   string runtime = 11;                  // driver/version, e.g. "docker/27.3.1"
+  repeated string features = 12;        // manifest features this agent supports (AGENT_FEATURES)
 }
 
 message RegisterAck {
@@ -71,6 +72,7 @@ message WorkloadStatus {
   uint32 cpu_usage_millicores = 9;     // average since previous heartbeat
   uint64 memory_used_bytes = 10;
   uint64 disk_used_bytes = 11;
+  HealthState health = 12;
 }
 
 message StartWorkload {
@@ -87,12 +89,39 @@ message StartWorkload {
   repeated VolumeMount volumes = 11;
   RestartPolicy restart = 12;
   uint32 kill_timeout_seconds = 13;
+  repeated string entrypoint = 14;     // empty: the image's
+  repeated string command = 15;        // empty: the image's
+  // Environment variables the agent resolves before creating the container:
+  // name -> reference ("ssm:<parameter>" or "file:<path>"). Values never
+  // reach the controller.
+  map<string, string> secrets = 16;
+  HealthCheck check = 17;              // unset: no health check
+}
+
+// The agent probes the workload through one of its published ports, at the
+// port's bind address (127.0.0.1 when it binds every address).
+message HealthCheck {
+  string type = 1;                     // "tcp" or "http"
+  string port_name = 2;                // a PortMapping name
+  string path = 3;                     // http only
+  uint32 interval_seconds = 4;
+  uint32 timeout_seconds = 5;
+  uint32 failures = 6;                 // consecutive failures before a restart
+  uint32 grace_seconds = 7;            // after a start, failures before the first success are not counted
+}
+
+enum HealthState {
+  HEALTH_STATE_UNSPECIFIED = 0;        // no health check
+  HEALTH_STATE_STARTING = 1;           // not yet passed since the container (re)started
+  HEALTH_STATE_HEALTHY = 2;
+  HEALTH_STATE_UNHEALTHY = 3;          // failed `failures` times in a row; being restarted
 }
 
 message PortMapping {
   string name = 1;
   uint32 container_port = 2;
   uint32 host_port = 3;
+  string host_ip = 4;                  // empty: all addresses; "advertise": the node's
 }
 
 message VolumeMount {

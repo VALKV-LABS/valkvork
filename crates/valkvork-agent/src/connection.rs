@@ -114,6 +114,10 @@ async fn session(
         host_volumes: cfg.host_volumes.keys().cloned().collect(),
         inventory: supervisor.report(),
         runtime: node.runtime.clone(),
+        features: valkvork_common::models::AGENT_FEATURES
+            .iter()
+            .map(|f| f.to_string())
+            .collect(),
     };
     let inventory = register.inventory.len();
     tx.send(pb::AgentMessage {

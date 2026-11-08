@@ -153,6 +153,7 @@ impl Core {
                     conn: None,
                     cpu_usage_percent: 0.0,
                     used_memory_bytes: 0,
+                    features: Vec::new(),
                 };
                 (entry.node.node_id.clone(), entry)
             })
@@ -483,6 +484,20 @@ impl Core {
                     memory_bytes: s.memory_bytes,
                     disk_bytes: s.disk_bytes,
                     env: s.env.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
+                    secrets: s
+                        .secrets
+                        .iter()
+                        .map(|(k, v)| (k.clone(), v.clone()))
+                        .collect(),
+                    check: s.check.as_ref().map(|c| pb::HealthCheck {
+                        r#type: c.kind.clone(),
+                        port_name: c.port.clone(),
+                        path: c.path.clone().unwrap_or_default(),
+                        interval_seconds: c.interval_seconds,
+                        timeout_seconds: c.timeout_seconds,
+                        failures: c.failures,
+                        grace_seconds: c.grace_seconds,
+                    }),
                     ports: s
                         .ports
                         .iter()
@@ -490,6 +505,7 @@ impl Core {
                             name: p.name.clone(),
                             container_port: p.container_port as u32,
                             host_port: p.host_port as u32,
+                            host_ip: p.host_ip.clone().unwrap_or_default(),
                         })
                         .collect(),
                     volumes: s
@@ -508,6 +524,8 @@ impl Core {
                         delay_seconds: s.restart.delay_seconds,
                     }),
                     kill_timeout_seconds: s.kill_timeout_seconds,
+                    entrypoint: s.entrypoint.clone().unwrap_or_default(),
+                    command: s.command.clone().unwrap_or_default(),
                 },
             )),
         };
@@ -651,7 +669,8 @@ impl Core {
                     n.allocatable_cpu_millicores,
                     n.allocatable_memory_bytes,
                     &n.host_volumes,
-                ),
+                )
+                .with_features(&e.features),
             );
         }
         for w in self.workloads.values() {
@@ -685,6 +704,8 @@ impl Core {
             created_at: now,
             started_at: None,
             updated_at: now,
+            health: Default::default(),
+            healthy_since: None,
         }
     }
 

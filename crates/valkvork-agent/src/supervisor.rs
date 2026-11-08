@@ -8,9 +8,12 @@
 //! It never acts on its own when the controller is unreachable except for
 //! restart-on-failure, which the policy delegates to it (FR-AGE-05).
 
+use crate::health::Probe;
 use crate::runtime::{
-    BindMount, ContainerRuntime, ContainerSpec, RunState, RuntimeEvent, LABEL_WORKLOAD,
+    BindMount, ContainerRuntime, ContainerSpec, PublishedPort, RunState, RuntimeEvent,
+    LABEL_WORKLOAD,
 };
+use crate::secrets::SecretResolver;
 use crate::telemetry::{dir_size, read_container, CpuRate};
 use futures::StreamExt;
 use pb::WorkloadState;
@@ -27,6 +30,8 @@ const LABEL_VERSION: &str = "valkvork.service_version";
 const LABEL_RESTART: &str = "valkvork.restart";
 const LABEL_KILL_TIMEOUT: &str = "valkvork.kill_timeout";
 const LABEL_DISK: &str = "valkvork.disk_bytes";
+/// The health check, so an adopted container keeps it (see `health::Probe`).
+const LABEL_CHECK: &str = "valkvork.check";
 
 /// Paths a workload may never mount (FR-SEC-06).
 const FORBIDDEN_MOUNTS: &[&str] = &[
@@ -65,6 +70,20 @@ struct Local {
     memory_bytes: u64,
     alloc_bytes: u64,
     rw_bytes: u64,
+    /// Health check, if the service has one.
+    check: Option<Probe>,
+    health: pb::HealthState,
+    check_failures: u32,
+    /// Passed at least once since the container last started.
+    ever_healthy: bool,
+    run_since: Instant,
+    next_check: Instant,
+    probing: bool,
+    /// Bumped at every (re)start, so a probe from before it is ignored.
+    check_gen: u64,
+    /// The agent stopped the container for failing its check; its exit is
+    /// restarted with reason UNHEALTHY.
+    unhealthy_stop: bool,
 }
 
 impl Local {
@@ -94,6 +113,33 @@ impl Local {
             memory_bytes: 0,
             alloc_bytes: 0,
             rw_bytes: 0,
+            check: None,
+            health: pb::HealthState::Unspecified,
+            check_failures: 0,
+            ever_healthy: false,
+            run_since: Instant::now(),
+            next_check: Instant::now(),
+            probing: false,
+            check_gen: 0,
+            unhealthy_stop: false,
+        }
+    }
+
+    /// The container (re)started: its check starts over.
+    fn reset_check(&mut self) {
+        let now = Instant::now();
+        self.check_gen += 1;
+        self.check_failures = 0;
+        self.ever_healthy = false;
+        self.probing = false;
+        self.unhealthy_stop = false;
+        self.run_since = now;
+        match &self.check {
+            Some(p) => {
+                self.health = pb::HealthState::Starting;
+                self.next_check = now + p.interval;
+            }
+            None => self.health = pb::HealthState::Unspecified,
         }
     }
 }
@@ -105,6 +151,11 @@ pub struct SupervisorConfig {
     /// Additional never-mountable paths, e.g. the runtime's data root.
     pub protected_paths: Vec<PathBuf>,
     pub host_volumes: BTreeMap<String, HostVolume>,
+    /// The address reported to the controller; ports with
+    /// `host_ip = "advertise"` are published on it.
+    pub advertise_ip: String,
+    /// Resolves [secrets] references at container start.
+    pub secrets: Arc<SecretResolver>,
 }
 
 pub struct Supervisor {
@@ -172,8 +223,12 @@ impl Supervisor {
                     label(LABEL_DISK).parse().unwrap_or(u64::MAX),
                 );
                 l.container_id = Some(c.id.clone());
+                l.check = c.labels.get(LABEL_CHECK).and_then(|v| Probe::from_label(v));
                 match c.state {
-                    RunState::Running | RunState::Restarting => l.state = WorkloadState::Running,
+                    RunState::Running | RunState::Restarting => {
+                        l.state = WorkloadState::Running;
+                        l.reset_check();
+                    }
                     RunState::Exited => match std::fs::read_to_string(self.failed_marker(&wid)) {
                         Ok(reason) => {
                             l.state = WorkloadState::Failed;
@@ -210,6 +265,7 @@ impl Supervisor {
                 if let Some(l) = map.get_mut(&wid) {
                     if ok {
                         l.state = WorkloadState::Running;
+                        l.reset_check();
                     } else {
                         self.mark_failed(&wid, l, "START_FAILED");
                     }
@@ -290,6 +346,7 @@ impl Supervisor {
                 l.container_id = Some(cid);
                 if l.state == WorkloadState::Starting {
                     l.state = WorkloadState::Running;
+                    l.reset_check();
                     tracing::info!(workload = %wid, service = %cmd.service_id, "workload running");
                 }
             }
@@ -346,6 +403,22 @@ impl Supervisor {
             });
         }
 
+        // Secrets first: a reference that cannot be resolved fails the start
+        // before the image is pulled. Values go only into the container's env.
+        let mut secret_env = Vec::with_capacity(cmd.secrets.len());
+        let mut names: Vec<&String> = cmd.secrets.keys().collect();
+        names.sort();
+        for name in names {
+            let reference = &cmd.secrets[name];
+            let value = self.cfg.secrets.resolve(reference).await.map_err(|e| {
+                (
+                    format!("SECRET_UNRESOLVED: {name} ({reference}): {e}"),
+                    format!("secret {name} ({reference}): {e}"),
+                )
+            })?;
+            secret_env.push((name.clone(), value));
+        }
+
         let auth = crate::runtime::registry_credentials(&self.cfg.registry_auth_file, &cmd.image);
         self.rt.pull(&cmd.image, auth).await.map_err(|e| match e {
             RuntimeError::Unavailable(d) => ("RUNTIME_UNAVAILABLE".to_string(), d),
@@ -355,7 +428,7 @@ impl Supervisor {
             return Err(("STOPPED".into(), "stop requested during pull".into()));
         }
 
-        let labels = HashMap::from([
+        let mut labels = HashMap::from([
             (LABEL_WORKLOAD.to_string(), wid.clone()),
             (LABEL_SERVICE.to_string(), cmd.service_id.clone()),
             (LABEL_VERSION.to_string(), cmd.service_version.to_string()),
@@ -380,19 +453,48 @@ impl Supervisor {
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect();
         env.sort();
+        env.extend(secret_env);
         env.push(("VALKVORK_WORKLOAD_ID".into(), wid.clone()));
         env.push(("VALKVORK_SERVICE_ID".into(), cmd.service_id.clone()));
+        let mut ports = Vec::with_capacity(cmd.ports.len());
+        for p in &cmd.ports {
+            let host_ip = match p.host_ip.as_str() {
+                "" => None,
+                "advertise" if self.cfg.advertise_ip.is_empty() => {
+                    return Err((
+                        "HOST_IP_UNAVAILABLE".into(),
+                        format!(
+                            "port {:?} binds the advertise address, which is unknown",
+                            p.name
+                        ),
+                    ))
+                }
+                "advertise" => Some(self.cfg.advertise_ip.clone()),
+                ip => Some(ip.to_string()),
+            };
+            ports.push(PublishedPort {
+                container_port: p.container_port as u16,
+                host_port: p.host_port as u16,
+                host_ip,
+            });
+        }
+        let probe = match &cmd.check {
+            None => None,
+            Some(c) => Some(self.probe_for(c, &cmd.ports)?),
+        };
+        if let Some(p) = &probe {
+            labels.insert(LABEL_CHECK.to_string(), p.to_label());
+        }
+        let non_empty = |l: &Vec<String>| (!l.is_empty()).then(|| l.clone());
         let spec = ContainerSpec {
             name: format!("vk-{wid}"),
             image: cmd.image.clone(),
             cpu_millicores: cmd.cpu_millicores,
             memory_bytes: cmd.memory_bytes,
             env,
-            ports: cmd
-                .ports
-                .iter()
-                .map(|p| (p.container_port as u16, p.host_port as u16))
-                .collect(),
+            entrypoint: non_empty(&cmd.entrypoint),
+            command: non_empty(&cmd.command),
+            ports,
             mounts,
             labels,
         };
@@ -403,6 +505,7 @@ impl Supervisor {
             .map_err(|e| ("CREATE_FAILED".to_string(), e.to_string()))?;
         if let Some(l) = self.workloads.lock().unwrap().get_mut(wid) {
             l.container_id = Some(cid.clone());
+            l.check = probe;
         }
         if self.is_stopping(wid) {
             return Ok(cid);
@@ -555,7 +658,14 @@ impl Supervisor {
         {
             l.recent_restarts.pop_front();
         }
-        let reason = if oom { "OOM_KILLED" } else { "EXITED" };
+        let unhealthy = std::mem::take(&mut l.unhealthy_stop);
+        let reason = if oom {
+            "OOM_KILLED"
+        } else if unhealthy {
+            "UNHEALTHY"
+        } else {
+            "EXITED"
+        };
         if (l.recent_restarts.len() as u32) < l.policy.attempts {
             l.state = WorkloadState::Restarting;
             l.reason = format!("{reason}({exit_code})");
@@ -588,6 +698,7 @@ impl Supervisor {
                         if ok {
                             l.state = WorkloadState::Running;
                             l.cpu = CpuRate::default();
+                            l.reset_check();
                         } else {
                             me.mark_failed(&wid, l, "START_FAILED");
                         }
@@ -771,6 +882,141 @@ impl Supervisor {
         out
     }
 
+    /// Where and how to probe a workload: through its published port, at the
+    /// port's bind address, or loopback when it binds every address.
+    fn probe_for(
+        &self,
+        c: &pb::HealthCheck,
+        ports: &[pb::PortMapping],
+    ) -> Result<Probe, (String, String)> {
+        let bad = |msg: String| ("CHECK_INVALID".to_string(), msg);
+        let port = ports
+            .iter()
+            .find(|p| p.name == c.port_name)
+            .ok_or_else(|| {
+                bad(format!(
+                    "check port {:?} is not a published port",
+                    c.port_name
+                ))
+            })?;
+        let ip: std::net::IpAddr = match port.host_ip.as_str() {
+            "" | "0.0.0.0" => std::net::Ipv4Addr::LOCALHOST.into(),
+            "::" => std::net::Ipv6Addr::LOCALHOST.into(),
+            "advertise" => self
+                .cfg
+                .advertise_ip
+                .parse()
+                .map_err(|_| bad("the advertise address is unknown".into()))?,
+            other => other
+                .parse()
+                .map_err(|_| bad(format!("bad host_ip {other:?}")))?,
+        };
+        Ok(Probe {
+            http: c.r#type == "http",
+            target: std::net::SocketAddr::new(ip, port.host_port as u16),
+            path: if c.path.is_empty() {
+                "/".into()
+            } else {
+                c.path.clone()
+            },
+            interval: Duration::from_secs(c.interval_seconds.max(1) as u64),
+            timeout: Duration::from_secs(c.timeout_seconds.max(1) as u64),
+            failures: c.failures.max(1),
+            grace: Duration::from_secs(c.grace_seconds as u64),
+        })
+    }
+
+    // ------------------------------------------------------------------
+    // Health checks
+    // ------------------------------------------------------------------
+
+    /// Probe due workloads every second, forever.
+    pub async fn run_health_checks(self: Arc<Self>) {
+        let mut tick = tokio::time::interval(Duration::from_secs(1));
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            tick.tick().await;
+            self.check_due();
+        }
+    }
+
+    /// Start the probes that are due; each reports back on its own.
+    fn check_due(self: &Arc<Self>) {
+        let now = Instant::now();
+        let mut due = Vec::new();
+        {
+            let mut map = self.workloads.lock().unwrap();
+            for (wid, l) in map.iter_mut() {
+                let Some(p) = &l.check else { continue };
+                if l.state != WorkloadState::Running
+                    || l.stopping
+                    || l.probing
+                    || now < l.next_check
+                {
+                    continue;
+                }
+                l.probing = true;
+                l.next_check = now + p.interval;
+                due.push((wid.clone(), l.check_gen, p.clone()));
+            }
+        }
+        for (wid, gen, probe) in due {
+            let me = self.clone();
+            tokio::spawn(async move {
+                let result = probe.run().await;
+                me.probe_result(&wid, gen, result);
+            });
+        }
+    }
+
+    fn probe_result(self: &Arc<Self>, wid: &str, gen: u64, result: Result<(), String>) {
+        let mut map = self.workloads.lock().unwrap();
+        let Some(l) = map.get_mut(wid) else { return };
+        if l.check_gen != gen {
+            return; // from before a restart
+        }
+        l.probing = false;
+        if l.state != WorkloadState::Running || l.stopping {
+            return;
+        }
+        let Some(p) = l.check.clone() else { return };
+        match result {
+            Ok(()) => {
+                if l.health != pb::HealthState::Healthy {
+                    tracing::info!(workload = wid, "health check passing");
+                }
+                l.health = pb::HealthState::Healthy;
+                l.check_failures = 0;
+                l.ever_healthy = true;
+            }
+            Err(e) => {
+                if !l.ever_healthy && l.run_since.elapsed() < p.grace {
+                    return; // still starting up
+                }
+                l.check_failures += 1;
+                tracing::debug!(workload = wid, error = %e, failures = l.check_failures, "health check failed");
+                if l.check_failures >= p.failures && l.health != pb::HealthState::Unhealthy {
+                    l.health = pb::HealthState::Unhealthy;
+                    l.unhealthy_stop = true;
+                    tracing::warn!(
+                        workload = wid,
+                        error = %e,
+                        failures = l.check_failures,
+                        "health check failed repeatedly; restarting the container"
+                    );
+                    // The exit that follows goes through the restart policy.
+                    if let Some(cid) = l.container_id.clone() {
+                        let timeout = l.kill_timeout;
+                        let me = self.clone();
+                        tokio::spawn(async move {
+                            let _ = me.rt.stop(&cid, timeout).await;
+                        });
+                    }
+                }
+            }
+        }
+    }
+
     pub fn report(&self) -> Vec<pb::WorkloadStatus> {
         let now = Instant::now();
         let mut map = self.workloads.lock().unwrap();
@@ -796,6 +1042,7 @@ impl Supervisor {
                 cpu_usage_millicores: l.cpu_millicores,
                 memory_used_bytes: l.memory_bytes,
                 disk_used_bytes: l.alloc_bytes + l.rw_bytes,
+                health: l.health as i32,
             });
         }
         out

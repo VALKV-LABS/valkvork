@@ -39,6 +39,8 @@ pub struct NodeEntry {
     pub conn: Option<(u64, AgentSender)>,
     pub cpu_usage_percent: f64,
     pub used_memory_bytes: u64,
+    /// From the agent's last Register; empty until it registers.
+    pub features: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -84,6 +86,32 @@ pub struct Workload {
     pub created_at: i64,
     pub started_at: Option<i64>,
     pub updated_at: i64,
+    /// From the agent's reports; not stored (re-reported within a heartbeat).
+    pub health: Health,
+    /// When the workload last became healthy.
+    pub healthy_since: Option<i64>,
+}
+
+/// A workload's health-check state, as its agent reports it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Health {
+    /// No health check, or not reported yet.
+    #[default]
+    Unknown,
+    Starting,
+    Healthy,
+    Unhealthy,
+}
+
+impl Health {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Health::Unknown => "",
+            Health::Starting => "STARTING",
+            Health::Healthy => "HEALTHY",
+            Health::Unhealthy => "UNHEALTHY",
+        }
+    }
 }
 
 impl Workload {

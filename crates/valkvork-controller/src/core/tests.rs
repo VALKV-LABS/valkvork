@@ -62,6 +62,19 @@ fn stops(msgs: &[pb::controller_message::Msg]) -> Vec<String> {
         .collect()
 }
 
+/// Agents support every feature, except nodes whose id starts with "old",
+/// which behave like an agent from before the features existed.
+fn features_for(id: &str) -> Vec<String> {
+    if id.starts_with("old") {
+        vec![]
+    } else {
+        valkvork_common::models::AGENT_FEATURES
+            .iter()
+            .map(|f| f.to_string())
+            .collect()
+    }
+}
+
 static CONN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
 fn register_with(
@@ -96,6 +109,7 @@ fn register_full(
         host_volumes,
         inventory,
         runtime: "docker/27.3.1".into(),
+        features: features_for(id),
     };
     c.handle(CoreMsg::AgentConnected {
         register,
@@ -1062,4 +1076,99 @@ impl Core {
     fn db_events_for_test(&self, subject: &str) -> usize {
         self.db.count_events_for_test(subject)
     }
+}
+
+/// With a health check, a rolling update keeps the old workload until the new
+/// one has passed its check for min_healthy_time, not just started.
+#[test]
+fn rollout_waits_for_the_health_check() {
+    let mut c = core();
+    let mut a = register(&mut c, "a");
+    let mut b = register(&mut c, "b");
+    let extra = "[[ports]]\nname = \"http\"\ncontainer_port = 80\nhost_port = 8080\n\n\
+                 [check]\ntype = \"http\"\nport = \"http\"\npath = \"/healthz\"\n";
+    apply(&mut c, &manifest("web", "nginx:1", 1, extra));
+    a.take();
+    b.take();
+    run_all(&mut c, &a);
+    run_all(&mut c, &b);
+    let old = by_status(&c, "web", WorkloadStatus::Running)[0]
+        .workload_id
+        .clone();
+
+    apply(&mut c, &manifest("web", "nginx:2", 1, extra));
+    let starts: Vec<_> = a.starts().into_iter().chain(b.starts()).collect();
+    assert_eq!(starts.len(), 1);
+    let check = starts[0]
+        .check
+        .as_ref()
+        .expect("the start carries the check");
+    assert_eq!(
+        (
+            check.r#type.as_str(),
+            check.port_name.as_str(),
+            check.path.as_str()
+        ),
+        ("http", "http", "/healthz")
+    );
+    let new = starts[0].workload_id.clone();
+    // host_port 8080 is static, so the new workload is on the other node.
+    let agent = if c.workloads[&new].node_id.as_deref() == Some("a") {
+        &a
+    } else {
+        &b
+    };
+
+    let mut st = status(&new, WorkloadState::Running);
+    st.health = pb::HealthState::Starting as i32;
+    heartbeat(&mut c, agent, vec![st.clone()]);
+    c.workloads.get_mut(&new).unwrap().started_at = Some(now_ms() - 60_000);
+    c.reconcile();
+    c.finish().unwrap();
+    assert_eq!(
+        c.workloads[&old].status,
+        WorkloadStatus::Running,
+        "running but not yet healthy"
+    );
+    assert_eq!(c.workloads[&new].health, crate::model::Health::Starting);
+
+    st.health = pb::HealthState::Healthy as i32;
+    heartbeat(&mut c, agent, vec![st]);
+    assert!(c.workloads[&new].healthy_since.is_some());
+    c.workloads.get_mut(&new).unwrap().healthy_since = Some(now_ms() - 60_000);
+    c.reconcile();
+    c.finish().unwrap();
+    assert_eq!(
+        c.workloads[&old].status,
+        WorkloadStatus::Stopping,
+        "healthy long enough"
+    );
+}
+
+/// A workload using secrets is never placed on an agent that does not
+/// support them; it waits with a reason, and plain services still run there.
+#[test]
+fn features_need_an_agent_that_supports_them() {
+    let mut c = core();
+    let mut old = register(&mut c, "old-1");
+    apply(
+        &mut c,
+        &manifest("pg", "postgres:16", 1, "[secrets]\nPW = \"ssm:/x\"\n"),
+    );
+    apply(&mut c, &manifest("plain", "nginx:1", 1, ""));
+    let pending = by_status(&c, "pg", WorkloadStatus::Pending);
+    assert_eq!(pending.len(), 1, "not placed on the old agent");
+    let reason = pending[0].status_reason.clone().unwrap_or_default();
+    assert!(reason.contains("agent lacks secrets"), "{reason}");
+    assert_eq!(by_status(&c, "plain", WorkloadStatus::Assigned).len(), 1);
+    old.take();
+
+    // A current agent joins: the workload goes there.
+    // (register_with keeps the messages register() would drain.)
+    let mut new = register_with(&mut c, "new-1", "general", TOKEN, vec![]);
+    c.reconcile();
+    c.finish().unwrap();
+    let starts = new.starts();
+    assert_eq!(starts.len(), 1);
+    assert_eq!(starts[0].service_id, "pg");
 }

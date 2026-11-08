@@ -17,6 +17,8 @@ struct FakeContainer {
 #[derive(Default)]
 struct FakeState {
     containers: HashMap<String, FakeContainer>,
+    /// Every spec passed to create, in order.
+    created: Vec<ContainerSpec>,
     starts: u32,
     next: u32,
     fail_pull: bool,
@@ -83,6 +85,7 @@ impl ContainerRuntime for Fake {
         if let Some((id, _)) = s.containers.iter().find(|(_, c)| c.name == spec.name) {
             return Ok(id.clone());
         }
+        s.created.push(spec.clone());
         s.next += 1;
         let id = format!("c{}", s.next);
         s.containers.insert(
@@ -106,8 +109,28 @@ impl ContainerRuntime for Fake {
         Ok(())
     }
     async fn stop(&self, id: &str, _: u32) -> RtResult<()> {
-        if let Some(c) = self.s.lock().unwrap().containers.get_mut(id) {
-            c.state = RunState::Exited;
+        // Like Docker, stopping a running container reports its exit.
+        let died = {
+            let mut s = self.s.lock().unwrap();
+            match s.containers.get_mut(id) {
+                Some(c) if c.state == RunState::Running => {
+                    c.state = RunState::Exited;
+                    c.exit_code = 143;
+                    c.labels.get(LABEL_WORKLOAD).cloned()
+                }
+                Some(c) => {
+                    c.state = RunState::Exited;
+                    None
+                }
+                None => None,
+            }
+        };
+        if let Some(wid) = died {
+            let _ = self.events.send(RuntimeEvent::Died {
+                container_id: id.into(),
+                workload_id: wid,
+                exit_code: 143,
+            });
         }
         Ok(())
     }
@@ -171,10 +194,47 @@ impl ContainerRuntime for Fake {
     }
 }
 
+impl Fake {
+    fn last_created(&self) -> ContainerSpec {
+        self.s
+            .lock()
+            .unwrap()
+            .created
+            .last()
+            .cloned()
+            .expect("a container was created")
+    }
+}
+
+/// A supervisor whose `file:` secrets may come from `dir/secrets`.
+fn supervisor_with_secrets(rt: Arc<Fake>, dir: &Path) -> Arc<Supervisor> {
+    let secrets = dir.join("secrets");
+    std::fs::create_dir_all(&secrets).unwrap();
+    Supervisor::new(
+        rt,
+        SupervisorConfig {
+            advertise_ip: "10.0.0.5".into(),
+            secrets: Arc::new(crate::secrets::SecretResolver::new(
+                valkvork_common::config::SecretsConfig {
+                    file_dirs: vec![secrets],
+                    ..Default::default()
+                },
+            )),
+            data_dir: dir.to_path_buf(),
+            registry_auth_file: dir.join("none.json"),
+            docker_socket: PathBuf::from("/var/run/docker.sock"),
+            protected_paths: vec![],
+            host_volumes: BTreeMap::new(),
+        },
+    )
+}
+
 fn supervisor(rt: Arc<Fake>, dir: &Path) -> Arc<Supervisor> {
     Supervisor::new(
         rt,
         SupervisorConfig {
+            advertise_ip: "10.0.0.5".into(),
+            secrets: Arc::new(crate::secrets::SecretResolver::new(Default::default())),
             data_dir: dir.to_path_buf(),
             registry_auth_file: dir.join("none.json"),
             docker_socket: PathBuf::from("/var/run/docker.sock"),
@@ -364,6 +424,8 @@ async fn forbidden_host_volume_is_refused() {
     let s = Supervisor::new(
         rt.clone(),
         SupervisorConfig {
+            advertise_ip: "10.0.0.5".into(),
+            secrets: Arc::new(crate::secrets::SecretResolver::new(Default::default())),
             data_dir: d.path().to_path_buf(),
             registry_auth_file: d.path().join("none.json"),
             docker_socket: PathBuf::from("/var/run/docker.sock"),
@@ -453,6 +515,8 @@ fn supervisor_with(dir: &Path, vols: Vec<(&str, HostVolume)>) -> Arc<Supervisor>
     Supervisor::new(
         Fake::new(),
         SupervisorConfig {
+            advertise_ip: "10.0.0.5".into(),
+            secrets: Arc::new(crate::secrets::SecretResolver::new(Default::default())),
             data_dir: dir.to_path_buf(),
             registry_auth_file: dir.join("none.json"),
             docker_socket: PathBuf::from("/var/run/docker.sock"),
@@ -521,4 +585,157 @@ fn host_volume_prepare_refuses_symlinks_and_protected_paths() {
         .prepare_host_volumes()
         .unwrap_err();
     assert!(err.contains("protected"), "{err}");
+}
+
+/// command, entrypoint and each port's bind address reach the runtime;
+/// "advertise" becomes the node's address.
+#[tokio::test]
+async fn passes_command_and_bind_addresses() {
+    let d = tempfile::tempdir().unwrap();
+    let rt = Fake::new();
+    let s = supervisor(rt.clone(), d.path());
+    let mut cmd = start_cmd("w1", 3);
+    cmd.command = vec!["postgres".into(), "-c".into(), "wal_level=logical".into()];
+    cmd.ports = vec![
+        pb::PortMapping {
+            name: "pg".into(),
+            container_port: 5432,
+            host_port: 5432,
+            host_ip: "advertise".into(),
+        },
+        pb::PortMapping {
+            name: "admin".into(),
+            container_port: 9000,
+            host_port: 9000,
+            host_ip: "127.0.0.1".into(),
+        },
+        pb::PortMapping {
+            name: "any".into(),
+            container_port: 80,
+            host_port: 8080,
+            host_ip: String::new(),
+        },
+    ];
+    s.start(cmd).await.unwrap();
+    settle().await;
+    assert_eq!(state_of(&s, "w1").unwrap().0, WorkloadState::Running);
+    let spec = rt.last_created();
+    assert_eq!(spec.command.as_ref().unwrap()[0], "postgres");
+    assert_eq!(spec.entrypoint, None, "unset keeps the image's entrypoint");
+    let ips: Vec<Option<&str>> = spec.ports.iter().map(|p| p.host_ip.as_deref()).collect();
+    assert_eq!(ips, vec![Some("10.0.0.5"), Some("127.0.0.1"), None]);
+}
+
+/// A resolved secret becomes an environment variable of the container.
+#[tokio::test]
+async fn secrets_become_environment_variables() {
+    let d = tempfile::tempdir().unwrap();
+    let rt = Fake::new();
+    let s = supervisor_with_secrets(rt.clone(), d.path());
+    std::fs::write(d.path().join("secrets/pw"), "hunter2\n").unwrap();
+    let mut cmd = start_cmd("w1", 3);
+    cmd.env.insert("PGDATA".into(), "/data".into());
+    cmd.secrets.insert(
+        "POSTGRES_PASSWORD".into(),
+        format!("file:{}", d.path().join("secrets/pw").display()),
+    );
+    s.start(cmd).await.unwrap();
+    settle().await;
+    assert_eq!(state_of(&s, "w1").unwrap().0, WorkloadState::Running);
+    let env = rt.last_created().env;
+    assert!(
+        env.contains(&("POSTGRES_PASSWORD".into(), "hunter2".into())),
+        "{env:?}"
+    );
+    assert!(env.contains(&("PGDATA".into(), "/data".into())));
+}
+
+/// An unresolvable reference fails the start before anything is created, and
+/// the reason names the reference.
+#[tokio::test]
+async fn unresolvable_secret_fails_the_start() {
+    let d = tempfile::tempdir().unwrap();
+    let rt = Fake::new();
+    let s = supervisor_with_secrets(rt.clone(), d.path());
+    let mut cmd = start_cmd("w1", 3);
+    cmd.secrets
+        .insert("TOKEN".into(), "file:/etc/shadow".into());
+    s.start(cmd).await.unwrap();
+    settle().await;
+    let (state, reason, _) = state_of(&s, "w1").unwrap();
+    assert_eq!(state, WorkloadState::Failed);
+    assert!(
+        reason.starts_with("SECRET_UNRESOLVED: TOKEN (file:/etc/shadow)"),
+        "{reason}"
+    );
+    assert_eq!(rt.count(), 0, "nothing is created");
+}
+
+/// A workload that passes its check is healthy; when the check keeps failing,
+/// the agent stops it and restarts it under the restart policy.
+#[tokio::test]
+async fn failing_health_check_restarts_the_container() {
+    let d = tempfile::tempdir().unwrap();
+    let rt = Fake::new();
+    let s = supervisor(rt.clone(), d.path());
+    tokio::spawn(s.clone().run_events());
+    tokio::spawn(s.clone().run_health_checks());
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let mut cmd = start_cmd("w1", 3);
+    cmd.ports = vec![pb::PortMapping {
+        name: "http".into(),
+        container_port: 80,
+        host_port: port as u32,
+        host_ip: "127.0.0.1".into(),
+    }];
+    cmd.check = Some(pb::HealthCheck {
+        r#type: "tcp".into(),
+        port_name: "http".into(),
+        interval_seconds: 1,
+        timeout_seconds: 1,
+        failures: 2,
+        ..Default::default()
+    });
+    s.start(cmd).await.unwrap();
+    settle().await;
+    assert_eq!(health(&s).0, pb::HealthState::Starting);
+    assert!(
+        rt.last_created().labels.contains_key("valkvork.check"),
+        "the check is kept for adoption"
+    );
+
+    wait_health(&s, |h| h.0 == pb::HealthState::Healthy).await;
+
+    drop(listener); // the "application" stops answering
+    let (_, restarts, reason) = wait_health(&s, |h| h.1 == 1).await;
+    assert_eq!(restarts, 1);
+    assert!(reason.starts_with("UNHEALTHY"), "{reason}");
+}
+
+type HealthReport = (pb::HealthState, u32, String);
+
+fn health(s: &Supervisor) -> HealthReport {
+    let w = s
+        .report()
+        .into_iter()
+        .find(|w| w.workload_id == "w1")
+        .unwrap();
+    (
+        pb::HealthState::try_from(w.health).unwrap(),
+        w.restart_count,
+        w.reason,
+    )
+}
+
+async fn wait_health(s: &Supervisor, want: impl Fn(&HealthReport) -> bool) -> HealthReport {
+    for _ in 0..60 {
+        let h = health(s);
+        if want(&h) {
+            return h;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    panic!("timed out; last {:?}", health(s));
 }
