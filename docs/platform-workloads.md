@@ -52,15 +52,15 @@ No Valkvork features. Infrastructure and tooling that Stages 1 and 2 need.
 - 0.4 is built: valkvork#8 (`scripts/dev-cell-upgrade.sh`).
 - 0.3 is built: goldenimage#12. AWS generates the secrets during apply, and they are kept out of Terraform state. `tofu output workload_secret_parameters` lists the parameters.
 
-**Cell layout for Stages 1 and 2** (`aws-us-west-1-valkvork`, two nodes):
+**Cell layout for Stages 1 and 2** (`aws-us-west-1-valkvork`, two nodes). The controller node's class is `controller` since goldenimage#13 (it was `app` for the Stage 1 run). `global-pg.toml` requires it; Stage 2's `valkv-apg.toml` requires `app`, so it runs on the agent node:
 
 | Node | Class | Host volumes |
 |---|---|---|
-| Controller node (controller + agent) | `app` | `pgdata=/data/postgresql` |
+| Controller node (controller + agent) | `controller` | `pgdata=/data/postgresql` |
 | Agent node | `app` | none |
 
 **Verify** (checked 2026-11-08 on `aws-us-west-1-valkvork`):
-- [x] `valkvork node list` shows both nodes as class `app`.
+- [x] `valkvork node list` shows both nodes as class `app` (before goldenimage#13; after it, the controller node is `controller`).
 - [x] `valkvork -o json node list` lists `pgdata` in `host_volumes` on the controller node only.
 - [x] From the agent node, `aws ssm get-parameter --with-decryption --name /valkv/<cell>/workloads/POSTGRES_PASSWORD` works.
 - [ ] **Fails:** the same call for `/valkv/<cell>/valkvork/controller/key` is **allowed**. The template's own policy is narrow, but the AWS managed policy `AmazonSSMManagedInstanceCore` (attached for Session Manager) grants `ssm:GetParameter` on `*`. So every node, and every container using its role, can read every parameter in the account: the controller's TLS key and admin token, and other cells' secrets. Fix in goldenimage: see [Findings](#findings-from-the-aws-run-2026-11-08).
@@ -128,7 +128,7 @@ All checked 2026-11-08, except where marked.
 |---|---|---|---|
 | F1 | **Every node can read every SSM parameter.** `AmazonSSMManagedInstanceCore` grants `ssm:GetParameter(s)` on `*`, which overrides the template's narrow per-node policy. Fix: an explicit `Deny` on the agent role for `/valkv/<cell>/valkvork/controller/*`, and on every role for other cells' `/valkv/*` paths; or replace the managed policy with one without the parameter actions | goldenimage template (or infracatalog) | Nothing functionally; a security fix. The Stage 0 check fails until it's done |
 | F2 | **A `tcp` check can't detect a hung process.** Postgres needs an `exec` check (`type = "exec"`, `command = ["pg_isready", "-U", "valkv"]`, run with `docker exec`) | Valkvork | Stage 1's pause check. Not Stage 2 |
-| F3 | **A container can't reach its own node's address.** UFW's input policy is `DROP`, and a container connecting to the node's own IP (`10.12.0.240:5432`) goes through the host's input chain, where it is dropped. From another node it works (Docker's forward rules) | goldenimage hardening (UFW) | **Stage 2:** valkv-apg on the controller node must reach Postgres at the node's address |
+| F3 | **A container can't reach its own node's address.** UFW's input policy is `DROP`, and a container connecting to the node's own IP (`10.12.0.240:5432`) goes through the host's input chain, where it is dropped. From another node it works (Docker's forward rules) | goldenimage hardening (UFW) | Any container that reaches a service on its own node by the node's address. **Not Stage 2** any more: with the controller node's class `controller`, valkv-apg runs on the agent node and reaches Postgres from there, which works |
 | F4 | A failed in-place restart fails the workload at once, instead of retrying under the restart policy. The controller then replaces it, which works, but the restart count and reason are lost | Valkvork | Nothing |
 
 ---
