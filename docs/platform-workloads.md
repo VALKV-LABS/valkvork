@@ -59,11 +59,11 @@ No Valkvork features. Infrastructure and tooling that Stages 1 and 2 need.
 | Controller node (controller + agent) | `app` | `pgdata=/data/postgresql` |
 | Agent node | `app` | none |
 
-**Verify:**
-- [ ] `valkvork node list` shows both nodes as class `app`.
-- [ ] `valkvork node list -o json` lists `pgdata` in `host_volumes` on the controller node only.
-- [ ] From the agent node, `aws ssm get-parameter --with-decryption --name /valkv/<cell>/workloads/POSTGRES_PASSWORD` works.
-- [ ] The same call for `/valkv/<cell>/valkvork/controller/key` is denied.
+**Verify** (checked 2026-11-08 on `aws-us-west-1-valkvork`):
+- [x] `valkvork node list` shows both nodes as class `app`.
+- [x] `valkvork -o json node list` lists `pgdata` in `host_volumes` on the controller node only.
+- [x] From the agent node, `aws ssm get-parameter --with-decryption --name /valkv/<cell>/workloads/POSTGRES_PASSWORD` works.
+- [ ] **Fails:** the same call for `/valkv/<cell>/valkvork/controller/key` is **allowed**. The template's own policy is narrow, but the AWS managed policy `AmazonSSMManagedInstanceCore` (attached for Session Manager) grants `ssm:GetParameter` on `*`. So every node, and every container using its role, can read every parameter in the account: the controller's TLS key and admin token, and other cells' secrets. Fix in goldenimage: see [Findings](#findings-from-the-aws-run-2026-11-08).
 
 ---
 
@@ -92,29 +92,44 @@ No Valkvork features. Infrastructure and tooling that Stages 1 and 2 need.
 - **`make e2e`:** passes against real Docker ([local-development.md](local-development.md#tests-and-ci)). It runs Postgres with a `file:` secret, `host_ip = "advertise"`, a `command` and a `tcp` check. Then it checks the password, the bind address, an unresolvable secret, a stop-first update, adoption after an agent restart, the health metric, and a failing `http` check.
 - **Not tested yet:** `ssm:` references (the AWS CLI, the node role, the region from instance metadata). They need AWS.
 
-**Getting it onto the cell:** release it and build an image (steps 2–3), or for a first try, put this branch's binaries on the running cell with `scripts/dev-cell-upgrade.sh --cell aws-us-west-1-valkvork --bucket <bucket> --region us-west-1`.
+**Getting it onto the cell:** release it and build an image (steps 2–3), or for a first try, put this branch's binaries on the running cell with `scripts/dev-cell-upgrade.sh --cell aws-us-west-1-valkvork --bucket <bucket> --region us-west-1 --version X.Y.Z`.
+
+**On AWS (2026-11-08):** released in v0.2.6. Verified on `aws-us-west-1-valkvork` with the dev build `0.2.99` (v0.2.6 plus the paused-container fix below), put on the cell with `dev-cell-upgrade.sh`.
 
 ### Verify on AWS
 
+All checked 2026-11-08, except where marked.
+
 **Placement and secrets**
-- [ ] `valkvork plan -f global-pg.toml` places it on the controller node, the only one with `pgdata`.
-- [ ] Postgres starts with the password from SSM. `psql` from the agent node, with that password, connects.
-- [ ] The password appears nowhere in `valkvork status global-pg`, the UI, or `valkvork events`. `grep -a` for it finds nothing under `/data/valkvork/db/` (the database and its WAL). Only the reference appears.
-- [ ] A wrong SSM path fails the start with an event naming the path. Correcting the manifest recovers.
+- [x] `global-pg` runs on the controller node, the only one with `pgdata` (the deployed workload's node; `plan` on an unchanged manifest reports only "unchanged").
+- [x] Postgres starts with the password from SSM. `psql` from the agent node, with that password, connects; a wrong password is refused.
+- [x] The password appears nowhere in `valkvork status global-pg`, the UI's API (`/ui/api/overview`, `services`, `services/global-pg`, `nodes`), `valkvork events`, the agent and controller journals, or under `/data/valkvork/db/` (`grep -a`, database and WAL). The reference appears in `status`, the UI and the database.
+- [x] A wrong SSM path fails the start: `FAILED: SECRET_UNRESOLVED: TEST_SECRET (ssm:/…/DOES_NOT_EXIST): aws: [ERROR]: … (ParameterNotFound)`. No container is created. Correcting the manifest runs it. (Tested with a throwaway service, so Postgres stayed up.)
 
 **Network**
-- [ ] `ss -ltn` on the node shows 5432 on the private address only (`host_ip = "advertise"`). The port is not reachable on the public IP.
+- [x] `ss -ltn` shows 5432 on `10.12.0.240` only. It is not reachable on the public IP. But on AWS the security group (5432 from `10.12.0.0/16` only) is what blocks it: AWS translates the public IP to the private address, so a private bind alone would not.
 
 **Health**
-- [ ] `status` shows the workload healthy.
-- [ ] `docker pause` on the container: within `failures × interval` the workload is `UNHEALTHY`, an event says so, and the agent restarts the container. It is `HEALTHY` again afterwards.
+- [x] `status` shows the workload healthy.
+- [ ] **Can't pass with a `tcp` check.** With Postgres paused, its `tcp` check kept passing (for 9 minutes, until unpaused): the kernel completes the TCP handshake for a listening socket even while the process is frozen, through the published port and on the container's own IP. A `tcp` check detects a process that exits or stops listening, not one that hangs. Postgres needs an `exec` check (`pg_isready`, as compose uses): a new check type, see Findings.
+- [x] The unhealthy path itself, with an `http` check on a throwaway nginx service: after `docker pause`, it was `UNHEALTHY` in 7s (3 failures, 2s apart), with an event; the agent stopped the paused container and restarted it in place; `HEALTHY` again 4s later.
+- [x] Found and fixed: the agent took Docker's `paused` state for an exit and restarted the container in place. That start fails on a paused container, so the first pause test ended `FAILED: START_FAILED` and the controller replaced the workload. Fixed on branch `feat/dev-cell-upgrade-version`; the test above ran with the fix.
 
 **Data survives**
-- [ ] A table created before each of these is still there after:
-  - a `valkvork apply` with a replacing change, such as a changed `command` (stop-first update: the old container is gone before the new one starts);
-  - `systemctl restart valkvork-agent` (adoption, not a restart);
-  - a reboot of the node.
-- [ ] `SHOW wal_level` returns `logical`.
+- [x] A table created before each of these is still there after:
+  - two `valkvork apply`s with a replacing change (a changed `command`, then back): the old container was gone before the new one started, both times;
+  - `systemctl restart valkvork-agent`: the same container, same start time (adopted), healthy again in 5s. The `dev-cell-upgrade.sh` restart of both agents and the controller adopted it too;
+  - a reboot of the controller node: Postgres was healthy again 2 minutes after the reboot, with no manual steps.
+- [x] `SHOW wal_level` returns `logical`.
+
+### Findings from the AWS run (2026-11-08)
+
+| # | Finding | Where | Blocks |
+|---|---|---|---|
+| F1 | **Every node can read every SSM parameter.** `AmazonSSMManagedInstanceCore` grants `ssm:GetParameter(s)` on `*`, which overrides the template's narrow per-node policy. Fix: an explicit `Deny` on the agent role for `/valkv/<cell>/valkvork/controller/*`, and on every role for other cells' `/valkv/*` paths; or replace the managed policy with one without the parameter actions | goldenimage template (or infracatalog) | Nothing functionally; a security fix. The Stage 0 check fails until it's done |
+| F2 | **A `tcp` check can't detect a hung process.** Postgres needs an `exec` check (`type = "exec"`, `command = ["pg_isready", "-U", "valkv"]`, run with `docker exec`) | Valkvork | Stage 1's pause check. Not Stage 2 |
+| F3 | **A container can't reach its own node's address.** UFW's input policy is `DROP`, and a container connecting to the node's own IP (`10.12.0.240:5432`) goes through the host's input chain, where it is dropped. From another node it works (Docker's forward rules) | goldenimage hardening (UFW) | **Stage 2:** valkv-apg on the controller node must reach Postgres at the node's address |
+| F4 | A failed in-place restart fails the workload at once, instead of retrying under the restart policy. The controller then replaces it, which works, but the restart count and reason are lost | Valkvork | Nothing |
 
 ---
 

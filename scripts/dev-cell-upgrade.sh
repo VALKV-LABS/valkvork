@@ -85,7 +85,9 @@ done
 version="${VERSION:-$(sed -n 's/^version = "\(.*\)"/\1/p' "$ROOT/crates/valkvork-agent/Cargo.toml" | head -1)}"
 rev="$(git -C "$ROOT" rev-parse --short HEAD)$(git -C "$ROOT" diff --quiet || echo -dirty)"
 tarball="$work/valkvork-$rev-linux-$ARCH.tar.gz"
-tar -C "$ROOT/dist" -czf "$tarball" valkvork-controller valkvork-agent valkvork
+# --no-xattrs: macOS tar otherwise adds its file attributes, which GNU tar on
+# the nodes warns about.
+tar --no-xattrs -C "$ROOT/dist" -czf "$tarball" valkvork-controller valkvork-agent valkvork
 sha="$(shasum -a 256 "$tarball" | cut -d' ' -f1)"
 echo "    $rev ($version), sha256 $sha"
 
