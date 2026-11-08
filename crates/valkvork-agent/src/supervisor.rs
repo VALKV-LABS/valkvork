@@ -225,7 +225,7 @@ impl Supervisor {
                 l.container_id = Some(c.id.clone());
                 l.check = c.labels.get(LABEL_CHECK).and_then(|v| Probe::from_label(v));
                 match c.state {
-                    RunState::Running | RunState::Restarting => {
+                    RunState::Running | RunState::Restarting | RunState::Paused => {
                         l.state = WorkloadState::Running;
                         l.reset_check();
                     }
@@ -778,7 +778,10 @@ impl Supervisor {
             .collect();
         for (wid, cid) in candidates {
             match states.get(&cid) {
-                Some(RunState::Running) | Some(RunState::Restarting) => {}
+                // A paused process has not exited: leave it to its health
+                // check. Treating it as an exit restarted it in place, which
+                // fails on a paused container and failed the workload.
+                Some(RunState::Running) | Some(RunState::Restarting) | Some(RunState::Paused) => {}
                 Some(_) => {
                     let code = self
                         .rt

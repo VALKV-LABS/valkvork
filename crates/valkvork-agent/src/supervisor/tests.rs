@@ -739,3 +739,30 @@ async fn wait_health(s: &Supervisor, want: impl Fn(&HealthReport) -> bool) -> He
     }
     panic!("timed out; last {:?}", health(s));
 }
+
+/// A paused container is not an exit: resync leaves it alone, and a failing
+/// health check is what restarts it. Before, resync took "paused" for an exit,
+/// the in-place restart failed on the paused container, and the workload
+/// went FAILED (START_FAILED) instead of UNHEALTHY.
+#[tokio::test]
+async fn paused_container_is_not_an_exit() {
+    let d = tempfile::tempdir().unwrap();
+    let rt = Fake::new();
+    let s = supervisor(rt.clone(), d.path());
+    s.start(start_cmd("w1", 3)).await.unwrap();
+    settle().await;
+    let starts = rt.starts();
+    for c in rt.s.lock().unwrap().containers.values_mut() {
+        c.state = RunState::Paused;
+    }
+    s.resync().await;
+    settle().await;
+    assert_eq!(state_of(&s, "w1").unwrap().0, WorkloadState::Running);
+    assert_eq!(rt.starts(), starts, "not restarted");
+
+    // Adoption keeps a paused container too.
+    let s = supervisor(rt.clone(), d.path());
+    assert_eq!(s.adopt().await.unwrap(), 1);
+    assert_eq!(state_of(&s, "w1").unwrap().0, WorkloadState::Running);
+    assert_eq!(rt.starts(), starts);
+}
