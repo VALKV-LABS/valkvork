@@ -71,6 +71,7 @@ pub enum ValidationErrorCode {
     UnknownField,
     InvalidVolumeSpec,
     InvalidSecretRef,
+    InvalidCheckSpec,
     UnsatisfiableNow,
 }
 
@@ -85,6 +86,7 @@ impl std::fmt::Display for ValidationErrorCode {
             ValidationErrorCode::UnknownField => "UNKNOWN_FIELD",
             ValidationErrorCode::InvalidVolumeSpec => "INVALID_VOLUME_SPEC",
             ValidationErrorCode::InvalidSecretRef => "INVALID_SECRET_REF",
+            ValidationErrorCode::InvalidCheckSpec => "INVALID_CHECK_SPEC",
             ValidationErrorCode::UnsatisfiableNow => "UNSATISFIABLE_NOW",
         })
     }

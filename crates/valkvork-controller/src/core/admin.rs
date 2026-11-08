@@ -599,6 +599,7 @@ impl Core {
             updated_at: w.updated_at as u64,
             service_id: w.service_id.clone(),
             service_version: w.service_version,
+            health: w.health.as_str().to_string(),
         }
     }
 
@@ -793,6 +794,17 @@ pub fn spec_to_toml(s: &valkvork_common::models::ServiceSpec) -> String {
             a.min_replicas, a.max_replicas, a.target_cpu_percent
         );
     }
+    if let Some(c) = &s.check {
+        let _ = writeln!(o, "[check]\ntype = {:?}\nport = {:?}", c.kind, c.port);
+        if let Some(p) = &c.path {
+            let _ = writeln!(o, "path = {p:?}");
+        }
+        let _ = writeln!(
+            o,
+            "interval = \"{}s\"\ntimeout = \"{}s\"\nfailures = {}\ngrace = \"{}s\"\n",
+            c.interval_seconds, c.timeout_seconds, c.failures, c.grace_seconds
+        );
+    }
     let _ = writeln!(
         o,
         "[update]\nmax_parallel = {}\nmin_healthy_time = \"{}s\"\n",
@@ -848,6 +860,12 @@ host_ip = "advertise"
 
 [secrets]
 POSTGRES_PASSWORD = "ssm:/valkv/dev/workloads/POSTGRES_PASSWORD"
+
+[check]
+type = "tcp"
+port = "postgres"
+interval = "5s"
+grace = "30s"
 
 [[ports]]
 name = "admin"

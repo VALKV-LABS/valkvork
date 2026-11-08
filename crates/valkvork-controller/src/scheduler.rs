@@ -258,6 +258,7 @@ mod tests {
             autoscale: None,
             update: UpdatePolicy::default(),
             restart: RestartPolicy::default(),
+            check: None,
         }
     }
 

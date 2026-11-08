@@ -50,9 +50,19 @@ min_replicas       = 3
 max_replicas       = 10
 target_cpu_percent = 75
 
+[check]                        # optional health check, through a published port
+type     = "http"              # "tcp" (connects) or "http" (GET; healthy on 2xx and 3xx)
+port     = "http"              # a [[ports]] name
+path     = "/healthz"          # http only; default "/"
+interval = "10s"
+timeout  = "2s"
+failures = 3                   # consecutive failures before the container is restarted
+grace    = "0s"                # after a start, failures before the first success don't count for this long
+
 [update]
 max_parallel     = 1           # rolling update and drain concurrency
-min_healthy_time = "10s"       # how long a new workload must run before its predecessor stops
+min_healthy_time = "10s"       # how long a new workload must run (or, with [check], pass it)
+                               # before its predecessor stops
 
 [restart]
 attempts = 3                   # local restarts allowed ...
@@ -67,6 +77,7 @@ delay    = "5s"                # wait before each restart
 | `ports.host_ip` | every address (`0.0.0.0`) |
 | `resources.disk` | `"1GiB"` |
 | `constraints.required_class` | none: any node |
+| `check.path`, `check.interval`, `check.timeout`, `check.failures`, `check.grace` | `"/"` (http), `"10s"`, `"2s"`, `3`, `"0s"` |
 | `update.max_parallel`, `update.min_healthy_time` | `1`, `"10s"` |
 | `restart.attempts`, `restart.interval`, `restart.delay` | `3`, `"5m"`, `"5s"` |
 
@@ -75,6 +86,17 @@ Durations are `<n>s`, `<n>m`, `<n>h`, or a bare number of seconds. Sizes are an 
 `command` and `entrypoint` follow Docker Compose: `command` replaces the image's default arguments (`CMD`) and keeps its `ENTRYPOINT`, which is what most images, such as `postgres`, expect. Set `entrypoint` only to replace the program itself.
 
 `host_ip = "advertise"` publishes the port on the address the agent reports to the controller (agent.toml `advertise_ip`, or the address it reaches the controller from). Use it on instances with public IPs, so a port is reachable on the private network only. `host_ip = "127.0.0.1"` keeps a port on the node itself. A port's host address does not change the scheduler's view: a `host_port` is still taken on the node whatever address it binds.
+
+### Health Checks
+
+With `[check]`, the agent probes the workload through one of its published ports, at that port's bind address: `127.0.0.1` when it binds every address, the node's address for `host_ip = "advertise"`. A `tcp` check passes when it can connect; an `http` check sends `GET path` and passes on a 2xx or 3xx status. Each probe has `timeout` to answer.
+
+- A workload is `STARTING` until its first passing probe, then `HEALTHY`. After a (re)start, failures before the first success don't count during `grace`.
+- After `failures` consecutive failures it is `UNHEALTHY`: the agent stops the container, and the restart policy restarts it, with reason `UNHEALTHY`, or marks it FAILED when the policy is used up. The controller logs an event.
+- **Rollouts and drains wait for health.** A replacement counts once it has been `HEALTHY` for `min_healthy_time`, not merely running.
+- Health shows in `valkvork status` and `valkvork workloads` (`HEALTH`), the UI, and the metric `valkvork_workload_health`.
+
+The check needs a published port; there are no exec checks yet.
 
 ### Secrets
 
@@ -106,6 +128,7 @@ Validation runs before any database write. A failure writes nothing, returns gRP
 | VE-05 | Ports in 1–65535; `host_port` unique within the manifest; `host_port < 1024` is a **warning**; `host_ip` is an IP address or `"advertise"` | `INVALID_PORT_SPEC` |
 | VE-06 | No unknown keys or tables (`deny_unknown_fields`). The path names the table, e.g. `service.replica` or `ports.hostport` | `UNKNOWN_FIELD` |
 | VE-07 | Each volume has a known `type`, a source, an absolute `target`, and a unique `target` | `INVALID_VOLUME_SPEC` |
+| VE-09 | `check.type` is `tcp` or `http`; `check.port` names a `[[ports]]` entry; `path` only for `http`, starting with `/`; `failures` 1–1000 | `INVALID_CHECK_SPEC` |
 | VE-08 | Each secret's name is an environment variable name not also in `[env]`, and its reference is `ssm:<parameter name>` or `file:<absolute path>` | `INVALID_SECRET_REF` |
 | VW-01 | **Warning** at apply or plan: no current healthy node of the class could fit one replica, or none has the host volumes | `UNSATISFIABLE_NOW` |
 

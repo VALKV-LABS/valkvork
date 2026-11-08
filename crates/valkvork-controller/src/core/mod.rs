@@ -488,6 +488,15 @@ impl Core {
                         .iter()
                         .map(|(k, v)| (k.clone(), v.clone()))
                         .collect(),
+                    check: s.check.as_ref().map(|c| pb::HealthCheck {
+                        r#type: c.kind.clone(),
+                        port_name: c.port.clone(),
+                        path: c.path.clone().unwrap_or_default(),
+                        interval_seconds: c.interval_seconds,
+                        timeout_seconds: c.timeout_seconds,
+                        failures: c.failures,
+                        grace_seconds: c.grace_seconds,
+                    }),
                     ports: s
                         .ports
                         .iter()
@@ -693,6 +702,8 @@ impl Core {
             created_at: now,
             started_at: None,
             updated_at: now,
+            health: Default::default(),
+            healthy_since: None,
         }
     }
 

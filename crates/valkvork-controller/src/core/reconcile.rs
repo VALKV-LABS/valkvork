@@ -133,6 +133,7 @@ impl Core {
             svc.spec.update.min_healthy_time_seconds as i64,
             svc.rollout_status,
         );
+        let checked = svc.spec.check.is_some();
         let draining: HashSet<&str> = self
             .nodes
             .values()
@@ -189,10 +190,7 @@ impl Core {
         for old in movers {
             match replacing.get(old.workload_id.as_str()) {
                 Some(new) => {
-                    let healthy = new.status == WorkloadStatus::Running
-                        && new
-                            .started_at
-                            .is_some_and(|t| now - t >= min_healthy * 1000);
+                    let healthy = settled(new, checked, now, min_healthy);
                     if healthy {
                         to_stop.push(old.workload_id.clone());
                     } else {
@@ -274,10 +272,8 @@ impl Core {
             .values()
             .filter(|w| w.service_id == service_id && w.is_live())
             .collect();
-        let healthy = |w: &Workload| {
-            w.status == WorkloadStatus::Running
-                && w.started_at.is_some_and(|t| now - t >= min_healthy * 1000)
-        };
+        let checked = svc.spec.check.is_some();
+        let healthy = |w: &Workload| settled(w, checked, now, min_healthy);
         let outdated = |w: &Workload| w.service_version < version;
         let any_outdated = live.iter().any(|w| outdated(w));
         // Workloads still coming up hold the parallelism budget.
@@ -576,4 +572,17 @@ impl Core {
         let delay = Duration::from_secs((5u64 << (streak - 1).min(6)).min(300));
         last.elapsed() < delay
     }
+}
+
+/// A new workload counts as healthy for rollouts and drains once it has been
+/// RUNNING for `min_healthy` seconds, or, with a health check, has been
+/// passing it for that long.
+fn settled(w: &Workload, checked: bool, now: i64, min_healthy: i64) -> bool {
+    let since = if checked {
+        w.healthy_since
+            .filter(|_| w.health == crate::model::Health::Healthy)
+    } else {
+        w.started_at
+    };
+    w.status == WorkloadStatus::Running && since.is_some_and(|t| now - t >= min_healthy * 1000)
 }

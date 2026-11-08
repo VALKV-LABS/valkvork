@@ -20,6 +20,7 @@ The controller's values are computed from the core's in-memory state on each scr
 | `valkvork_nodes` | gauge | `status`, `class` | Registered nodes |
 | `valkvork_nodes_draining` | gauge | `class` | Draining nodes |
 | `valkvork_workloads` | gauge | `status` | Workloads by status, every status listed even at 0 |
+| `valkvork_workload_health` | gauge | `health` (`STARTING`, `HEALTHY`, `UNHEALTHY`) | Live workloads with a health check, by reported health |
 | `valkvork_pending_unplaced_workloads` | gauge | `class` | PENDING workloads that could not be placed, by the service's required class (`any` when unconstrained); every class with nodes is listed |
 | `valkvork_allocated_ratio` | gauge | `class`, `resource` (`cpu`, `memory`) | Requested over allocatable on healthy nodes |
 | `valkvork_service_cpu_utilization` | gauge | `service` | The autoscaler's utilisation figure (%), when there is a reading |

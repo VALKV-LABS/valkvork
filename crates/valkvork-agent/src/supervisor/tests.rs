@@ -109,8 +109,28 @@ impl ContainerRuntime for Fake {
         Ok(())
     }
     async fn stop(&self, id: &str, _: u32) -> RtResult<()> {
-        if let Some(c) = self.s.lock().unwrap().containers.get_mut(id) {
-            c.state = RunState::Exited;
+        // Like Docker, stopping a running container reports its exit.
+        let died = {
+            let mut s = self.s.lock().unwrap();
+            match s.containers.get_mut(id) {
+                Some(c) if c.state == RunState::Running => {
+                    c.state = RunState::Exited;
+                    c.exit_code = 143;
+                    c.labels.get(LABEL_WORKLOAD).cloned()
+                }
+                Some(c) => {
+                    c.state = RunState::Exited;
+                    None
+                }
+                None => None,
+            }
+        };
+        if let Some(wid) = died {
+            let _ = self.events.send(RuntimeEvent::Died {
+                container_id: id.into(),
+                workload_id: wid,
+                exit_code: 143,
+            });
         }
         Ok(())
     }
@@ -649,4 +669,73 @@ async fn unresolvable_secret_fails_the_start() {
         "{reason}"
     );
     assert_eq!(rt.count(), 0, "nothing is created");
+}
+
+/// A workload that passes its check is healthy; when the check keeps failing,
+/// the agent stops it and restarts it under the restart policy.
+#[tokio::test]
+async fn failing_health_check_restarts_the_container() {
+    let d = tempfile::tempdir().unwrap();
+    let rt = Fake::new();
+    let s = supervisor(rt.clone(), d.path());
+    tokio::spawn(s.clone().run_events());
+    tokio::spawn(s.clone().run_health_checks());
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let mut cmd = start_cmd("w1", 3);
+    cmd.ports = vec![pb::PortMapping {
+        name: "http".into(),
+        container_port: 80,
+        host_port: port as u32,
+        host_ip: "127.0.0.1".into(),
+    }];
+    cmd.check = Some(pb::HealthCheck {
+        r#type: "tcp".into(),
+        port_name: "http".into(),
+        interval_seconds: 1,
+        timeout_seconds: 1,
+        failures: 2,
+        ..Default::default()
+    });
+    s.start(cmd).await.unwrap();
+    settle().await;
+    assert_eq!(health(&s).0, pb::HealthState::Starting);
+    assert!(
+        rt.last_created().labels.contains_key("valkvork.check"),
+        "the check is kept for adoption"
+    );
+
+    wait_health(&s, |h| h.0 == pb::HealthState::Healthy).await;
+
+    drop(listener); // the "application" stops answering
+    let (_, restarts, reason) = wait_health(&s, |h| h.1 == 1).await;
+    assert_eq!(restarts, 1);
+    assert!(reason.starts_with("UNHEALTHY"), "{reason}");
+}
+
+type HealthReport = (pb::HealthState, u32, String);
+
+fn health(s: &Supervisor) -> HealthReport {
+    let w = s
+        .report()
+        .into_iter()
+        .find(|w| w.workload_id == "w1")
+        .unwrap();
+    (
+        pb::HealthState::try_from(w.health).unwrap(),
+        w.restart_count,
+        w.reason,
+    )
+}
+
+async fn wait_health(s: &Supervisor, want: impl Fn(&HealthReport) -> bool) -> HealthReport {
+    for _ in 0..60 {
+        let h = health(s);
+        if want(&h) {
+            return h;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    panic!("timed out; last {:?}", health(s));
 }

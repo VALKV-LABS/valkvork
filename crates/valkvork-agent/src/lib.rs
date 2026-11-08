@@ -8,8 +8,10 @@
 //!   (FR-ARC-01, FR-AGE-05).
 //! * [`identity`]: node id, hostname, address and capacity (FR-AGE-02).
 //! * [`secrets`]: resolution of workloads' secret references (FR-SEC-04).
+//! * [`health`]: health-check probes.
 
 pub mod connection;
+pub mod health;
 pub mod identity;
 pub mod metrics;
 pub mod runtime;

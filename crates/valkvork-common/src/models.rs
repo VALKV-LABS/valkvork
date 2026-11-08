@@ -198,6 +198,27 @@ impl VolumeSpec {
     }
 }
 
+/// A health check (`[check]`): the agent probes the workload through one of
+/// its published ports.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CheckSpec {
+    /// `tcp` (connects) or `http` (GET, healthy on 2xx and 3xx).
+    #[serde(rename = "type")]
+    pub kind: String,
+    /// A `[[ports]]` name.
+    pub port: String,
+    /// HTTP path; only for `http`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    pub interval_seconds: u32,
+    pub timeout_seconds: u32,
+    /// Consecutive failures that make the workload unhealthy and restart it.
+    pub failures: u32,
+    /// After a start, failures before the first success are not counted
+    /// for this long.
+    pub grace_seconds: u32,
+}
+
 /// Canonical form of a validated manifest. Field order and `BTreeMap` make the
 /// JSON serialisation deterministic, which `spec_hash` relies on (FR-MAN-02).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -228,6 +249,9 @@ pub struct ServiceSpec {
     pub autoscale: Option<AutoscaleSpec>,
     pub update: UpdatePolicy,
     pub restart: RestartPolicy,
+    /// Omitted when unset (stable hashes).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub check: Option<CheckSpec>,
 }
 
 /// Classification of the difference between a stored spec and a new one
@@ -273,6 +297,7 @@ impl ServiceSpec {
             && self.volumes == other.volumes
             && self.restart == other.restart
             && self.kill_timeout_seconds == other.kill_timeout_seconds
+            && self.check == other.check
     }
 
     /// Classify `new` against `self` (the stored spec), ignoring live target
@@ -349,6 +374,7 @@ mod tests {
             autoscale: None,
             update: UpdatePolicy::default(),
             restart: RestartPolicy::default(),
+            check: None,
         }
     }
 

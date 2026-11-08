@@ -6,7 +6,7 @@
 
 use crate::errors::{ValidationError, ValidationErrorCode as Code};
 use crate::models::{
-    AutoscaleSpec, PortSpec, RestartPolicy, ServiceSpec, UpdatePolicy, VolumeSpec,
+    AutoscaleSpec, CheckSpec, PortSpec, RestartPolicy, ServiceSpec, UpdatePolicy, VolumeSpec,
 };
 use crate::units::{parse_duration, parse_size};
 use regex::Regex;
@@ -39,6 +39,26 @@ struct RawManifest {
     update: Option<RawUpdate>,
     #[serde(default)]
     restart: Option<RawRestart>,
+    #[serde(default)]
+    check: Option<RawCheck>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawCheck {
+    #[serde(rename = "type")]
+    kind: String,
+    port: String,
+    #[serde(default)]
+    path: Option<String>,
+    #[serde(default)]
+    interval: Option<String>,
+    #[serde(default)]
+    timeout: Option<String>,
+    #[serde(default)]
+    failures: Option<i64>,
+    #[serde(default)]
+    grace: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -334,6 +354,52 @@ fn canonicalise(raw: RawManifest, out: &mut Vec<ValidationError>) -> Option<Serv
         }
     }
 
+    let check = raw.check.map(|c| {
+        let mut bad = |field: &str, msg: String| {
+            out.push(ValidationError::new(
+                Code::InvalidCheckSpec,
+                &format!("check.{field}"),
+                &msg,
+            ));
+            ok = false;
+        };
+        let http = c.kind == "http";
+        if !http && c.kind != "tcp" {
+            bad("type", format!("{:?}: use \"tcp\" or \"http\"", c.kind));
+        }
+        if !raw.ports.iter().any(|p| p.name == c.port) {
+            bad(
+                "port",
+                format!("{:?} is not the name of a [[ports]] entry", c.port),
+            );
+        }
+        match (&c.path, http) {
+            (Some(p), true) if !p.starts_with('/') => {
+                bad("path", format!("{p:?} must start with \"/\""))
+            }
+            (Some(_), false) => bad("path", "path applies to http checks".into()),
+            _ => {}
+        }
+        let failures = c.failures.unwrap_or(3);
+        if !(1..=1000).contains(&failures) {
+            bad("failures", "failures must be 1 to 1000".into());
+        }
+        CheckSpec {
+            kind: c.kind,
+            port: c.port,
+            path: if http {
+                Some(c.path.unwrap_or_else(|| "/".into()))
+            } else {
+                None
+            },
+            interval_seconds: duration_field("check.interval", c.interval.as_deref(), 10, out)
+                .max(1),
+            timeout_seconds: duration_field("check.timeout", c.timeout.as_deref(), 2, out).max(1),
+            failures: failures.clamp(1, 1000) as u32,
+            grace_seconds: duration_field("check.grace", c.grace.as_deref(), 0, out),
+        }
+    });
+
     for (name, reference) in &raw.secrets {
         if let Err(msg) = check_secret(name, reference, &raw.env) {
             out.push(ValidationError::new(
@@ -398,6 +464,7 @@ fn canonicalise(raw: RawManifest, out: &mut Vec<ValidationError>) -> Option<Serv
         autoscale,
         update,
         restart,
+        check,
     };
     ok.then_some(spec)
 }
@@ -911,6 +978,7 @@ target_cpu_percent = 75
             "\"entrypoint\"",
             "\"host_ip\"",
             "\"secrets\"",
+            "\"check\"",
         ] {
             assert!(!json.contains(key), "{key} in {json}");
         }
@@ -936,6 +1004,71 @@ target_cpu_percent = 75
             let m = format!("{VALID}\n[secrets]\n{secret}\n");
             let (code, _) = err_code(&m);
             assert_eq!(code, Code::InvalidSecretRef, "{why}: {secret}");
+        }
+    }
+
+    #[test]
+    fn health_checks() {
+        let tcp = format!("{VALID}\n[check]\ntype = \"tcp\"\nport = \"http\"\n");
+        let c = parse_manifest_str(&tcp).unwrap().spec.check.unwrap();
+        assert_eq!((c.kind.as_str(), c.path.as_deref()), ("tcp", None));
+        assert_eq!(
+            (
+                c.interval_seconds,
+                c.timeout_seconds,
+                c.failures,
+                c.grace_seconds
+            ),
+            (10, 2, 3, 0)
+        );
+
+        let http = format!(
+            "{VALID}\n[check]\ntype = \"http\"\nport = \"http\"\npath = \"/healthz\"\ninterval = \"5s\"\nfailures = 2\ngrace = \"1m\"\n"
+        );
+        let c = parse_manifest_str(&http).unwrap().spec.check.unwrap();
+        assert_eq!(
+            (
+                c.path.as_deref(),
+                c.interval_seconds,
+                c.failures,
+                c.grace_seconds
+            ),
+            (Some("/healthz"), 5, 2, 60)
+        );
+        let root = format!("{VALID}\n[check]\ntype = \"http\"\nport = \"http\"\n");
+        assert_eq!(
+            parse_manifest_str(&root)
+                .unwrap()
+                .spec
+                .check
+                .unwrap()
+                .path
+                .as_deref(),
+            Some("/")
+        );
+
+        for (check, field) in [
+            ("type = \"grpc\"\nport = \"http\"", "check.type"),
+            ("type = \"tcp\"\nport = \"nope\"", "check.port"),
+            (
+                "type = \"tcp\"\nport = \"http\"\npath = \"/x\"",
+                "check.path",
+            ),
+            (
+                "type = \"http\"\nport = \"http\"\npath = \"healthz\"",
+                "check.path",
+            ),
+            (
+                "type = \"tcp\"\nport = \"http\"\nfailures = 0",
+                "check.failures",
+            ),
+        ] {
+            let m = format!("{VALID}\n[check]\n{check}\n");
+            assert_eq!(
+                err_code(&m),
+                (Code::InvalidCheckSpec, field.into()),
+                "{check}"
+            );
         }
     }
 }

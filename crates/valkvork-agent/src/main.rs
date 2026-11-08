@@ -136,6 +136,7 @@ async fn run(args: Args) -> Result<(), ValkvorkError> {
     tokio::spawn(supervisor.clone().run_events());
     tokio::spawn(supervisor.clone().run_resync());
     tokio::spawn(supervisor.clone().run_disk_checks());
+    tokio::spawn(supervisor.clone().run_health_checks());
     if let Some(addr) = cfg.metrics_listen_addr {
         tokio::spawn(valkvork_agent::metrics::serve(addr, supervisor.clone()));
     }

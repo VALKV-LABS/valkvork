@@ -1063,3 +1063,70 @@ impl Core {
         self.db.count_events_for_test(subject)
     }
 }
+
+/// With a health check, a rolling update keeps the old workload until the new
+/// one has passed its check for min_healthy_time, not just started.
+#[test]
+fn rollout_waits_for_the_health_check() {
+    let mut c = core();
+    let mut a = register(&mut c, "a");
+    let mut b = register(&mut c, "b");
+    let extra = "[[ports]]\nname = \"http\"\ncontainer_port = 80\nhost_port = 8080\n\n\
+                 [check]\ntype = \"http\"\nport = \"http\"\npath = \"/healthz\"\n";
+    apply(&mut c, &manifest("web", "nginx:1", 1, extra));
+    a.take();
+    b.take();
+    run_all(&mut c, &a);
+    run_all(&mut c, &b);
+    let old = by_status(&c, "web", WorkloadStatus::Running)[0]
+        .workload_id
+        .clone();
+
+    apply(&mut c, &manifest("web", "nginx:2", 1, extra));
+    let starts: Vec<_> = a.starts().into_iter().chain(b.starts()).collect();
+    assert_eq!(starts.len(), 1);
+    let check = starts[0]
+        .check
+        .as_ref()
+        .expect("the start carries the check");
+    assert_eq!(
+        (
+            check.r#type.as_str(),
+            check.port_name.as_str(),
+            check.path.as_str()
+        ),
+        ("http", "http", "/healthz")
+    );
+    let new = starts[0].workload_id.clone();
+    // host_port 8080 is static, so the new workload is on the other node.
+    let agent = if c.workloads[&new].node_id.as_deref() == Some("a") {
+        &a
+    } else {
+        &b
+    };
+
+    let mut st = status(&new, WorkloadState::Running);
+    st.health = pb::HealthState::Starting as i32;
+    heartbeat(&mut c, agent, vec![st.clone()]);
+    c.workloads.get_mut(&new).unwrap().started_at = Some(now_ms() - 60_000);
+    c.reconcile();
+    c.finish().unwrap();
+    assert_eq!(
+        c.workloads[&old].status,
+        WorkloadStatus::Running,
+        "running but not yet healthy"
+    );
+    assert_eq!(c.workloads[&new].health, crate::model::Health::Starting);
+
+    st.health = pb::HealthState::Healthy as i32;
+    heartbeat(&mut c, agent, vec![st]);
+    assert!(c.workloads[&new].healthy_since.is_some());
+    c.workloads.get_mut(&new).unwrap().healthy_since = Some(now_ms() - 60_000);
+    c.reconcile();
+    c.finish().unwrap();
+    assert_eq!(
+        c.workloads[&old].status,
+        WorkloadStatus::Stopping,
+        "healthy long enough"
+    );
+}

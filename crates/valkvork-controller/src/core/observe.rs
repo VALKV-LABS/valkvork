@@ -334,6 +334,31 @@ impl Core {
             );
         }
 
+        // valkvork_workload_health{health}: workloads with a health check.
+        header(
+            &mut o,
+            "valkvork_workload_health",
+            "gauge",
+            "Live workloads with a health check, by reported health.",
+        );
+        let mut by_health: BTreeMap<&str, u32> = ["STARTING", "HEALTHY", "UNHEALTHY"]
+            .into_iter()
+            .map(|s| (s, 0))
+            .collect();
+        for w in self.workloads.values().filter(|w| w.is_live()) {
+            if let Some(n) = by_health.get_mut(w.health.as_str()) {
+                *n += 1;
+            }
+        }
+        for (health, n) in &by_health {
+            line(
+                &mut o,
+                "valkvork_workload_health",
+                &[("health", health)],
+                *n as f64,
+            );
+        }
+
         // valkvork_pending_unplaced_workloads{class}: drives infrastructure scale-out (§10.4).
         header(
             &mut o,
