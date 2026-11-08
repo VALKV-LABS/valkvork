@@ -214,6 +214,9 @@ fn supervisor_with_secrets(rt: Arc<Fake>, dir: &Path) -> Arc<Supervisor> {
         rt,
         SupervisorConfig {
             advertise_ip: "10.0.0.5".into(),
+            node_id: "node-1".into(),
+            node_class: "app".into(),
+            hostname: "host-1".into(),
             secrets: Arc::new(crate::secrets::SecretResolver::new(
                 valkvork_common::config::SecretsConfig {
                     file_dirs: vec![secrets],
@@ -234,6 +237,9 @@ fn supervisor(rt: Arc<Fake>, dir: &Path) -> Arc<Supervisor> {
         rt,
         SupervisorConfig {
             advertise_ip: "10.0.0.5".into(),
+            node_id: "node-1".into(),
+            node_class: "app".into(),
+            hostname: "host-1".into(),
             secrets: Arc::new(crate::secrets::SecretResolver::new(Default::default())),
             data_dir: dir.to_path_buf(),
             registry_auth_file: dir.join("none.json"),
@@ -425,6 +431,9 @@ async fn forbidden_host_volume_is_refused() {
         rt.clone(),
         SupervisorConfig {
             advertise_ip: "10.0.0.5".into(),
+            node_id: "node-1".into(),
+            node_class: "app".into(),
+            hostname: "host-1".into(),
             secrets: Arc::new(crate::secrets::SecretResolver::new(Default::default())),
             data_dir: d.path().to_path_buf(),
             registry_auth_file: d.path().join("none.json"),
@@ -516,6 +525,9 @@ fn supervisor_with(dir: &Path, vols: Vec<(&str, HostVolume)>) -> Arc<Supervisor>
         Fake::new(),
         SupervisorConfig {
             advertise_ip: "10.0.0.5".into(),
+            node_id: "node-1".into(),
+            node_class: "app".into(),
+            hostname: "host-1".into(),
             secrets: Arc::new(crate::secrets::SecretResolver::new(Default::default())),
             data_dir: dir.to_path_buf(),
             registry_auth_file: dir.join("none.json"),
@@ -872,5 +884,36 @@ async fn ephemeral_volume_lives_with_the_workload() {
     assert!(
         !d.path().join("volumes").join("w1").exists(),
         "removed with the workload"
+    );
+}
+
+/// ${node.NAME} in an env value gets this node's value.
+#[tokio::test]
+async fn node_values_in_env() {
+    let d = tempfile::tempdir().unwrap();
+    let rt = Fake::new();
+    let s = supervisor(rt.clone(), d.path());
+    let mut cmd = start_cmd("w1", 3);
+    cmd.env = [
+        (
+            "URL".to_string(),
+            "http://${node.advertise_ip}:4000".to_string(),
+        ),
+        (
+            "NODE".to_string(),
+            "${node.id}/${node.class}/${node.hostname}".to_string(),
+        ),
+    ]
+    .into();
+    s.start(cmd).await.unwrap();
+    settle().await;
+    let env = rt.last_created().env;
+    assert!(
+        env.contains(&("URL".into(), "http://10.0.0.5:4000".into())),
+        "{env:?}"
+    );
+    assert!(
+        env.contains(&("NODE".into(), "node-1/app/host-1".into())),
+        "{env:?}"
     );
 }

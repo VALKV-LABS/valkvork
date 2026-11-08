@@ -6,8 +6,8 @@
 
 use crate::errors::{ValidationError, ValidationErrorCode as Code};
 use crate::models::{
-    interpolate_secrets, AutoscaleSpec, CheckSpec, PortSpec, RestartPolicy, ServiceSpec,
-    ServiceType, UpdatePolicy, VolumeSpec,
+    interpolate_node, interpolate_secrets, AutoscaleSpec, CheckSpec, PortSpec, RestartPolicy,
+    ServiceSpec, ServiceType, UpdatePolicy, VolumeSpec,
 };
 use crate::units::{parse_duration, parse_size};
 use regex::Regex;
@@ -434,6 +434,25 @@ fn canonicalise(raw: RawManifest, out: &mut Vec<ValidationError>) -> Option<Serv
                 &msg,
             ));
             ok = false;
+        }
+    }
+
+    // ${node.NAME} in a value must name a node value the agent knows.
+    for (key, value) in &raw.env {
+        if value.contains("${node.") {
+            if let Err(e) = interpolate_node(value, |n| {
+                crate::models::NODE_VALUES.contains(&n).then_some("")
+            }) {
+                out.push(ValidationError::new(
+                    Code::InvalidResourceSpec,
+                    &format!("env.{key}"),
+                    &format!(
+                        "{e}: use ${{node.NAME}} with NAME one of {}",
+                        crate::models::NODE_VALUES.join(", ")
+                    ),
+                ));
+                ok = false;
+            }
         }
     }
 
@@ -1256,5 +1275,17 @@ target_cpu_percent = 75
             err_code(&odd),
             (Code::InvalidVolumeSpec, "volumes[0].type".into())
         );
+    }
+
+    #[test]
+    fn node_values() {
+        let ok = VALID.replace(
+            "A = \"1\"",
+            "A = \"1\"\nURL = \"http://${node.advertise_ip}:4000\"\nID = \"${node.id}\"",
+        );
+        let p = parse_manifest_str(&ok).unwrap();
+        assert!(p.spec.required_features().contains(&"node_values"));
+        let bad = VALID.replace("A = \"1\"", "X = \"${node.instance_id}\"");
+        assert_eq!(err_code(&bad), (Code::InvalidResourceSpec, "env.X".into()));
     }
 }

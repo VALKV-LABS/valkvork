@@ -286,9 +286,14 @@ pub const AGENT_FEATURES: &[&str] = &[
     "ephemeral_volumes",
     "health_checks",
     "host_ip",
+    "node_values",
     "secret_values",
     "secrets",
 ];
+
+/// What `${node.NAME}` in an [env] value can name, substituted by the agent
+/// with its own node's value at container start.
+pub const NODE_VALUES: &[&str] = &["advertise_ip", "class", "hostname", "id"];
 
 /// What a service's workloads do when their process exits.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -336,16 +341,32 @@ pub fn interpolate_secrets<'a>(
     value: &str,
     lookup: impl Fn(&str) -> Option<&'a str>,
 ) -> Result<String, String> {
+    interpolate(value, "${secret:", "secret", lookup)
+}
+
+/// Replace each `${node.NAME}` in `value` with `lookup(NAME)` (see
+/// `NODE_VALUES`). An unclosed reference or an unknown name is an error.
+pub fn interpolate_node<'a>(
+    value: &str,
+    lookup: impl Fn(&str) -> Option<&'a str>,
+) -> Result<String, String> {
+    interpolate(value, "${node.", "node value", lookup)
+}
+
+fn interpolate<'a>(
+    value: &str,
+    open: &str,
+    what: &str,
+    lookup: impl Fn(&str) -> Option<&'a str>,
+) -> Result<String, String> {
     let mut out = String::with_capacity(value.len());
     let mut rest = value;
-    while let Some(i) = rest.find("${secret:") {
+    while let Some(i) = rest.find(open) {
         out.push_str(&rest[..i]);
-        let after = &rest[i + "${secret:".len()..];
-        let j = after
-            .find('}')
-            .ok_or_else(|| "unclosed ${secret:".to_string())?;
+        let after = &rest[i + open.len()..];
+        let j = after.find('}').ok_or_else(|| format!("unclosed {open}"))?;
         let name = &after[..j];
-        out.push_str(lookup(name).ok_or_else(|| format!("no secret {name:?}"))?);
+        out.push_str(lookup(name).ok_or_else(|| format!("no {what} {name:?}"))?);
         rest = &after[j + 1..];
     }
     out.push_str(rest);
@@ -370,6 +391,9 @@ impl ServiceSpec {
         }
         if self.env.values().any(|v| v.contains("${secret:")) {
             f.push("secret_values");
+        }
+        if self.env.values().any(|v| v.contains("${node.")) {
+            f.push("node_values");
         }
         if self.service_type == ServiceType::Batch {
             f.push("batch");
@@ -600,5 +624,30 @@ mod tests {
         assert!(b.canonical_json().contains("\"type\":\"batch\""));
         assert!(!a.same_replacement_fields(&b));
         assert_eq!(b.required_features(), vec!["batch"]);
+    }
+
+    #[test]
+    fn node_values_in_env() {
+        let look = |n: &str| match n {
+            "advertise_ip" => Some("10.0.0.5"),
+            "id" => Some("n-1"),
+            _ => None,
+        };
+        assert_eq!(
+            interpolate_node("http://${node.advertise_ip}:4000/x?n=${node.id}", look).unwrap(),
+            "http://10.0.0.5:4000/x?n=n-1"
+        );
+        assert!(interpolate_node("${node.nope}", look)
+            .unwrap_err()
+            .contains("nope"));
+        assert!(interpolate_node("${node.id", look).is_err());
+        // Secrets and node values don't see each other's syntax.
+        assert_eq!(
+            interpolate_node("${secret:X}", look).unwrap(),
+            "${secret:X}"
+        );
+        let mut s = spec();
+        s.env.insert("A".into(), "${node.id}".into());
+        assert_eq!(s.required_features(), vec!["node_values"]);
     }
 }

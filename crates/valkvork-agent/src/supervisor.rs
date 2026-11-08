@@ -159,6 +159,10 @@ pub struct SupervisorConfig {
     /// The address reported to the controller; ports with
     /// `host_ip = "advertise"` are published on it.
     pub advertise_ip: String,
+    /// This node's id, class and hostname, for `${node.NAME}` in [env].
+    pub node_id: String,
+    pub node_class: String,
+    pub hostname: String,
     /// Resolves [secrets] references at container start.
     pub secrets: Arc<SecretResolver>,
 }
@@ -443,7 +447,26 @@ impl Supervisor {
             secret_env.push((name.clone(), value));
         }
 
-        let auth = crate::runtime::registry_credentials(&self.cfg.registry_auth_file, &cmd.image);
+        let mut auth =
+            crate::runtime::registry_credentials(&self.cfg.registry_auth_file, &cmd.image);
+        // Amazon ECR: a short-lived login from the node's role, when agent.toml's
+        // registry_auth_file has nothing for the registry.
+        let registry = crate::runtime::image_registry(&cmd.image);
+        if auth.is_none() {
+            if let Some(region) = crate::secrets::ecr_region(&registry) {
+                let password = self
+                    .cfg
+                    .secrets
+                    .ecr_password(&registry, region)
+                    .await
+                    .map_err(|e| ("IMAGE_PULL_FAILED".to_string(), format!("ECR login: {e}")))?;
+                auth = Some(crate::runtime::RegistryCredentials {
+                    username: "AWS".into(),
+                    password,
+                    server: registry.clone(),
+                });
+            }
+        }
         self.rt.pull(&cmd.image, auth).await.map_err(|e| match e {
             RuntimeError::Unavailable(d) => ("RUNTIME_UNAVAILABLE".to_string(), d),
             other => ("IMAGE_PULL_FAILED".to_string(), other.to_string()),
@@ -478,6 +501,23 @@ impl Supervisor {
         // the secret in it exists only in the container's environment.
         let mut env: Vec<(String, String)> = Vec::with_capacity(cmd.env.len());
         for (k, v) in &cmd.env {
+            let node_value = |name: &str| match name {
+                "advertise_ip" => Some(self.cfg.advertise_ip.as_str()).filter(|v| !v.is_empty()),
+                "id" => Some(self.cfg.node_id.as_str()),
+                "class" => Some(self.cfg.node_class.as_str()),
+                "hostname" => Some(self.cfg.hostname.as_str()),
+                _ => None,
+            };
+            let v = &if v.contains("${node.") {
+                valkvork_common::models::interpolate_node(v, node_value).map_err(|e| {
+                    (
+                        format!("NODE_VALUE_UNAVAILABLE: {k}: {e}"),
+                        format!("env {k}: {e}"),
+                    )
+                })?
+            } else {
+                v.clone()
+            };
             let value = if v.contains("${secret:") {
                 valkvork_common::models::interpolate_secrets(v, |name| {
                     secret_env
