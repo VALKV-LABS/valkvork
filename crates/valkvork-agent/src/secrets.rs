@@ -5,9 +5,11 @@
 //! variables. Values are never logged, stored or reported back. Errors name
 //! the reference and the cause, never a value.
 
+use std::collections::HashMap;
 use std::path::Path;
 use std::process::Stdio;
-use std::time::Duration;
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::OnceCell;
 use valkvork_common::config::SecretsConfig;
@@ -21,6 +23,26 @@ pub struct SecretResolver {
     /// `cfg.aws_region`, or the instance's region from the metadata service,
     /// looked up once.
     region: OnceCell<Option<String>>,
+    /// ECR registry -> (password, fetched at). Tokens last 12 h; reused for 6.
+    ecr: Mutex<HashMap<String, (String, Instant)>>,
+}
+
+/// How long an ECR login is reused (they are valid for 12 hours).
+const ECR_REUSE: Duration = Duration::from_secs(6 * 3600);
+
+/// The region of an Amazon ECR registry host
+/// (`<account>.dkr.ecr.<region>.amazonaws.com`), or None for any other.
+pub fn ecr_region(registry: &str) -> Option<&str> {
+    let mut parts = registry.split('.');
+    let (account, dkr, ecr, region) = (parts.next()?, parts.next()?, parts.next()?, parts.next()?);
+    let rest: Vec<&str> = parts.collect();
+    let ok = account.len() == 12
+        && account.bytes().all(|b| b.is_ascii_digit())
+        && dkr == "dkr"
+        && ecr == "ecr"
+        && !region.is_empty()
+        && (rest == ["amazonaws", "com"] || rest == ["amazonaws", "com", "cn"]);
+    ok.then_some(region)
 }
 
 impl SecretResolver {
@@ -29,7 +51,28 @@ impl SecretResolver {
             cfg,
             imds: IMDS.to_string(),
             region: OnceCell::new(),
+            ecr: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// A Docker login password for an ECR registry, from
+    /// `aws ecr get-login-password` with the node's role (needs
+    /// ecr:GetAuthorizationToken), reused for 6 hours.
+    pub async fn ecr_password(&self, registry: &str, region: &str) -> Result<String, String> {
+        if let Some((p, at)) = self.ecr.lock().unwrap().get(registry) {
+            if at.elapsed() < ECR_REUSE {
+                return Ok(p.clone());
+            }
+        }
+        let password = self
+            .aws(&["ecr", "get-login-password", "--region", region], None)
+            .await?;
+        self.ecr
+            .lock()
+            .unwrap()
+            .insert(registry.to_string(), (password.clone(), Instant::now()));
+        tracing::info!(registry, "ECR login from the node's role");
+        Ok(password)
     }
 
     /// The region for ssm: references. Unset in agent.toml: this instance's
@@ -88,20 +131,30 @@ impl SecretResolver {
     }
 
     async fn ssm(&self, param: &str) -> Result<String, String> {
+        let region = self.region().await;
+        self.aws(
+            &[
+                "ssm",
+                "get-parameter",
+                "--with-decryption",
+                "--name",
+                param,
+                "--query",
+                "Parameter.Value",
+                "--output",
+                "text",
+            ],
+            region.as_deref(),
+        )
+        .await
+    }
+
+    /// Run the AWS CLI; its output with one trailing newline dropped.
+    async fn aws(&self, args: &[&str], region: Option<&str>) -> Result<String, String> {
         let mut cmd = tokio::process::Command::new(&self.cfg.aws_cli);
-        cmd.args([
-            "ssm",
-            "get-parameter",
-            "--with-decryption",
-            "--name",
-            param,
-            "--query",
-            "Parameter.Value",
-            "--output",
-            "text",
-        ]);
-        if let Some(region) = self.region().await {
-            cmd.args(["--region", &region]);
+        cmd.args(args);
+        if let Some(region) = region {
+            cmd.args(["--region", region]);
         }
         cmd.env("AWS_PAGER", "")
             .stdin(Stdio::null())
@@ -315,5 +368,46 @@ mod tests {
                 .unwrap_err();
             assert!(e.contains("allowed directory"), "{}: {e}", bad.display());
         }
+    }
+
+    #[test]
+    fn ecr_registries() {
+        assert_eq!(
+            ecr_region("936356193095.dkr.ecr.us-west-1.amazonaws.com"),
+            Some("us-west-1")
+        );
+        assert_eq!(ecr_region("docker.io"), None);
+        assert_eq!(ecr_region("ghcr.io"), None);
+        assert_eq!(ecr_region("1234.dkr.ecr.us-west-1.amazonaws.com"), None);
+        assert_eq!(ecr_region("936356193095.dkr.ecr.us-west-1.evil.com"), None);
+    }
+
+    /// The ECR password comes from the CLI once and is then reused.
+    #[tokio::test]
+    async fn ecr_login_is_cached() {
+        let d = tempfile::tempdir().unwrap();
+        let cli = d.path().join("aws");
+        let count = d.path().join("count");
+        std::fs::write(
+            &cli,
+            format!(
+                "#!/bin/sh\necho \"$@\" >> {count}\n[ \"$1 $2\" = \"ecr get-login-password\" ] && printf 'tok3n\\n' && exit 0\nexit 1\n",
+                count = count.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&cli, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let r = SecretResolver::new(SecretsConfig {
+            aws_cli: cli,
+            aws_region: None,
+            file_dirs: vec![],
+            timeout_seconds: 2,
+        });
+        let reg = "936356193095.dkr.ecr.us-west-1.amazonaws.com";
+        assert_eq!(r.ecr_password(reg, "us-west-1").await.unwrap(), "tok3n");
+        assert_eq!(r.ecr_password(reg, "us-west-1").await.unwrap(), "tok3n");
+        let calls = std::fs::read_to_string(&count).unwrap();
+        assert_eq!(calls.lines().count(), 1, "{calls}");
+        assert!(calls.contains("--region us-west-1"));
     }
 }

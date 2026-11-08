@@ -1312,3 +1312,61 @@ fn batch_service_status_follows_its_run() {
     heartbeat(&mut c, &a, vec![status(&second, WorkloadState::Completed)]);
     assert_eq!(shown(&c, "init"), "COMPLETED");
 }
+
+/// A rolling update whose new workload can only go where the old one is (a
+/// static host port on the only node of its class) stops the old one first
+/// instead of waiting for ever.
+#[test]
+fn rolling_update_with_static_port_on_one_node_stops_first() {
+    let mut c = core();
+    let mut a = register(&mut c, "a");
+    let extra = "[[ports]]\nname = \"http\"\ncontainer_port = 80\nhost_port = 3100\n";
+    apply(&mut c, &manifest("portal", "img:1", 1, extra));
+    a.take();
+    run_all(&mut c, &a);
+    let old = by_status(&c, "portal", WorkloadStatus::Running)[0]
+        .workload_id
+        .clone();
+
+    apply(&mut c, &manifest("portal", "img:2", 1, extra));
+    c.reconcile();
+    c.finish().unwrap();
+    let msgs = a.take();
+    assert!(
+        stops(&msgs).contains(&old),
+        "the old workload is stopped first"
+    );
+    assert_eq!(c.workloads[&old].status, WorkloadStatus::Stopping);
+    // Once its container is gone the port is free and the new one is placed.
+    heartbeat(&mut c, &a, vec![]);
+    assert_eq!(c.workloads[&old].status, WorkloadStatus::Stopped);
+    let starts = a.starts();
+    assert_eq!(starts.len(), 1);
+    assert_eq!(starts[0].image, "img:2");
+}
+
+/// With a second node free, the rolling update still starts the new
+/// workload first.
+#[test]
+fn rolling_update_with_room_elsewhere_starts_new_first() {
+    let mut c = core();
+    let mut a = register(&mut c, "a");
+    let mut b = register(&mut c, "b");
+    let extra = "[[ports]]\nname = \"http\"\ncontainer_port = 80\nhost_port = 3100\n";
+    apply(&mut c, &manifest("portal", "img:1", 1, extra));
+    a.take();
+    b.take();
+    run_all(&mut c, &a);
+    run_all(&mut c, &b);
+    let old = by_status(&c, "portal", WorkloadStatus::Running)[0]
+        .workload_id
+        .clone();
+    apply(&mut c, &manifest("portal", "img:2", 1, extra));
+    c.reconcile();
+    c.finish().unwrap();
+    assert_eq!(
+        c.workloads[&old].status,
+        WorkloadStatus::Running,
+        "kept until the new one is healthy"
+    );
+}

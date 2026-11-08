@@ -182,6 +182,20 @@ impl Core {
             })
             .collect();
 
+        // A replacement that can only be placed once its original is gone (a
+        // static host port, or a volume, on the only eligible node) would
+        // wait for ever: the original is stopped first instead, as in a
+        // stop-first update. Checked against a snapshot without it.
+        let spec = svc.spec.clone();
+        let blocked_by = |old: &str| -> bool {
+            if self.snapshot().place(&spec).is_ok() {
+                return false;
+            }
+            let mut without = HashSet::new();
+            without.insert(old.to_string());
+            self.snapshot_excluding(&without).place(&spec).is_ok()
+        };
+        let mut stop_first_ids: Vec<String> = Vec::new();
         let mut to_stop = Vec::new();
         let mut in_flight = 0usize;
         let mut need_replacement = Vec::new();
@@ -196,6 +210,9 @@ impl Core {
                     if healthy {
                         to_stop.push(old.workload_id.clone());
                     } else {
+                        if new.status == WorkloadStatus::Pending && blocked_by(&old.workload_id) {
+                            stop_first_ids.push(old.workload_id.clone());
+                        }
                         in_flight += 1;
                     }
                 }
@@ -226,6 +243,33 @@ impl Core {
         }
         for wid in cancelled {
             self.stop_workload(&wid, "MIGRATION_CANCELLED");
+        }
+        for old in stop_first_ids {
+            let first = self
+                .svc_rt
+                .entry(service_id.to_string())
+                .or_default()
+                .move_blocked
+                .insert(format!("stop-first:{old}"));
+            if first {
+                self.event(
+                    EventKind::Deploy,
+                    SubjectType::Workload,
+                    &old,
+                    format!("{service_id}: its replacement can only run where {old} is (a static host port or a volume on the only eligible node), so {old} is stopped first"),
+                    CONTROLLER,
+                );
+            }
+            let reason = if self
+                .workloads
+                .get(&old)
+                .is_some_and(|w| w.service_version < version)
+            {
+                "ROLLED_OUT"
+            } else {
+                "DRAINED"
+            };
+            self.stop_workload(&old, reason);
         }
         for old in to_stop {
             self.stop_workload(
