@@ -97,6 +97,7 @@ dist:  ## Static musl binaries into dist/ (PLATFORM=linux/amd64 to cross-build)
 e2e: dist  ## End-to-end test against your Docker: Postgres with secrets, bind address, check (~2 min)
 	docker run --rm --network host -v /var/run/docker.sock:/var/run/docker.sock \
 	  -v /var/tmp/vk-e2e:/var/tmp/vk-e2e -v "$(CURDIR)/dist:/dist:ro" \
+	  -v "$(CURDIR)/examples:/examples:ro" \
 	  -v "$(CURDIR)/scripts/e2e-docker.sh:/e2e.sh:ro" docker:27-cli sh /e2e.sh
 
 image:  ## Controller and agent images (valkvork-controller:dev, valkvork-agent:dev)

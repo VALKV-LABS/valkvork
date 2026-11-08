@@ -448,7 +448,7 @@ impl Core {
                 && spec
                     .volumes
                     .iter()
-                    .all(|v| n.host_volumes.contains(&v.source))
+                    .all(|v| !v.is_host() || n.host_volumes.contains(&v.source))
         });
         (!fits).then(|| {
             let class = spec.required_class.as_deref().unwrap_or("any");

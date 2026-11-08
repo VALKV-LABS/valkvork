@@ -11,7 +11,7 @@
 # directory; folders shared from macOS cannot be chowned). Each run uses a new
 # run-<time> directory there. It uses ports 50061, 50062, 9410, 9411, 15432
 # and 18080 on the Docker host and the service ids global-pg, bad-secret,
-# web-check, pg-init and pg-fail, so do not run it next to a dev cluster with
+# web-check, pg-init, pg-fail and cache-demo, so do not run it next to a dev cluster with
 # those services.
 set -eu
 W=/var/tmp/vk-e2e/run-$(date +%s)
@@ -21,7 +21,7 @@ pass() { echo "PASS: $*"; }
 
 # Remove this test's containers however it ends.
 cleanup() {
-  for svc in global-pg bad-secret web-check pg-init pg-fail; do
+  for svc in global-pg bad-secret web-check pg-init pg-fail cache-demo; do
     for c in $(docker ps -aq --filter "label=valkvork.service_id=$svc"); do
       docker stop "$c" >/dev/null 2>&1 || true
       docker rm "$c" >/dev/null 2>&1 || true
@@ -333,6 +333,27 @@ vk workloads | grep pg-fail | grep -q 'FAILED' || fail "a failing batch job did 
 vk workloads | grep pg-fail | grep -E 'FAILED +- +1 ' >/dev/null || fail "it was not restarted once under its policy first"
 pass "a batch job exiting 3 is restarted under its policy, then FAILED (and retried by the controller)"
 vk delete service pg-fail >/dev/null
+
+# ── an ephemeral volume (examples/ephemeral-volume.toml) ────────────────────
+cp /examples/ephemeral-volume.toml "$W/cache.toml"
+vk apply -f "$W/cache.toml" >/dev/null
+for _ in $(seq 60); do [ "$(vk workloads 2>/dev/null | grep -c 'cache-demo.*RUNNING')" = 2 ] && break; sleep 1; done
+[ "$(vk workloads | grep -c 'cache-demo.*RUNNING')" = 2 ] || { tail -20 "$W/agent.log"; fail "cache-demo did not run 2 replicas"; }
+CIDS="$(docker ps -q --filter label=valkvork.service_id=cache-demo)"
+for c in $CIDS; do
+  WID="$(docker inspect -f '{{index .Config.Labels "valkvork.workload_id"}}' "$c")"
+  SRC="$(docker inspect -f '{{range .Mounts}}{{if eq .Destination "/var/cache/nginx"}}{{.Source}}{{end}}{{end}}' "$c")"
+  [ "$SRC" = "$W/data/volumes/$WID/nginx-cache" ] || fail "mounted from $SRC"
+  docker exec "$c" sh -c 'echo hi > /var/cache/nginx/probe'
+  [ -f "$SRC/probe" ] || fail "a write in the container is not in $SRC"
+done
+[ "$(ls "$W/data/volumes" | wc -l)" -ge 2 ] || fail "not one directory per workload"
+pass "ephemeral volume: one directory per workload, mounted at its target, writable (nginx's own cache dirs: $(ls "$SRC" | tr '\n' ' '))"
+vk delete service cache-demo >/dev/null
+for _ in $(seq 30); do [ -z "$(docker ps -aq --filter label=valkvork.service_id=cache-demo)" ] && break; sleep 1; done
+sleep 1
+[ -z "$(ls "$W/data/volumes" 2>/dev/null)" ] || fail "ephemeral volume directories left behind: $(ls "$W/data/volumes")"
+pass "ephemeral volumes are deleted with their workloads"
 
 vk delete service global-pg >/dev/null
 for _ in $(seq 30); do [ -z "$(docker ps -aq --filter label=valkvork.service_id=global-pg)" ] && break; sleep 1; done

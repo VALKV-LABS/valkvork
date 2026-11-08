@@ -832,3 +832,45 @@ async fn secret_inside_a_value() {
         "{env:?}"
     );
 }
+
+/// An ephemeral volume is a fresh directory per workload, mounted at its
+/// target, and removed with the workload.
+#[tokio::test]
+async fn ephemeral_volume_lives_with_the_workload() {
+    let d = tempfile::tempdir().unwrap();
+    let rt = Fake::new();
+    let s = supervisor(rt.clone(), d.path());
+    let mut cmd = start_cmd("w1", 3);
+    cmd.volumes = vec![pb::VolumeMount {
+        r#type: "ephemeral".into(),
+        source: "cache".into(),
+        target: "/var/cache/app".into(),
+        read_only: false,
+    }];
+    s.start(cmd).await.unwrap();
+    settle().await;
+    let dir = d.path().join("volumes").join("w1").join("cache");
+    assert!(dir.is_dir());
+    let mount = rt
+        .last_created()
+        .mounts
+        .into_iter()
+        .find(|m| m.target == "/var/cache/app")
+        .expect("mounted at its target");
+    assert_eq!(mount.source, dir);
+    assert!(!mount.read_only);
+    std::fs::write(dir.join("f"), "x").unwrap();
+
+    s.stop(pb::StopWorkload {
+        workload_id: "w1".into(),
+        kill_timeout_seconds: 1,
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+    settle().await;
+    assert!(
+        !d.path().join("volumes").join("w1").exists(),
+        "removed with the workload"
+    );
+}

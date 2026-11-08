@@ -51,7 +51,7 @@ The container gets:
 | Entrypoint, command | The manifest's `entrypoint` and `command`, or the image's |
 | Environment | The manifest's `[env]`, the resolved `[secrets]`, plus `VALKVORK_WORKLOAD_ID` and `VALKVORK_SERVICE_ID` |
 | Ports | `PortBindings` for each `[[ports]]` entry, TCP, on its `host_ip` (`"advertise"` becomes the node's address; unset: every address) |
-| Mounts | `/alloc` → the alloc directory, plus one bind mount per volume |
+| Mounts | `/alloc` → the alloc directory, plus one bind mount per volume: a host volume's declared path, or an ephemeral volume's `<data_dir>/volumes/<workload_id>/<source>`, created empty and mode `1777` like `/alloc` |
 | Restart policy | `no`: the agent owns restarts |
 | Privileged | never |
 | Labels | `valkvork.workload_id`, `valkvork.service_id`, `valkvork.service_version`, `valkvork.restart` (`attempts/interval/delay`), `valkvork.kill_timeout`, `valkvork.disk_bytes`, and `valkvork.check` when it has a health check |
@@ -65,7 +65,8 @@ A host volume is mounted read-only if either the manifest or `agent.toml` says s
 ```
 StopWorkload
   mark stopping, ack, then: stop with the kill timeout (SIGTERM, wait, SIGKILL),
-  remove the container, delete its alloc directory and failed marker, forget it
+  remove the container, delete its alloc and ephemeral volume directories and its
+  failed marker, forget it
 ```
 
 A stop that arrives while the start is still pulling is finished as soon as the start returns. If removing the container fails, the entry is kept, so the controller keeps seeing it and asks again.
@@ -118,7 +119,7 @@ The event stream is the primary signal. Every 10 s, and each time the stream rec
 
 ## Ephemeral Disk
 
-Each workload's disk use is the size of its alloc directory, measured every 10 s, plus its writable layer (`SizeRw`), measured every 60 s because the call is expensive. When the total exceeds the manifest's `disk` (default 1 GiB), the workload becomes FAILED with `EPHEMERAL_DISK_EXCEEDED` and its container is stopped. The restart policy does not apply (FR-AGE-08).
+Each workload's disk use is the size of its alloc directory and its ephemeral volumes, measured every 10 s, plus its writable layer (`SizeRw`), measured every 60 s because the call is expensive. When the total exceeds the manifest's `disk` (default 1 GiB), the workload becomes FAILED with `EPHEMERAL_DISK_EXCEEDED` and its container is stopped. The restart policy does not apply (FR-AGE-08).
 
 This is a polling check, so there is a soft margin. Container logs live under Docker's data root and are bounded by Docker's log rotation, not by `disk`.
 

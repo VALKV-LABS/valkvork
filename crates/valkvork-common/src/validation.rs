@@ -346,8 +346,31 @@ fn canonicalise(raw: RawManifest, out: &mut Vec<ValidationError>) -> Option<Serv
         }
     };
 
-    // VE-07: sharing rules only apply to writable volumes.
+    // VE-07: sharing rules only apply to writable host volumes.
     for (i, v) in raw.volumes.iter().enumerate() {
+        if v.kind == "ephemeral" {
+            for (set, field, why) in [
+                (
+                    v.read_only,
+                    "read_only",
+                    "an ephemeral volume starts empty, so read_only would leave it unusable",
+                ),
+                (
+                    v.single_writer.is_some(),
+                    "single_writer",
+                    "an ephemeral volume belongs to one workload; there is nothing to share",
+                ),
+            ] {
+                if set {
+                    out.push(ValidationError::new(
+                        Code::InvalidVolumeSpec,
+                        &format!("volumes[{i}].{field}"),
+                        why,
+                    ));
+                }
+            }
+            continue;
+        }
         if v.read_only && v.single_writer == Some(true) {
             out.push(ValidationError::new(
                 Code::InvalidVolumeSpec,
@@ -732,14 +755,36 @@ fn validate_service_spec_into(spec: &ServiceSpec, out: &mut Vec<ValidationError>
     // VE-07
     let mut targets = HashSet::new();
     for (i, v) in spec.volumes.iter().enumerate() {
-        if v.kind != "host" {
+        if v.kind != "host" && v.kind != "ephemeral" {
             out.push(ValidationError::new(
                 Code::InvalidVolumeSpec,
                 &format!("volumes[{i}].type"),
                 &format!(
-                    "unknown volume type {:?}; only \"host\" is supported",
+                    "unknown volume type {:?}; use \"host\" or \"ephemeral\"",
                     v.kind
                 ),
+            ));
+        }
+        // An ephemeral volume's source names its directory on the node.
+        if v.kind == "ephemeral"
+            && !v.source.is_empty()
+            && !(v.source.len() <= 63
+                && v.source.bytes().all(|b| {
+                    b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-' || b == b'_'
+                })
+                && !v.source.starts_with(['-', '_']))
+        {
+            out.push(ValidationError::new(
+                Code::InvalidVolumeSpec,
+                &format!("volumes[{i}].source"),
+                "an ephemeral volume's source is a name: lowercase letters, digits, - and _, up to 63",
+            ));
+        }
+        if v.target == "/alloc" || v.target.starts_with("/alloc/") {
+            out.push(ValidationError::new(
+                Code::InvalidVolumeSpec,
+                &format!("volumes[{i}].target"),
+                "/alloc is the workload's own scratch directory; mount elsewhere",
             ));
         }
         if v.source.is_empty() {
@@ -1163,6 +1208,53 @@ target_cpu_percent = 75
         assert_eq!(
             err_code(&unclosed),
             (Code::InvalidSecretRef, "env.URL".into())
+        );
+    }
+
+    #[test]
+    fn ephemeral_volumes() {
+        let with = |v: &str| format!("{VALID}\n[[volumes]]\ntype = \"ephemeral\"\n{v}");
+        let ok =
+            parse_manifest_str(&with("source = \"cache\"\ntarget = \"/var/cache/app\"\n")).unwrap();
+        let v = &ok.spec.volumes[0];
+        assert!(
+            !v.is_host() && !v.single_writer(),
+            "per workload: nothing to share"
+        );
+        assert!(
+            !ok.spec.stop_first(),
+            "no stop-first update for an ephemeral volume"
+        );
+        assert!(ok.spec.required_features().contains(&"ephemeral_volumes"));
+        for (extra, field) in [
+            (
+                "source = \"cache\"\ntarget = \"/c\"\nread_only = true\n",
+                "volumes[0].read_only",
+            ),
+            (
+                "source = \"cache\"\ntarget = \"/c\"\nsingle_writer = false\n",
+                "volumes[0].single_writer",
+            ),
+            (
+                "source = \"../etc\"\ntarget = \"/c\"\n",
+                "volumes[0].source",
+            ),
+            (
+                "source = \"cache\"\ntarget = \"/alloc/x\"\n",
+                "volumes[0].target",
+            ),
+        ] {
+            assert_eq!(
+                err_code(&with(extra)),
+                (Code::InvalidVolumeSpec, field.into()),
+                "{extra}"
+            );
+        }
+        let odd =
+            format!("{VALID}\n[[volumes]]\ntype = \"tmpfs\"\nsource = \"x\"\ntarget = \"/x\"\n");
+        assert_eq!(
+            err_code(&odd),
+            (Code::InvalidVolumeSpec, "volumes[0].type".into())
         );
     }
 }

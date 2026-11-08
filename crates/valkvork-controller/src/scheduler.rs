@@ -113,7 +113,7 @@ impl Snapshot {
             // are reserved even for workloads that are stopping.
             n.used_ports.extend(spec.ports.iter().map(|p| p.host_port));
             // Likewise the directory is in use until the container is gone.
-            for v in &spec.volumes {
+            for v in spec.volumes.iter().filter(|v| v.is_host()) {
                 let u = n.volume_users.entry(v.source.clone()).or_default();
                 u.0 += v.single_writer() as u32;
                 u.1 += 1;
@@ -171,7 +171,7 @@ impl Snapshot {
             if let Some(v) = spec
                 .volumes
                 .iter()
-                .find(|v| !n.host_volumes.contains(&v.source))
+                .find(|v| v.is_host() && !n.host_volumes.contains(&v.source))
             {
                 rej.volume = Some(v.source.clone());
                 rej.volume_count += 1;
@@ -179,7 +179,7 @@ impl Snapshot {
             }
             // A single-writer volume admits no other user; a shared one
             // admits no single-writer user.
-            if let Some(v) = spec.volumes.iter().find(|v| {
+            if let Some(v) = spec.volumes.iter().filter(|v| v.is_host()).find(|v| {
                 let (single, all) = n.volume_users.get(&v.source).copied().unwrap_or_default();
                 if v.single_writer() {
                     all > 0
@@ -413,6 +413,27 @@ mod tests {
         assert_eq!(
             s.place(&spec(1, 4)).unwrap_err(),
             "NO_NODE: no healthy, non-draining nodes"
+        );
+    }
+
+    /// An ephemeral volume needs nothing from the node and blocks no one.
+    #[test]
+    fn ephemeral_volume_places_anywhere() {
+        let mut s = snap(&[("a", "general", 4000, 4096)]);
+        let mut v = spec(10, 10);
+        v.volumes.push(VolumeSpec {
+            kind: "ephemeral".into(),
+            source: "cache".into(),
+            target: "/c".into(),
+            read_only: false,
+            shared: false,
+        });
+        assert_eq!(s.place(&v).unwrap(), "a");
+        s.reserve("a", &v, true);
+        assert_eq!(
+            s.place(&v).unwrap(),
+            "a",
+            "a second replica on the same node"
         );
     }
 }

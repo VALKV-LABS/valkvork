@@ -19,7 +19,7 @@ For each pass, the core builds a `Snapshot` with one `NodeCapacity` per node:
 | Host volume users | For each volume, how many non-terminal, non-LOST workloads on the node mount it, and how many of those mounts are single-writer. STOPPING ones count, because the directory is in use until the container is gone |
 | Workloads per service | For the tie-break |
 | Healthy, draining | Node status and flag |
-| Agent features | The manifest features the node's agent listed in its Register (`batch`, `command`, `health_checks`, `host_ip`, `secret_values`, `secrets`) |
+| Agent features | The manifest features the node's agent listed in its Register (`batch`, `command`, `ephemeral_volumes`, `health_checks`, `host_ip`, `secret_values`, `secrets`) |
 
 Each placement calls `Snapshot::reserve`, so placements within one pass account for each other.
 
@@ -32,7 +32,7 @@ A node is eligible only if all of these hold:
 3. its agent supports every manifest feature the spec uses (`command`/`entrypoint`, `[check]`, a port's `host_ip`, `[secrets]`). Protobuf ignores fields a receiver does not know, so an older agent would otherwise start the container without them; the workload waits instead, with `agent lacks secrets (upgrade it) on 1`;
 4. free CPU and free memory cover the request;
 5. none of the manifest's static `host_port`s is in use on it;
-6. it advertises every host volume the manifest mounts;
+6. it advertises every host volume the manifest mounts (ephemeral volumes need nothing from the node);
 7. no single-writer volume the manifest mounts has another user on the node, and no shared volume it mounts has a single-writer user.
 
 ## Score

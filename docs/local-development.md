@@ -131,6 +131,7 @@ make e2e         # end-to-end against your Docker, about 2 minutes
 - an agent restart adopts the container and its check passes again;
 - an `http` check that keeps failing restarts the container, then fails it;
 - a batch job connecting through a `${secret:...}` URL completes, is not shown the password, and runs again when re-applied;
-- a batch job that exits non-zero is restarted under its policy, then fails.
+- a batch job that exits non-zero is restarted under its policy, then fails;
+- `examples/ephemeral-volume.toml`: each replica gets its own directory, mounted at its target and writable, deleted with the workload.
 
 It works in `/var/tmp/vk-e2e` on the Docker host, and cleans up its containers.

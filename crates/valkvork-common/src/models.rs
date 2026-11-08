@@ -197,10 +197,17 @@ pub struct VolumeSpec {
 }
 
 impl VolumeSpec {
+    /// A directory the node declares (`[host_volumes.<name>]`): the
+    /// scheduler places the workload only where it exists.
+    pub fn is_host(&self) -> bool {
+        self.kind == "host"
+    }
+
     /// Only one live workload may use the directory at a time: writable
     /// host volumes are single-writer unless declared `single_writer = false`.
+    /// An ephemeral volume belongs to one workload, so never.
     pub fn single_writer(&self) -> bool {
-        !self.read_only && !self.shared
+        self.is_host() && !self.read_only && !self.shared
     }
 }
 
@@ -276,6 +283,7 @@ pub struct ServiceSpec {
 pub const AGENT_FEATURES: &[&str] = &[
     "batch",
     "command",
+    "ephemeral_volumes",
     "health_checks",
     "host_ip",
     "secret_values",
@@ -365,6 +373,9 @@ impl ServiceSpec {
         }
         if self.service_type == ServiceType::Batch {
             f.push("batch");
+        }
+        if self.volumes.iter().any(|v| v.kind == "ephemeral") {
+            f.push("ephemeral_volumes");
         }
         f
     }

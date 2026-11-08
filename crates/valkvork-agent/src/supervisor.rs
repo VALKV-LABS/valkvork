@@ -182,6 +182,13 @@ impl Supervisor {
         self.cfg.data_dir.join("alloc").join(wid)
     }
 
+    /// A workload's ephemeral volumes, `<data_dir>/volumes/<wid>/<name>`:
+    /// next to its alloc directory, counted against the same disk limit and
+    /// removed with it.
+    fn volumes_dir(&self, wid: &str) -> PathBuf {
+        self.cfg.data_dir.join("volumes").join(wid)
+    }
+
     /// Marker that survives agent restarts so a FAILED container is not
     /// restarted on adoption.
     fn failed_marker(&self, wid: &str) -> PathBuf {
@@ -389,6 +396,18 @@ impl Supervisor {
             read_only: false,
         }];
         for v in &cmd.volumes {
+            if v.r#type == "ephemeral" {
+                let dir = self.volumes_dir(wid).join(&v.source);
+                std::fs::create_dir_all(&dir)
+                    .and_then(|()| make_alloc_writable(&dir))
+                    .map_err(|e| ("VOLUME_DIR_FAILED".to_string(), e.to_string()))?;
+                mounts.push(BindMount {
+                    source: dir,
+                    target: v.target.clone(),
+                    read_only: false,
+                });
+                continue;
+            }
             let hv = self.cfg.host_volumes.get(&v.source).ok_or_else(|| {
                 (
                     "HOST_VOLUME_NOT_FOUND".to_string(),
@@ -657,6 +676,7 @@ impl Supervisor {
             return;
         }
         let _ = std::fs::remove_dir_all(self.alloc_dir(wid));
+        let _ = std::fs::remove_dir_all(self.volumes_dir(wid));
         let _ = std::fs::remove_file(self.failed_marker(wid));
         self.workloads.lock().unwrap().remove(wid);
         tracing::info!(workload = wid, "workload stopped and removed");
@@ -863,7 +883,7 @@ impl Supervisor {
                 .map(|(w, l)| (w.clone(), l.container_id.clone()))
                 .collect();
             for (wid, cid) in running {
-                let alloc = dir_size(&self.alloc_dir(&wid));
+                let alloc = dir_size(&self.alloc_dir(&wid)) + dir_size(&self.volumes_dir(&wid));
                 let rw = match (&cid, check_rw) {
                     (Some(cid), true) => self.rt.writable_layer_size(cid).await.ok(),
                     _ => None,

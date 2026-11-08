@@ -39,7 +39,7 @@ host_port      = 8080          # static host port: one replica per node
                                # Unset: every address (0.0.0.0)
 
 [[volumes]]
-type      = "host"             # only "host" in this release
+type      = "host"             # "host" (a node's directory) or "ephemeral" (the workload's own)
 source    = "pgdata"           # a [host_volumes.<name>] entry in agent.toml
 target    = "/var/lib/postgresql/data"
 read_only = false
@@ -99,6 +99,15 @@ With `[check]`, the agent probes the workload through one of its published ports
 
 The check needs a published port; there are no exec checks yet. A `tcp` check only proves the port accepts connections: the kernel accepts them for a listening socket even while the process is frozen or hung, so it detects a process that exited or stopped listening, not one that stopped answering. Use `http` where the service has an endpoint.
 
+### Volumes
+
+| `type` | What it is | Placement | Lifetime |
+|---|---|---|---|
+| `host` | A directory the node declares in agent.toml (`[host_volumes.<name>]`) | Only nodes that declare `source`. Writable ones are single-writer by default: one live workload, stop-first updates | The node's: survives the workload |
+| `ephemeral` | An empty directory of the workload's own, `<data_dir>/volumes/<workload_id>/<source>` | Any node; never shared, so no single-writer rule | The workload's: kept across in-place restarts, deleted when the workload stops |
+
+An ephemeral volume counts against `[resources] disk` together with `/alloc`, and starts empty: the image's files at `target` are not copied in, unlike a Docker named volume. `source` is its name (lowercase letters, digits, `-`, `_`); `read_only` and `single_writer` don't apply. It needs an agent with the `ephemeral_volumes` feature. No volume may be mounted at `/alloc`, which is always the workload's scratch directory. See `examples/ephemeral-volume.toml`.
+
 ### Batch Jobs
 
 `type = "batch"` runs each of `replicas` workloads to completion, for one-off work such as creating databases or running migrations.
@@ -152,7 +161,7 @@ Validation runs before any database write. A failure writes nothing, returns gRP
 | VE-04 | `1 ≤ min_replicas ≤ max_replicas`, `0 < target_cpu_percent < 100` | `INVALID_AUTOSCALE_SPEC` |
 | VE-05 | Ports in 1–65535; `host_port` unique within the manifest; `host_port < 1024` is a **warning**; `host_ip` is an IP address or `"advertise"` | `INVALID_PORT_SPEC` |
 | VE-06 | No unknown keys or tables (`deny_unknown_fields`). The path names the table, e.g. `service.replica` or `ports.hostport` | `UNKNOWN_FIELD` |
-| VE-07 | Each volume has a known `type`, a source, an absolute `target`, and a unique `target` | `INVALID_VOLUME_SPEC` |
+| VE-07 | Each volume has a known `type` (`host` or `ephemeral`), a source, an absolute `target` that is unique and not `/alloc`. An ephemeral volume's source is a name, and it takes no `read_only` or `single_writer` | `INVALID_VOLUME_SPEC` |
 | VE-09 | `check.type` is `tcp` or `http`; `check.port` names a `[[ports]]` entry; `path` only for `http`, starting with `/`; `failures` 1–1000 | `INVALID_CHECK_SPEC` |
 | VE-08 | Each secret's name is an environment variable name not also in `[env]`, and its reference is `ssm:<parameter name>` or `file:<absolute path>`. Every `${secret:NAME}` in an `[env]` value is closed and names a `[secrets]` key | `INVALID_SECRET_REF` |
 | VW-01 | **Warning** at apply or plan: no current healthy node of the class could fit one replica, or none has the host volumes | `UNSATISFIABLE_NOW` |
