@@ -12,6 +12,8 @@ id           = "frontend-web"                        # required; DNS label, immu
 image        = "docker.io/library/nginx:1.27.2-alpine-slim"   # required; OCI reference, digest allowed
 replicas     = 3                                     # required; >= 0
 kill_timeout = "10s"                                 # SIGTERM → SIGKILL grace period
+# entrypoint = ["docker-entrypoint.sh"]              # replaces the image's ENTRYPOINT
+# command    = ["postgres", "-c", "wal_level=logical"]   # replaces the image's CMD, keeps its entrypoint
 
 [resources]
 cpu    = 0.5          # required; cores, rounded up to the nearest millicore
@@ -28,6 +30,8 @@ LOG_LEVEL = "info"             # plaintext: not for secrets
 name           = "http"
 container_port = 80
 host_port      = 8080          # static host port: one replica per node
+# host_ip      = "advertise"   # bind address: an IP, or "advertise" for the node's address.
+                               # Unset: every address (0.0.0.0)
 
 [[volumes]]
 type      = "host"             # only "host" in this release
@@ -55,12 +59,18 @@ delay    = "5s"                # wait before each restart
 | Key | Default |
 |---|---|
 | `service.kill_timeout` | `"10s"` |
+| `service.entrypoint`, `service.command` | the image's `ENTRYPOINT` and `CMD` |
+| `ports.host_ip` | every address (`0.0.0.0`) |
 | `resources.disk` | `"1GiB"` |
 | `constraints.required_class` | none: any node |
 | `update.max_parallel`, `update.min_healthy_time` | `1`, `"10s"` |
 | `restart.attempts`, `restart.interval`, `restart.delay` | `3`, `"5m"`, `"5s"` |
 
 Durations are `<n>s`, `<n>m`, `<n>h`, or a bare number of seconds. Sizes are an integer with an IEC unit, or a bare number of bytes. `examples/` has ready-to-apply manifests.
+
+`command` and `entrypoint` follow Docker Compose: `command` replaces the image's default arguments (`CMD`) and keeps its `ENTRYPOINT`, which is what most images, such as `postgres`, expect. Set `entrypoint` only to replace the program itself.
+
+`host_ip = "advertise"` publishes the port on the address the agent reports to the controller (agent.toml `advertise_ip`, or the address it reaches the controller from). Use it on instances with public IPs, so a port is reachable on the private network only. `host_ip = "127.0.0.1"` keeps a port on the node itself. A port's host address does not change the scheduler's view: a `host_port` is still taken on the node whatever address it binds.
 
 `cpu` is both the scheduler's reservation and a hard limit: `cpu = 0.5` reserves 500 millicores on a node and caps the container at half a core's worth of CPU time across all cores. `memory` likewise is reserved, and the container is OOM-killed above it, with no swap.
 
@@ -70,11 +80,11 @@ Validation runs before any database write. A failure writes nothing, returns gRP
 
 | Rule | Checks | Code |
 |---|---|---|
-| VE-01 | `cpu > 0`, `memory ≥ 4MiB`, `disk > 0`, `replicas ≥ 0`, valid durations and sizes, `max_parallel ≥ 1` | `INVALID_RESOURCE_SPEC` |
+| VE-01 | `cpu > 0`, `memory ≥ 4MiB`, `disk > 0`, `replicas ≥ 0`, valid durations and sizes, `max_parallel ≥ 1`, `entrypoint` and `command` not empty when given | `INVALID_RESOURCE_SPEC` |
 | VE-02 | `image` is a valid OCI reference (`[registry[:port]/]path[:tag][@sha256:digest]`). A missing tag becomes `:latest` with a **warning** | `INVALID_IMAGE_REF` |
 | VE-03 | `service.id` matches `^[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?$` | `INVALID_SERVICE_ID` |
 | VE-04 | `1 ≤ min_replicas ≤ max_replicas`, `0 < target_cpu_percent < 100` | `INVALID_AUTOSCALE_SPEC` |
-| VE-05 | Ports in 1–65535; `host_port` unique within the manifest; `host_port < 1024` is a **warning** | `INVALID_PORT_SPEC` |
+| VE-05 | Ports in 1–65535; `host_port` unique within the manifest; `host_port < 1024` is a **warning**; `host_ip` is an IP address or `"advertise"` | `INVALID_PORT_SPEC` |
 | VE-06 | No unknown keys or tables (`deny_unknown_fields`). The path names the table, e.g. `service.replica` or `ports.hostport` | `UNKNOWN_FIELD` |
 | VE-07 | Each volume has a known `type`, a source, an absolute `target`, and a unique `target` | `INVALID_VOLUME_SPEC` |
 | VW-01 | **Warning** at apply or plan: no current healthy node of the class could fit one replica, or none has the host volumes | `UNSATISFIABLE_NOW` |

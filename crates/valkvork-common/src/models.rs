@@ -169,6 +169,11 @@ pub struct PortSpec {
     pub name: String,
     pub container_port: u16,
     pub host_port: u16,
+    /// Host address to publish on: an IP, or `"advertise"` for the node's
+    /// advertised address. Unset: every address (0.0.0.0). Omitted when unset,
+    /// so specs stored before it existed keep their hash.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_ip: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -199,6 +204,13 @@ impl VolumeSpec {
 pub struct ServiceSpec {
     pub id: String,
     pub image: String,
+    /// Replaces the image's entrypoint. Omitted when unset (stable hashes).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub entrypoint: Option<Vec<String>>,
+    /// Replaces the image's default command (Docker CMD), keeping its
+    /// entrypoint. Omitted when unset (stable hashes).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command: Option<Vec<String>>,
     pub replicas: u32,
     pub kill_timeout_seconds: u32,
     pub cpu_millicores: u32,
@@ -244,6 +256,8 @@ impl ServiceSpec {
     /// True when every replacement-requiring field (spec §3.3) is equal.
     pub fn same_replacement_fields(&self, other: &ServiceSpec) -> bool {
         self.image == other.image
+            && self.entrypoint == other.entrypoint
+            && self.command == other.command
             && self.cpu_millicores == other.cpu_millicores
             && self.memory_bytes == other.memory_bytes
             && self.disk_bytes == other.disk_bytes
@@ -314,6 +328,8 @@ mod tests {
         ServiceSpec {
             id: "web".into(),
             image: "nginx:1.27".into(),
+            entrypoint: None,
+            command: None,
             replicas: 1,
             kill_timeout_seconds: 10,
             cpu_millicores: 500,

@@ -243,6 +243,8 @@ mod tests {
         ServiceSpec {
             id: "svc".into(),
             image: "img:1".into(),
+            entrypoint: None,
+            command: None,
             replicas: 1,
             kill_timeout_seconds: 10,
             cpu_millicores: cpu,
@@ -323,6 +325,7 @@ mod tests {
             name: "http".into(),
             container_port: 80,
             host_port: 8080,
+            host_ip: None,
         });
         s.reserve("a", &p, true);
         s.reserve("b", &p, true);

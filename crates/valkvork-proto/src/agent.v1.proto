@@ -87,12 +87,15 @@ message StartWorkload {
   repeated VolumeMount volumes = 11;
   RestartPolicy restart = 12;
   uint32 kill_timeout_seconds = 13;
+  repeated string entrypoint = 14;     // empty: the image's
+  repeated string command = 15;        // empty: the image's
 }
 
 message PortMapping {
   string name = 1;
   uint32 container_port = 2;
   uint32 host_port = 3;
+  string host_ip = 4;                  // empty: all addresses; "advertise": the node's
 }
 
 message VolumeMount {

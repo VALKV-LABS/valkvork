@@ -111,6 +111,7 @@ async fn run(args: Args) -> Result<(), ValkvorkError> {
             docker_socket: cfg.docker_socket.clone(),
             protected_paths,
             host_volumes: cfg.host_volumes.clone(),
+            advertise_ip: node.ip_address.clone(),
         },
     );
     supervisor

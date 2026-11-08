@@ -17,6 +17,8 @@ struct FakeContainer {
 #[derive(Default)]
 struct FakeState {
     containers: HashMap<String, FakeContainer>,
+    /// Every spec passed to create, in order.
+    created: Vec<ContainerSpec>,
     starts: u32,
     next: u32,
     fail_pull: bool,
@@ -83,6 +85,7 @@ impl ContainerRuntime for Fake {
         if let Some((id, _)) = s.containers.iter().find(|(_, c)| c.name == spec.name) {
             return Ok(id.clone());
         }
+        s.created.push(spec.clone());
         s.next += 1;
         let id = format!("c{}", s.next);
         s.containers.insert(
@@ -171,10 +174,23 @@ impl ContainerRuntime for Fake {
     }
 }
 
+impl Fake {
+    fn last_created(&self) -> ContainerSpec {
+        self.s
+            .lock()
+            .unwrap()
+            .created
+            .last()
+            .cloned()
+            .expect("a container was created")
+    }
+}
+
 fn supervisor(rt: Arc<Fake>, dir: &Path) -> Arc<Supervisor> {
     Supervisor::new(
         rt,
         SupervisorConfig {
+            advertise_ip: "10.0.0.5".into(),
             data_dir: dir.to_path_buf(),
             registry_auth_file: dir.join("none.json"),
             docker_socket: PathBuf::from("/var/run/docker.sock"),
@@ -364,6 +380,7 @@ async fn forbidden_host_volume_is_refused() {
     let s = Supervisor::new(
         rt.clone(),
         SupervisorConfig {
+            advertise_ip: "10.0.0.5".into(),
             data_dir: d.path().to_path_buf(),
             registry_auth_file: d.path().join("none.json"),
             docker_socket: PathBuf::from("/var/run/docker.sock"),
@@ -453,6 +470,7 @@ fn supervisor_with(dir: &Path, vols: Vec<(&str, HostVolume)>) -> Arc<Supervisor>
     Supervisor::new(
         Fake::new(),
         SupervisorConfig {
+            advertise_ip: "10.0.0.5".into(),
             data_dir: dir.to_path_buf(),
             registry_auth_file: dir.join("none.json"),
             docker_socket: PathBuf::from("/var/run/docker.sock"),
@@ -521,4 +539,43 @@ fn host_volume_prepare_refuses_symlinks_and_protected_paths() {
         .prepare_host_volumes()
         .unwrap_err();
     assert!(err.contains("protected"), "{err}");
+}
+
+/// command, entrypoint and each port's bind address reach the runtime;
+/// "advertise" becomes the node's address.
+#[tokio::test]
+async fn passes_command_and_bind_addresses() {
+    let d = tempfile::tempdir().unwrap();
+    let rt = Fake::new();
+    let s = supervisor(rt.clone(), d.path());
+    let mut cmd = start_cmd("w1", 3);
+    cmd.command = vec!["postgres".into(), "-c".into(), "wal_level=logical".into()];
+    cmd.ports = vec![
+        pb::PortMapping {
+            name: "pg".into(),
+            container_port: 5432,
+            host_port: 5432,
+            host_ip: "advertise".into(),
+        },
+        pb::PortMapping {
+            name: "admin".into(),
+            container_port: 9000,
+            host_port: 9000,
+            host_ip: "127.0.0.1".into(),
+        },
+        pb::PortMapping {
+            name: "any".into(),
+            container_port: 80,
+            host_port: 8080,
+            host_ip: String::new(),
+        },
+    ];
+    s.start(cmd).await.unwrap();
+    settle().await;
+    assert_eq!(state_of(&s, "w1").unwrap().0, WorkloadState::Running);
+    let spec = rt.last_created();
+    assert_eq!(spec.command.as_ref().unwrap()[0], "postgres");
+    assert_eq!(spec.entrypoint, None, "unset keeps the image's entrypoint");
+    let ips: Vec<Option<&str>> = spec.ports.iter().map(|p| p.host_ip.as_deref()).collect();
+    assert_eq!(ips, vec![Some("10.0.0.5"), Some("127.0.0.1"), None]);
 }

@@ -47,6 +47,10 @@ struct RawService {
     replicas: i64,
     #[serde(default)]
     kill_timeout: Option<String>,
+    #[serde(default)]
+    entrypoint: Option<Vec<String>>,
+    #[serde(default)]
+    command: Option<Vec<String>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -71,6 +75,8 @@ struct RawPort {
     name: String,
     container_port: i64,
     host_port: i64,
+    #[serde(default)]
+    host_ip: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -231,10 +237,21 @@ fn canonicalise(raw: RawManifest, out: &mut Vec<ValidationError>) -> Option<Serv
             ));
             ok = false;
         }
+        if let Some(ip) = &p.host_ip {
+            if ip != "advertise" && ip.parse::<std::net::IpAddr>().is_err() {
+                out.push(ValidationError::new(
+                    Code::InvalidPortSpec,
+                    &format!("ports[{i}].host_ip"),
+                    &format!("{ip:?} is not an IP address or \"advertise\""),
+                ));
+                ok = false;
+            }
+        }
         ports.push(PortSpec {
             name: p.name.clone(),
             container_port: p.container_port.clamp(0, 65535) as u16,
             host_port: p.host_port.clamp(0, 65535) as u16,
+            host_ip: p.host_ip.clone(),
         });
     }
 
@@ -315,9 +332,25 @@ fn canonicalise(raw: RawManifest, out: &mut Vec<ValidationError>) -> Option<Serv
         }
     }
 
+    for (field, list) in [
+        ("service.entrypoint", &raw.service.entrypoint),
+        ("service.command", &raw.service.command),
+    ] {
+        if list.as_ref().is_some_and(|l| l.is_empty()) {
+            out.push(ValidationError::new(
+                Code::InvalidResourceSpec,
+                field,
+                "must not be empty; leave it out to use the image's",
+            ));
+            ok = false;
+        }
+    }
+
     let spec = ServiceSpec {
         id: raw.service.id,
         image: normalise_image(&raw.service.image),
+        entrypoint: raw.service.entrypoint,
+        command: raw.service.command,
         replicas: raw.service.replicas.max(0) as u32,
         kill_timeout_seconds: duration_field(
             "service.kill_timeout",
@@ -774,5 +807,60 @@ target_cpu_percent = 75
             parse_manifest_str(&std::fs::read_to_string(dir.join("shared-logs.toml")).unwrap())
                 .unwrap();
         assert!(!logs.spec.stop_first());
+    }
+
+    #[test]
+    fn command_entrypoint_and_bind_address() {
+        let m = VALID
+            .replace(
+                "replicas = 3\n",
+                "replicas = 3\nentrypoint = [\"/bin/sh\", \"-c\"]\ncommand = [\"postgres\", \"-c\", \"wal_level=logical\"]\n",
+            )
+            .replace("host_port      = 8080", "host_port      = 8080\nhost_ip        = \"advertise\"");
+        let p = parse_manifest_str(&m).unwrap();
+        assert_eq!(
+            p.spec.entrypoint.as_deref(),
+            Some(&["/bin/sh".to_string(), "-c".to_string()][..])
+        );
+        assert_eq!(p.spec.command.as_ref().unwrap()[2], "wal_level=logical");
+        assert_eq!(p.spec.ports[0].host_ip.as_deref(), Some("advertise"));
+
+        let ip = VALID.replace(
+            "host_port      = 8080",
+            "host_port      = 8080\nhost_ip = \"127.0.0.1\"",
+        );
+        assert_eq!(
+            parse_manifest_str(&ip).unwrap().spec.ports[0]
+                .host_ip
+                .as_deref(),
+            Some("127.0.0.1")
+        );
+    }
+
+    #[test]
+    fn rejects_bad_command_and_bind_address() {
+        let empty = VALID.replace("replicas = 3\n", "replicas = 3\ncommand = []\n");
+        assert_eq!(
+            err_code(&empty),
+            (Code::InvalidResourceSpec, "service.command".into())
+        );
+        let bad = VALID.replace(
+            "host_port      = 8080",
+            "host_port      = 8080\nhost_ip = \"localhost\"",
+        );
+        assert_eq!(
+            err_code(&bad),
+            (Code::InvalidPortSpec, "ports[0].host_ip".into())
+        );
+    }
+
+    /// Specs without the new fields serialise as before, so their hashes do
+    /// not change and re-applying them after an upgrade is `unchanged`.
+    #[test]
+    fn new_fields_keep_old_hashes() {
+        let json = parse_manifest_str(VALID).unwrap().spec.canonical_json();
+        for key in ["\"command\"", "\"entrypoint\"", "\"host_ip\""] {
+            assert!(!json.contains(key), "{key} in {json}");
+        }
     }
 }

@@ -727,9 +727,15 @@ pub fn spec_to_toml(s: &valkvork_common::models::ServiceSpec) -> String {
     let mut o = String::new();
     let _ = writeln!(
         o,
-        "[service]\nid = {:?}\nimage = {:?}\nreplicas = {}\nkill_timeout = \"{}s\"\n",
+        "[service]\nid = {:?}\nimage = {:?}\nreplicas = {}\nkill_timeout = \"{}s\"",
         s.id, s.image, s.replicas, s.kill_timeout_seconds
     );
+    for (key, list) in [("entrypoint", &s.entrypoint), ("command", &s.command)] {
+        if let Some(l) = list {
+            let _ = writeln!(o, "{key} = {}", toml_list(l));
+        }
+    }
+    o.push('\n');
     let _ = writeln!(
         o,
         "[resources]\ncpu = {}\nmemory = \"{}\"\ndisk = \"{}\"\n",
@@ -750,9 +756,13 @@ pub fn spec_to_toml(s: &valkvork_common::models::ServiceSpec) -> String {
     for p in &s.ports {
         let _ = writeln!(
             o,
-            "[[ports]]\nname = {:?}\ncontainer_port = {}\nhost_port = {}\n",
+            "[[ports]]\nname = {:?}\ncontainer_port = {}\nhost_port = {}",
             p.name, p.container_port, p.host_port
         );
+        if let Some(ip) = &p.host_ip {
+            let _ = writeln!(o, "host_ip = {ip:?}");
+        }
+        o.push('\n');
     }
     for v in &s.volumes {
         let _ = writeln!(
@@ -789,6 +799,11 @@ pub fn spec_to_toml(s: &valkvork_common::models::ServiceSpec) -> String {
     o
 }
 
+fn toml_list(l: &[String]) -> String {
+    let items: Vec<String> = l.iter().map(|x| format!("{x:?}")).collect();
+    format!("[{}]", items.join(", "))
+}
+
 fn human_size(b: u64) -> String {
     for (unit, shift) in [("GiB", 30), ("MiB", 20), ("KiB", 10)] {
         if b >= 1 << shift && b.is_multiple_of(1 << shift) {
@@ -796,4 +811,41 @@ fn human_size(b: u64) -> String {
         }
     }
     format!("{b}")
+}
+
+#[cfg(test)]
+mod spec_toml_tests {
+    use super::spec_to_toml;
+    use valkvork_common::validation::parse_manifest_str;
+
+    /// The detail view's manifest parses back to the same spec.
+    #[test]
+    fn round_trips() {
+        let m = r#"
+[service]
+id = "pg"
+image = "docker.io/library/postgres:16.4-alpine"
+replicas = 1
+entrypoint = ["docker-entrypoint.sh"]
+command = ["postgres", "-c", "wal_level=logical"]
+
+[resources]
+cpu = 1.0
+memory = "1GiB"
+
+[[ports]]
+name = "postgres"
+container_port = 5432
+host_port = 5432
+host_ip = "advertise"
+
+[[ports]]
+name = "admin"
+container_port = 9000
+host_port = 9000
+"#;
+        let spec = parse_manifest_str(m).unwrap().spec;
+        let again = parse_manifest_str(&spec_to_toml(&spec)).unwrap().spec;
+        assert_eq!(spec, again);
+    }
 }

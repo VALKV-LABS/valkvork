@@ -9,7 +9,8 @@
 //! restart-on-failure, which the policy delegates to it (FR-AGE-05).
 
 use crate::runtime::{
-    BindMount, ContainerRuntime, ContainerSpec, RunState, RuntimeEvent, LABEL_WORKLOAD,
+    BindMount, ContainerRuntime, ContainerSpec, PublishedPort, RunState, RuntimeEvent,
+    LABEL_WORKLOAD,
 };
 use crate::telemetry::{dir_size, read_container, CpuRate};
 use futures::StreamExt;
@@ -105,6 +106,9 @@ pub struct SupervisorConfig {
     /// Additional never-mountable paths, e.g. the runtime's data root.
     pub protected_paths: Vec<PathBuf>,
     pub host_volumes: BTreeMap<String, HostVolume>,
+    /// The address reported to the controller; ports with
+    /// `host_ip = "advertise"` are published on it.
+    pub advertise_ip: String,
 }
 
 pub struct Supervisor {
@@ -382,17 +386,38 @@ impl Supervisor {
         env.sort();
         env.push(("VALKVORK_WORKLOAD_ID".into(), wid.clone()));
         env.push(("VALKVORK_SERVICE_ID".into(), cmd.service_id.clone()));
+        let mut ports = Vec::with_capacity(cmd.ports.len());
+        for p in &cmd.ports {
+            let host_ip = match p.host_ip.as_str() {
+                "" => None,
+                "advertise" if self.cfg.advertise_ip.is_empty() => {
+                    return Err((
+                        "HOST_IP_UNAVAILABLE".into(),
+                        format!(
+                            "port {:?} binds the advertise address, which is unknown",
+                            p.name
+                        ),
+                    ))
+                }
+                "advertise" => Some(self.cfg.advertise_ip.clone()),
+                ip => Some(ip.to_string()),
+            };
+            ports.push(PublishedPort {
+                container_port: p.container_port as u16,
+                host_port: p.host_port as u16,
+                host_ip,
+            });
+        }
+        let non_empty = |l: &Vec<String>| (!l.is_empty()).then(|| l.clone());
         let spec = ContainerSpec {
             name: format!("vk-{wid}"),
             image: cmd.image.clone(),
             cpu_millicores: cmd.cpu_millicores,
             memory_bytes: cmd.memory_bytes,
             env,
-            ports: cmd
-                .ports
-                .iter()
-                .map(|p| (p.container_port as u16, p.host_port as u16))
-                .collect(),
+            entrypoint: non_empty(&cmd.entrypoint),
+            command: non_empty(&cmd.command),
+            ports,
             mounts,
             labels,
         };

@@ -490,6 +490,7 @@ impl Core {
                             name: p.name.clone(),
                             container_port: p.container_port as u32,
                             host_port: p.host_port as u32,
+                            host_ip: p.host_ip.clone().unwrap_or_default(),
                         })
                         .collect(),
                     volumes: s
@@ -508,6 +509,8 @@ impl Core {
                         delay_seconds: s.restart.delay_seconds,
                     }),
                     kill_timeout_seconds: s.kill_timeout_seconds,
+                    entrypoint: s.entrypoint.clone().unwrap_or_default(),
+                    command: s.command.clone().unwrap_or_default(),
                 },
             )),
         };
