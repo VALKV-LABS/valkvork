@@ -599,7 +599,13 @@ impl Core {
             updated_at: w.updated_at as u64,
             service_id: w.service_id.clone(),
             service_version: w.service_version,
-            health: w.health.as_str().to_string(),
+            // Only live workloads have a current health; a stopped one keeps
+            // its last report otherwise.
+            health: if w.is_live() {
+                w.health.as_str().to_string()
+            } else {
+                String::new()
+            },
         }
     }
 

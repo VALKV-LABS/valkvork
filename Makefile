@@ -17,7 +17,7 @@ PLATFORM ?= linux/$(shell uname -m | sed -e 's/x86_64/amd64/' -e 's/aarch64/arm6
 .PHONY: help build build-release test test-unit fmt fmt-check check ci \
         dev-up dev-down dev-status dev-logs dev-reset env demo ui \
         dev-add-node dev-stop-node dev-remove-node \
-        dist image clean
+        dist image e2e clean
 
 help:  ## Show this help
 	@awk 'BEGIN {FS = ":.*## "} /^[a-zA-Z_-]+:.*## / {printf "  \033[36m%-17s\033[0m %s\n", $$1, $$2}' $(MAKEFILE_LIST)
@@ -93,6 +93,11 @@ ui:  ## Open the web UI in the browser
 
 dist:  ## Static musl binaries into dist/ (PLATFORM=linux/amd64 to cross-build)
 	docker buildx build --platform $(PLATFORM) --target export --output dist/ .
+
+e2e: dist  ## End-to-end test against your Docker: Postgres with secrets, bind address, check (~2 min)
+	docker run --rm --network host -v /var/run/docker.sock:/var/run/docker.sock \
+	  -v /var/tmp/vk-e2e:/var/tmp/vk-e2e -v "$(CURDIR)/dist:/dist:ro" \
+	  -v "$(CURDIR)/scripts/e2e-docker.sh:/e2e.sh:ro" docker:27-cli sh /e2e.sh
 
 image:  ## Controller and agent images (valkvork-controller:dev, valkvork-agent:dev)
 	docker buildx build --platform $(PLATFORM) --load --target controller -t valkvork-controller:dev .
