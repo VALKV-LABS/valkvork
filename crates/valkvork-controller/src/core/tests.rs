@@ -1272,3 +1272,43 @@ fn migration_adds_completed_status() {
     let c = Core::new(cfg(), Db::open(&path).unwrap(), TOKEN.into()).unwrap();
     assert_eq!(c.workloads[&wid].status, WorkloadStatus::Completed);
 }
+
+/// A batch service shows where its run is, not ACTIVE: RUNNING, RETRYING
+/// after a failure, then COMPLETED. A plain service still shows ACTIVE.
+#[test]
+fn batch_service_status_follows_its_run() {
+    let mut c = core();
+    let mut a = register(&mut c, "a");
+    apply(&mut c, &batch_manifest("init", 1));
+    apply(&mut c, &manifest("web", "nginx:1", 1, ""));
+    let shown = |c: &Core, id: &str| c.display_status(&c.services[id]);
+    assert_eq!(shown(&c, "web"), "ACTIVE");
+    assert_eq!(shown(&c, "init"), "RUNNING");
+
+    let first = a
+        .starts()
+        .into_iter()
+        .find(|s| s.service_id == "init")
+        .unwrap()
+        .workload_id;
+    heartbeat(&mut c, &a, vec![status(&first, WorkloadState::Failed)]);
+    assert_eq!(
+        shown(&c, "init"),
+        "RETRYING",
+        "failed; the next run is backing off"
+    );
+
+    c.svc_rt.get_mut("init").unwrap().last_failure =
+        Some(std::time::Instant::now() - std::time::Duration::from_secs(60));
+    c.reconcile();
+    c.finish().unwrap();
+    assert_eq!(shown(&c, "init"), "RUNNING");
+    let second = a
+        .starts()
+        .into_iter()
+        .find(|s| s.service_id == "init")
+        .unwrap()
+        .workload_id;
+    heartbeat(&mut c, &a, vec![status(&second, WorkloadState::Completed)]);
+    assert_eq!(shown(&c, "init"), "COMPLETED");
+}

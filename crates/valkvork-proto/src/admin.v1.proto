@@ -58,7 +58,10 @@ message ServiceDetail {
   string service_id = 1;
   uint64 version = 2;
   string spec_toml = 3;
-  string status = 4;  // ACTIVE | DEGRADED | DELETING
+  // ACTIVE | DEGRADED | DELETING. A batch service shows its run instead of
+  // ACTIVE: RUNNING, RETRYING (a run failed; the next one is backing off) or
+  // COMPLETED (every run of the current version exited 0).
+  string status = 4;
   string rollout_status = 5;  // NONE | IN_PROGRESS | HALTED
   uint32 target_replicas = 6;
   uint32 running_replicas = 7;
@@ -68,6 +71,8 @@ message ServiceDetail {
   repeated ScalingEvent scaling_events = 11;
   uint64 created_at = 12;
   uint64 updated_at = 13;
+  string type = 14;                // service | batch
+  uint32 completed_replicas = 15;  // batch: COMPLETED runs of the current version
 }
 
 message WorkloadSummary {
@@ -111,6 +116,8 @@ message ServiceSummary {
   double cpu_utilization = 7;
   uint64 created_at = 8;
   string rollout_status = 9;  // NONE | IN_PROGRESS | HALTED
+  string type = 10;                // service | batch
+  uint32 completed_replicas = 11;  // batch: COMPLETED runs of the current version
 }
 
 message ListWorkloadsRequest {

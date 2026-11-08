@@ -639,6 +639,38 @@ impl Core {
             .count() as u32
     }
 
+    /// COMPLETED runs of the service's current version.
+    fn completed_runs(&self, s: &Service) -> u32 {
+        self.workloads
+            .values()
+            .filter(|w| {
+                w.service_id == s.service_id
+                    && w.service_version == s.version
+                    && w.status == WorkloadStatus::Completed
+            })
+            .count() as u32
+    }
+
+    /// The status shown for a service. A batch service that is ACTIVE shows
+    /// where its run is instead: ACTIVE would read as "still running" for a
+    /// job that finished. DEGRADED and DELETING show as they are.
+    pub(crate) fn display_status(&self, s: &Service) -> String {
+        if !s.spec.is_batch() || s.status != ServiceStatus::Active {
+            return s.status.to_string();
+        }
+        if self.completed_runs(s) >= s.target_replicas {
+            "COMPLETED".into()
+        } else if self
+            .workloads
+            .values()
+            .any(|w| w.service_id == s.service_id && w.is_live())
+        {
+            "RUNNING".into()
+        } else {
+            "RETRYING".into()
+        }
+    }
+
     fn service_detail(&self, id: &str) -> Result<pb::ServiceDetail, ValkvorkError> {
         let s = self
             .services
@@ -654,7 +686,9 @@ impl Core {
             service_id: s.service_id.clone(),
             version: s.version,
             spec_toml: spec_to_toml(&s.spec),
-            status: s.status.to_string(),
+            status: self.display_status(s),
+            r#type: s.spec.service_type.as_str().into(),
+            completed_replicas: self.completed_runs(s),
             rollout_status: s.rollout_status.to_string(),
             target_replicas: s.target_replicas,
             running_replicas: self.count(id, WorkloadStatus::Running),
@@ -675,7 +709,9 @@ impl Core {
                 service_id: s.service_id.clone(),
                 version: s.version,
                 image: s.spec.image.clone(),
-                status: s.status.to_string(),
+                status: self.display_status(s),
+                r#type: s.spec.service_type.as_str().into(),
+                completed_replicas: self.completed_runs(s),
                 target_replicas: s.target_replicas,
                 running_replicas: self.count(&s.service_id, WorkloadStatus::Running),
                 cpu_utilization: self.service_utilisation(&s.service_id).unwrap_or(0.0),

@@ -299,7 +299,9 @@ vk status pg-init | grep -qF 'DATABASE_URL = "postgresql://valkv:${secret:POSTGR
 if vk status pg-init | grep -qF "$PW"; then fail "status shows the password"; fi
 sleep 3
 [ -z "$(docker ps -aq --filter label=valkvork.service_id=pg-init)" ] || fail "the completed container was not removed"
-pass "batch job COMPLETED once, connecting with \${secret:...} in its URL; not shown, container removed"
+vk status pg-init | grep -q '^status: *COMPLETED' || { vk status pg-init | head -4; fail "the service does not show COMPLETED"; }
+vk status | grep pg-init | grep -q '1/1 done' || fail "the service list does not show 1/1 done"
+pass "batch job COMPLETED once (service status COMPLETED, 1/1 done), connecting with \${secret:...} in its URL; not shown, container removed"
 
 vk plan -f "$W/init.toml" | grep -q 'batch: run again' || fail "plan does not say it runs again"
 vk apply -f "$W/init.toml" >/dev/null

@@ -117,6 +117,7 @@ An ephemeral volume counts against `[resources] disk` together with `/alloc`, an
 - **Applying it again runs it again.** Once a run has finished, an unchanged manifest is the change `rerun`: a new version with new workloads. While a run is in progress, an unchanged apply changes nothing.
 - **A changed manifest supersedes a run in progress:** its workloads are stopped (`SUPERSEDED`) and the new version's start.
 - No `[check]` and no `[autoscale]`. A batch job needs an agent with the `batch` feature.
+- **Its status shows the run**, not `ACTIVE`: `RUNNING` while a workload is live, `RETRYING` after a failed run while the next one waits out the backoff, `COMPLETED` once every run of the current version exited 0. `DEGRADED` and `DELETING` show as for a service. `valkvork status` and the UI count runs (`1/1 done`) instead of running replicas.
 
 Nothing waits for a batch job: a service that needs its result must cope until it has run (retry at start, or fail and be restarted).
 
