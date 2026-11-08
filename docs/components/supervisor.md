@@ -12,7 +12,7 @@ One entry per workload, keyed by workload id:
 |---|---|
 | service id, service version | From the command or the container's labels |
 | container id | Once created |
-| state | `STARTING`, `RUNNING`, `RESTARTING`, `STOPPED` or `FAILED` |
+| state | `STARTING`, `RUNNING`, `RESTARTING`, `STOPPED`, `FAILED` or `COMPLETED` (a batch workload that exited 0) |
 | reason, exit code | Why it failed or last exited |
 | restart count, recent restarts | For the restart policy |
 | restart policy, kill timeout, disk limit | From the command or labels |
@@ -32,7 +32,8 @@ StartWorkload
     1. create <data_dir>/alloc/<workload_id>/
     2. resolve volumes: each source must be a [host_volumes] entry in agent.toml,
        and must not be a protected path            → else FAILED HOST_VOLUME_NOT_FOUND / FORBIDDEN_MOUNT
-    3. resolve [secrets] references                → else FAILED SECRET_UNRESOLVED: NAME (ref): cause
+    3. resolve [secrets] references, then the
+       ${secret:NAME}s in [env] values             → else FAILED SECRET_UNRESOLVED: NAME (ref): cause
     4. pull the image with registry credentials    → else FAILED IMAGE_PULL_FAILED
     5. resolve bind addresses and the health check → else FAILED HOST_IP_UNAVAILABLE / CHECK_INVALID
     6. create vk-<workload_id>                     → else FAILED CREATE_FAILED
@@ -50,7 +51,7 @@ The container gets:
 | Entrypoint, command | The manifest's `entrypoint` and `command`, or the image's |
 | Environment | The manifest's `[env]`, the resolved `[secrets]`, plus `VALKVORK_WORKLOAD_ID` and `VALKVORK_SERVICE_ID` |
 | Ports | `PortBindings` for each `[[ports]]` entry, TCP, on its `host_ip` (`"advertise"` becomes the node's address; unset: every address) |
-| Mounts | `/alloc` → the alloc directory, plus one bind mount per volume |
+| Mounts | `/alloc` → the alloc directory, plus one bind mount per volume: a host volume's declared path, or an ephemeral volume's `<data_dir>/volumes/<workload_id>/<source>`, created empty and mode `1777` like `/alloc` |
 | Restart policy | `no`: the agent owns restarts |
 | Privileged | never |
 | Labels | `valkvork.workload_id`, `valkvork.service_id`, `valkvork.service_version`, `valkvork.restart` (`attempts/interval/delay`), `valkvork.kill_timeout`, `valkvork.disk_bytes`, and `valkvork.check` when it has a health check |
@@ -64,7 +65,8 @@ A host volume is mounted read-only if either the manifest or `agent.toml` says s
 ```
 StopWorkload
   mark stopping, ack, then: stop with the kill timeout (SIGTERM, wait, SIGKILL),
-  remove the container, delete its alloc directory and failed marker, forget it
+  remove the container, delete its alloc and ephemeral volume directories and its
+  failed marker, forget it
 ```
 
 A stop that arrives while the start is still pulling is finished as soon as the start returns. If removing the container fails, the entry is kept, so the controller keeps seeing it and asks again.
@@ -74,13 +76,15 @@ A stop that arrives while the start is still pulling is finished as soon as the 
 The agent learns about exits from Docker's event stream (`die` and `oom` events, filtered by label), not by polling. When a RUNNING, non-stopping container exits:
 
 ```
+a batch workload (label valkvork.batch=1) that exited 0, not OOM or unhealthy?
+  yes → COMPLETED; never restarted (the controller then has it removed)
 attempts used in the last `interval` < `attempts`?
   yes → RESTARTING, wait `delay`, start the same container again → RUNNING
   no  → FAILED with reason OOM_KILLED (after an oom event), UNHEALTHY (stopped for its check) or EXITED;
         leave the container stopped
 ```
 
-The default policy is 3 attempts within 5 minutes, 5 s apart. An exit with code 0 counts as a failure too, since services are meant to run forever. This works with the controller unreachable. Replacing a FAILED workload is the controller's decision; it then asks the agent to remove the container.
+The default policy is 3 attempts within 5 minutes, 5 s apart. For a service, an exit with code 0 counts as a failure too, since services are meant to run forever; only batch workloads complete. After an agent restart, an exited batch container with code 0 is adopted as COMPLETED. This works with the controller unreachable. Replacing a FAILED workload is the controller's decision; it then asks the agent to remove the container.
 
 A failed workload also gets a marker file, `<data_dir>/failed/<workload_id>`, holding the reason.
 
@@ -115,7 +119,7 @@ The event stream is the primary signal. Every 10 s, and each time the stream rec
 
 ## Ephemeral Disk
 
-Each workload's disk use is the size of its alloc directory, measured every 10 s, plus its writable layer (`SizeRw`), measured every 60 s because the call is expensive. When the total exceeds the manifest's `disk` (default 1 GiB), the workload becomes FAILED with `EPHEMERAL_DISK_EXCEEDED` and its container is stopped. The restart policy does not apply (FR-AGE-08).
+Each workload's disk use is the size of its alloc directory and its ephemeral volumes, measured every 10 s, plus its writable layer (`SizeRw`), measured every 60 s because the call is expensive. When the total exceeds the manifest's `disk` (default 1 GiB), the workload becomes FAILED with `EPHEMERAL_DISK_EXCEEDED` and its container is stopped. The restart policy does not apply (FR-AGE-08).
 
 This is a polling check, so there is a soft margin. Container logs live under Docker's data root and are bounded by Docker's log rotation, not by `disk`.
 

@@ -353,7 +353,11 @@ async fn run(cli: &Cli) -> Result<(), Failure> {
                         vec![
                             s.service_id.clone(),
                             s.version.to_string(),
-                            format!("{}/{}", s.running_replicas, s.target_replicas),
+                            if s.r#type == "batch" {
+                                format!("{}/{} done", s.completed_replicas, s.target_replicas)
+                            } else {
+                                format!("{}/{}", s.running_replicas, s.target_replicas)
+                            },
                             format!("{:.0}%", s.cpu_utilization),
                             s.status.clone(),
                             s.image.clone(),
@@ -516,6 +520,14 @@ fn print_plan(r: &pb::PlanResponse) {
                 r.max_parallel
             ),
         ),
+        ChangeKind::Rerun => (
+            "~",
+            format!(
+                "version {} → {}   [batch: run again]",
+                r.version.saturating_sub(1),
+                r.version
+            ),
+        ),
         ChangeKind::ScaleOnly => ("~", format!("version {}   [scale-only]", r.version)),
         ChangeKind::PolicyOnly => ("~", format!("version {}   [policy-only]", r.version)),
     };
@@ -544,10 +556,21 @@ fn print_service(s: &pb::ServiceDetail) {
     println!("service:   {}", s.service_id);
     println!("version:   {}", s.version);
     println!("status:    {} (rollout {})", s.status, s.rollout_status);
-    println!(
-        "replicas:  {} running / {} target ({} pending, {} failed)",
-        s.running_replicas, s.target_replicas, s.pending_replicas, s.failed_replicas
-    );
+    if s.r#type == "batch" {
+        println!(
+            "runs:      {} completed / {} target ({} running, {} pending, {} failed)",
+            s.completed_replicas,
+            s.target_replicas,
+            s.running_replicas,
+            s.pending_replicas,
+            s.failed_replicas
+        );
+    } else {
+        println!(
+            "replicas:  {} running / {} target ({} pending, {} failed)",
+            s.running_replicas, s.target_replicas, s.pending_replicas, s.failed_replicas
+        );
+    }
     println!("\nworkloads:");
     print_workloads(&s.workloads, false);
     if !s.scaling_events.is_empty() {

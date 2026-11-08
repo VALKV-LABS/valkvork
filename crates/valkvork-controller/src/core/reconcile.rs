@@ -29,6 +29,8 @@ impl Core {
                 .is_some_and(|s| s.status == ServiceStatus::Deleting)
             {
                 self.reconcile_delete(id);
+            } else if self.services.get(id).is_some_and(|s| s.spec.is_batch()) {
+                self.reconcile_batch(id);
             } else {
                 self.reconcile_migrations(id);
                 self.reconcile_count(id);
@@ -373,6 +375,60 @@ impl Core {
                 );
             }
             _ => {}
+        }
+    }
+
+    /// A batch service runs `target_replicas` workloads of its current
+    /// version to completion. COMPLETED ones count as done and are never
+    /// replaced; FAILED ones are replaced under the failure backoff. A new
+    /// version (a changed manifest, or a re-apply after the run finished)
+    /// supersedes a run still in progress.
+    fn reconcile_batch(&mut self, service_id: &str) {
+        let Some(svc) = self.services.get(service_id).cloned() else {
+            return;
+        };
+        let version = svc.version;
+        let mine = |w: &&Workload| w.service_id == service_id;
+        let superseded: Vec<String> = self
+            .workloads
+            .values()
+            .filter(mine)
+            .filter(|w| w.is_live() && w.service_version < version)
+            .map(|w| w.workload_id.clone())
+            .collect();
+        for wid in superseded {
+            self.stop_workload(&wid, "SUPERSEDED");
+        }
+        let mut live: Vec<(i64, String)> = self
+            .workloads
+            .values()
+            .filter(mine)
+            .filter(|w| w.is_live() && w.service_version == version)
+            .map(|w| (w.created_at, w.workload_id.clone()))
+            .collect();
+        let done = self
+            .workloads
+            .values()
+            .filter(mine)
+            .filter(|w| w.status == WorkloadStatus::Completed && w.service_version == version)
+            .count();
+        let target = svc.target_replicas as usize;
+        let have = live.len() + done;
+        if have < target {
+            if self.replacement_blocked(service_id) {
+                return;
+            }
+            for _ in have..target {
+                let w = self.new_workload(&svc, None);
+                self.insert_workload(w);
+            }
+        } else if have > target {
+            // Scaled down mid-run: stop the newest still running.
+            live.sort();
+            let excess = (have - target).min(live.len());
+            for (_, wid) in live.into_iter().rev().take(excess) {
+                self.stop_workload(&wid, "SCALED_DOWN");
+            }
         }
     }
 

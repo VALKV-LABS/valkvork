@@ -34,9 +34,9 @@ const link = (href, text) => h('a', { href, 'data-link': true }, text);
 const enc = encodeURIComponent;
 
 const STATUS_CLASS = {
-  RUNNING: 'ok', HEALTHY: 'ok', ACTIVE: 'ok', created: 'ok',
-  PENDING: 'warn', ASSIGNED: 'warn', STOPPING: 'warn', IN_PROGRESS: 'warn', DELETING: 'warn', DRAINING: 'warn',
-  'scale-only': 'warn', 'policy-only': 'warn', replacing: 'warn',
+  RUNNING: 'ok', HEALTHY: 'ok', ACTIVE: 'ok', created: 'ok', COMPLETED: 'ok',
+  PENDING: 'warn', ASSIGNED: 'warn', STOPPING: 'warn', RETRYING: 'warn', IN_PROGRESS: 'warn', DELETING: 'warn', DRAINING: 'warn',
+  'scale-only': 'warn', 'policy-only': 'warn', replacing: 'warn', rerun: 'warn',
   FAILED: 'bad', LOST: 'bad', UNHEALTHY: 'bad', DEGRADED: 'bad', HALTED: 'bad',
 };
 // Status is always text plus colour, never colour alone (FR-UI-08).
@@ -296,7 +296,7 @@ async function servicesPage() {
         link(`/ui/services/${enc(s.service_id)}`, s.service_id),
         h('span', { class: 'mono' }, s.image),
         s.version,
-        `${s.running_replicas} / ${s.target_replicas}`,
+        s.type === 'batch' ? `${s.completed_replicas} / ${s.target_replicas} done` : `${s.running_replicas} / ${s.target_replicas}`,
         `${Math.round(s.cpu_utilization)} %`,
         badge(s.status),
         badge(s.rollout_status),
@@ -324,7 +324,7 @@ function workloadHeaders({ service = false, node = true } = {}) {
 async function servicePage(id) {
   const { service: s, cpu_series, scaling_events } = await api(`services/${enc(id)}`);
   const msg = h('div');
-  const live = s.workloads.filter((w) => !['STOPPED', 'FAILED'].includes(w.status));
+  const live = s.workloads.filter((w) => !['STOPPED', 'FAILED', 'COMPLETED'].includes(w.status));
   const current = live.filter((w) => w.service_version === s.version && w.status === 'RUNNING').length;
 
   const replicas = h('input', { type: 'number', min: 0, value: s.target_replicas, 'aria-label': 'Replicas' });
@@ -361,7 +361,9 @@ async function servicePage(id) {
   const lastCpu = cpu_series.length ? `${Math.round(cpu_series[cpu_series.length - 1].value)} %` : '—';
   return h('div', {},
     h('div', { class: 'row' }, h('h1', {}, s.service_id), badge(s.status), badge(s.rollout_status)),
-    h('p', { class: 'sub' }, `version ${s.version} · ${s.running_replicas} running / ${s.target_replicas} target · ${s.pending_replicas} pending · ${s.failed_replicas} failed`),
+    h('p', { class: 'sub' }, s.type === 'batch'
+      ? `batch job · version ${s.version} · ${s.completed_replicas} completed / ${s.target_replicas} · ${s.running_replicas} running · ${s.failed_replicas} failed`
+      : `version ${s.version} · ${s.running_replicas} running / ${s.target_replicas} target · ${s.pending_replicas} pending · ${s.failed_replicas} failed`),
     msg,
     s.status === 'DELETING' ? null : h('div', { class: 'panel actions' }, scale, delForm),
     h('div', { class: 'grid2' },
@@ -454,7 +456,7 @@ async function nodePage(id) {
     table(workloadHeaders({ service: true, node: false }), workloadRows(workloads, { service: true, node: false })));
 }
 
-const STATUSES = ['', 'PENDING', 'ASSIGNED', 'RUNNING', 'STOPPING', 'LOST', 'STOPPED', 'FAILED'];
+const STATUSES = ['', 'PENDING', 'ASSIGNED', 'RUNNING', 'STOPPING', 'LOST', 'STOPPED', 'FAILED', 'COMPLETED'];
 
 async function workloadsPage(params) {
   const q = new URLSearchParams();

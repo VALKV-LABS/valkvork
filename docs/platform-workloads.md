@@ -63,7 +63,7 @@ No Valkvork features. Infrastructure and tooling that Stages 1 and 2 need.
 - [x] `valkvork node list` shows both nodes as class `app` (before goldenimage#13; after it, the controller node is `controller`).
 - [x] `valkvork -o json node list` lists `pgdata` in `host_volumes` on the controller node only.
 - [x] From the agent node, `aws ssm get-parameter --with-decryption --name /valkv/<cell>/workloads/POSTGRES_PASSWORD` works.
-- [ ] **Fails:** the same call for `/valkv/<cell>/valkvork/controller/key` is **allowed**. The template's own policy is narrow, but the AWS managed policy `AmazonSSMManagedInstanceCore` (attached for Session Manager) grants `ssm:GetParameter` on `*`. So every node, and every container using its role, can read every parameter in the account: the controller's TLS key and admin token, and other cells' secrets. Fixed in goldenimage#14 (an explicit `Deny`); passes once that is applied. See [Findings](#findings-from-the-aws-run-2026-11-08).
+- [x] The same call for `/valkv/<cell>/valkvork/controller/key` is denied (`AccessDeniedException`), since goldenimage#14 (checked 2026-11-08 on the redeployed cell). Before it, the AWS managed policy `AmazonSSMManagedInstanceCore` let every node read every parameter; see [Findings](#findings-from-the-aws-run-2026-11-08).
 
 ---
 
@@ -98,7 +98,7 @@ No Valkvork features. Infrastructure and tooling that Stages 1 and 2 need.
 
 ### Verify on AWS
 
-All checked 2026-11-08, except where marked.
+All checked 2026-11-08, except where marked. **Checked again** the same day on the redeployed cell (new instances from the image with goldenimage#13 and #14, valkvork 0.2.7 then the Stage 2 dev build): every check below passed again, with `global-pg` now pinned by `required_class = "controller"`, and a container on the controller node now reaching Postgres at the node's own address (F3 fixed).
 
 **Placement and secrets**
 - [x] `global-pg` runs on the controller node, the only one with `pgdata` (the deployed workload's node; `plan` on an unchanged manifest reports only "unchanged").
@@ -126,10 +126,10 @@ All checked 2026-11-08, except where marked.
 
 | # | Finding | Where | Blocks |
 |---|---|---|---|
-| F1 | **Every node can read every SSM parameter.** `AmazonSSMManagedInstanceCore` grants `ssm:GetParameter(s)` on `*`, which overrides the template's narrow per-node policy. Fix: an explicit `Deny` on the agent role for `/valkv/<cell>/valkvork/controller/*`, and on every role for other cells' `/valkv/*` paths; or replace the managed policy with one without the parameter actions | goldenimage template | **Fixed in goldenimage#14:** `iam.tf` denies parameter reads outside each node's list. Checked with the IAM policy simulator; needs `tofu apply` |
-| F2 | **A `tcp` check can't detect a hung process.** Postgres needs an `exec` check (`type = "exec"`, `command = ["pg_isready", "-U", "valkv"]`, run with `docker exec`) | Valkvork | Stage 1's pause check. Not Stage 2 |
-| F3 | **A container can't reach its own node's address.** UFW's input policy is `DROP`, and a container connecting to the node's own IP (`10.12.0.240:5432`) goes through the host's input chain, where it is dropped. From another node it works (Docker's forward rules) | goldenimage image | **Fixed in goldenimage#14:** Docker's userland proxy off, so Docker NATs that traffic through FORWARD and UFW is never involved. Tested on the agent node; needs an image rebuild, or the `daemon.json` change on running nodes. Affected any container that reaches a service on its own node by the node's address. **Not Stage 2** any more: with the controller node's class `controller`, valkv-apg runs on the agent node and reaches Postgres from there, which works |
-| F4 | A failed in-place restart fails the workload at once, instead of retrying under the restart policy. The controller then replaces it, which works, but the restart count and reason are lost | Valkvork | Nothing |
+| F1 | **Fixed, verified on the redeployed cell.** **Every node can read every SSM parameter.** `AmazonSSMManagedInstanceCore` grants `ssm:GetParameter(s)` on `*`, which overrides the template's narrow per-node policy. Fix: an explicit `Deny` on the agent role for `/valkv/<cell>/valkvork/controller/*`, and on every role for other cells' `/valkv/*` paths; or replace the managed policy with one without the parameter actions | goldenimage template | **Fixed in goldenimage#14:** `iam.tf` denies parameter reads outside each node's list. Checked with the IAM policy simulator; needs `tofu apply` |
+| F2 | **A `tcp` check can't detect a hung process.** Postgres needs an `exec` check (`type = "exec"`, `command = ["pg_isready", "-U", "valkv"]`, run with `docker exec`) | Valkvork | Stage 1's pause check. Not Stage 2. **Open** |
+| F3 | **Fixed, verified on the redeployed cell.** **A container can't reach its own node's address.** UFW's input policy is `DROP`, and a container connecting to the node's own IP (`10.12.0.240:5432`) goes through the host's input chain, where it is dropped. From another node it works (Docker's forward rules) | goldenimage image | **Fixed in goldenimage#14:** Docker's userland proxy off, so Docker NATs that traffic through FORWARD and UFW is never involved. Tested on the agent node; needs an image rebuild, or the `daemon.json` change on running nodes. Affected any container that reaches a service on its own node by the node's address. **Not Stage 2** any more: with the controller node's class `controller`, valkv-apg runs on the agent node and reaches Postgres from there, which works |
+| F4 | A failed in-place restart fails the workload at once, instead of retrying under the restart policy. The controller then replaces it, which works, but the restart count and reason are lost | Valkvork | Nothing. **Open** |
 
 ---
 
@@ -139,32 +139,42 @@ All checked 2026-11-08, except where marked.
 
 | # | Feature | Manifest | Notes |
 |---|---|---|---|
-| 2.1 | **Secrets inside a value**, for URLs that embed a password. | `[env]`<br>`APG_DATABASE_URL = "postgresql://valkv:${secret:POSTGRES_PASSWORD}@postgres.<zone>:5432/valkv_apg"` | Builds on 1.1. Resolved by the agent. Any value that uses a secret is treated as secret, and shown with the secret masked |
-| 2.2 | **Batch jobs**: run to completion. | `[service]`<br>`type = "batch"` | Design in [phase-2.md](phase-2.md#batch-and-system-jobs). Exit 0 is `COMPLETED` with no restart; failures retry under the restart policy. A rule for keeping finished runs. Needed for `global-pg-init`, which creates `valkv_apg` and the other databases idempotently |
-| 2.3 | **An address for Postgres.** | `postgres.<zone>` in the URL | **Infrastructure, not Valkvork**, for now: the goldenimage template adds a private DNS record for the node that declares `pgdata`. Service discovery in Valkvork comes later |
+| 2.1 | **Secrets inside a value**, for URLs that embed a password. | `[env]`<br>`APG_DATABASE_URL = "postgresql://valkv:${secret:POSTGRES_PASSWORD}@postgres.<zone>:5432/valkv_apg"` | Builds on 1.1: `NAME` is a `[secrets]` key. Substituted by the agent; the controller stores and shows the value as written, with the reference |
+| 2.2 | **Batch jobs**: run to completion. | `[service]`<br>`type = "batch"` | Exit 0 is `COMPLETED`, never replaced; other exits restart under the policy, then the controller retries under its backoff. Finished runs are pruned like stopped workloads. Applying a finished job again runs it again (change `rerun`). Needed for `global-pg-init` |
+| 2.3 | **An address for Postgres.** | `postgres.<zone>` in the URL | **Infrastructure, not Valkvork**, for now: goldenimage `controller_dns_aliases = ["postgres"]` adds `postgres.valkvork.internal` for the controller node, where `global-pg` is pinned. Service discovery in Valkvork comes later |
 | 2.4 | **Loopback-only admin port**, from 1.2. | `host_ip = "127.0.0.1"` on port 9000 | Nothing new to build; this stage verifies it |
 
 **New manifest:** `global-pg-init.toml`. A batch job using the postgres image and
-`command`, which creates the databases (`valkv_apg`, `valkv_ingress`, `valkv_krocks`,
-`valkv_cloudlaunch`, `valkv_supavisor`) and the `supavisor` role. It replaces compose's
-three `*-db-init` services.
+`command`, which creates the databases `valkv_apg`, `valkv_ingress`, `valkv_krocks` and
+`valkv_cloudlaunch`. It replaces compose's `ingress-db-init` and `cachedb-db-init`.
+**Moved to the supavisor stage:** the `supavisor` role and `valkv_supavisor` (compose's
+`supavisor-db-init`), which need a `SUPAVISOR_DB_PASSWORD` secret the cell doesn't
+generate yet.
+
+**Status (2026-11-08): built and verified on AWS.**
+- Valkvork: branch `feat/stage2-valkv-apg`. 121 unit tests, plus `make e2e` (15 checks), which adds a batch job connecting through a `${secret:...}` URL, its re-run, and a failing batch job. Database migration 2 (the `COMPLETED` status) ran on the cell's existing database with Postgres running.
+- goldenimage: `controller_dns_aliases`, branch `feat/valkvork-dns-aliases`, applied to the cell (one Route53 record).
+- valkv-platform-infra: `global-pg-init.toml` (new) and `valkv-apg.toml`, all gaps closed.
+- On the cell as the dev build `0.2.99` (`dev-cell-upgrade.sh`); not released yet.
 
 ### Verify on AWS
 
+All checked 2026-11-08 on `aws-us-west-1-valkvork`.
+
 **Init job**
-- [ ] `global-pg-init` runs once and shows `COMPLETED`; the databases exist.
-- [ ] Re-applying it runs again and still completes (it's idempotent).
-- [ ] If Postgres is down, the job retries under its restart policy, then completes once Postgres is up.
+- [x] `global-pg-init` runs once and shows `COMPLETED`, in 6s; `valkv_apg`, `valkv_cloudlaunch`, `valkv_ingress` and `valkv_krocks` exist. Its container is removed.
+- [x] Re-applying it runs again and still completes (it's idempotent): `plan` shows `version 1 → 2 [batch: run again]`, and v2 is `COMPLETED`.
+- [x] If Postgres is down, the job retries under its restart policy, then completes once Postgres is up. With `global-pg` scaled to 0, the run's own wait (30 × `pg_isready`) ran out and it exited; the agent restarted it (restart count 1); after `global-pg` was scaled back up it completed, 5½ minutes after the apply. (A shorter outage is covered by the job's own wait: a first try with Postgres down for 150 s completed without a restart.)
 
 **apg-admin**
-- [ ] It starts, runs its migrations into `valkv_apg`, and is healthy.
-- [ ] Port 9001 is reachable from the VPC. Port 9000 is not, and listens on `127.0.0.1` only.
-- [ ] An SSM port forward to the node's `127.0.0.1:9000` opens the console, and the bootstrap admin token logs in.
-- [ ] `APG_DATABASE_URL` and the three secrets appear nowhere in `status`, the UI, events or the database. Only references or masked values do.
+- [x] It starts, runs its migrations into `valkv_apg` (27 tables), and is `HEALTHY` in 24 s, with an `http` check on `/readyz`, which pings the database. It runs on the agent node (class `app`) and reaches Postgres at `postgres.valkvork.internal`.
+- [x] Port 9001 is reachable from the VPC (from the controller node) and listens on the node's private address. Port 9000 is not reachable, and listens on `127.0.0.1` only.
+- [x] An SSM port forward to the node's `127.0.0.1:9000` opens the console (`/` → `/ui/`, the `valkv-apg` page), and the bootstrap admin token logs in: `GET /v1/session` returns `bootstrap-admin`, role `admin`. No token, or a wrong one: 401.
+- [x] `APG_DATABASE_URL` with the password, and the values of all four secrets (`POSTGRES_PASSWORD`, `APG_SECRET_KEY`, `APG_ADMIN_TOKEN`, `APG_NODE_TOKEN`), appear nowhere in `status`, the UI's API, events, the controller database or either node's journal. `status` shows `APG_DATABASE_URL = "postgresql://valkv:${secret:POSTGRES_PASSWORD}@…"` and the four `ssm:` references.
 
 **Recovery**
-- [ ] Updating `global-pg` (a short Postgres outage): apg-admin reconnects, or restarts under its policy, and is healthy again without intervention.
-- [ ] Rebooting the node that runs both: both come back with no manual steps, whichever starts first.
+- [x] Updating `global-pg` (a replacing change; Postgres was down about 6 s): apg-admin reconnected by itself and stayed `HEALTHY`, with no restart; an authenticated request that reads the database succeeds afterwards.
+- [x] Rebooting the nodes: they now run on different nodes (Postgres on the controller node, apg-admin on the agent node), so both nodes were rebooted at once. Both came back `HEALTHY` with no manual steps; apg-admin was restarted once under its policy (it started before Postgres was reachable). Postgres's data was kept and `wal_level` is still `logical`.
 
 ---
 
@@ -211,5 +221,6 @@ anything that failed and was fixed.
 | Stage | Date | Version | Result |
 |---|---|---|---|
 | 0 | 2026-11-07 | v0.2.5 | Done: node groups, workload secrets generated by Terraform, the upgrade script (goldenimage#11, #12; valkvork#8) |
-| 1 | | | Built and passing locally (unit tests, `make e2e`); AWS verification pending |
+| 1 | 2026-11-08 | v0.2.6, then 0.2.99 (dev) | **Done**, except the pause check, which a `tcp` check can't pass (F2, open). Found and fixed: a paused container taken for an exit (valkvork#10), every node reading every SSM parameter (F1) and containers not reaching their own node (F3) (goldenimage#14). Checked again on the redeployed cell |
+| 2 | 2026-11-08 | 0.2.99 (dev build of `feat/stage2-valkv-apg`) | **Done.** Batch jobs and `${secret:NAME}` in values; `postgres.valkvork.internal` (goldenimage `controller_dns_aliases`). Every check passes. The supavisor role moved to the supavisor stage |
 | 2 | | | |

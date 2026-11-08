@@ -1,0 +1,42 @@
+# Two nginx replicas, each with its own cache directory: an ephemeral volume.
+#
+# An ephemeral volume is an empty directory that belongs to one workload. The
+# agent creates it when the workload starts, at
+# <data_dir>/volumes/<workload_id>/<source>, and mounts it at `target`.
+#   - It survives restarts of the container (the restart policy reuses it).
+#   - It is deleted when the workload is stopped: a replacing update, a scale
+#     down or a move to another node starts the new workload with an empty one.
+#   - It needs nothing from the node, so replicas go anywhere, several on one
+#     node; there is no single-writer rule and no stop-first update.
+#   - It counts against [resources] disk, together with /alloc.
+#   - It starts empty: unlike a Docker named volume, the image's files at
+#     `target` are not copied into it.
+# Use it for caches and scratch space at a path the image expects. For data
+# that must outlive the workload, use a host volume (examples/postgres.toml).
+#
+# Every workload also gets /alloc, a scratch directory with the same lifetime,
+# without declaring anything; an ephemeral volume is the same thing at a path
+# you choose. Try it:
+#   valkvork apply -f examples/ephemeral-volume.toml
+#   docker exec <container> sh -c 'ls -ld /var/cache/nginx; df -h /var/cache/nginx'
+[service]
+id           = "cache-demo"
+image        = "docker.io/library/nginx:1.27-alpine"
+replicas     = 2
+kill_timeout = "2s"
+
+[resources]
+cpu    = 0.1
+memory = "32MiB"
+disk   = "256MiB"       # /alloc plus every ephemeral volume of the workload
+
+# nginx keeps its proxy and temp files here; it creates the subdirectories it
+# needs at start, so an empty directory is fine.
+[[volumes]]
+type   = "ephemeral"
+source = "nginx-cache"   # a name: the directory under <data_dir>/volumes/<workload_id>/
+target = "/var/cache/nginx"
+
+[update]
+max_parallel     = 1
+min_healthy_time = "5s"

@@ -292,14 +292,27 @@ impl Core {
         if change == ChangeKind::ScaleOnly && autoscaled && new_target == existing.target_replicas {
             change = ChangeKind::Unchanged; // `replicas` is ignored once autoscaled
         }
+        // A finished batch run applied again runs again, as a new version.
+        if change == ChangeKind::Unchanged
+            && spec.is_batch()
+            && !self
+                .workloads
+                .values()
+                .any(|w| w.service_id == id && w.is_live())
+        {
+            change = ChangeKind::Rerun;
+        }
         let halted = existing.rollout_status == RolloutStatus::Halted;
-        let version = if change == ChangeKind::Replacing {
+        let version = if matches!(change, ChangeKind::Replacing | ChangeKind::Rerun) {
             existing.version + 1
         } else {
             existing.version
         };
 
         let mut diff = existing.spec.diff_lines(&spec);
+        if change == ChangeKind::Rerun {
+            diff.push("batch run: the previous run has finished; this runs it again".into());
+        }
         if new_target != existing.target_replicas && !diff.iter().any(|d| d.starts_with("replicas"))
         {
             diff.push(format!(
@@ -314,6 +327,7 @@ impl Core {
             .count() as u32;
         let to_place = match change {
             ChangeKind::Replacing => live.max(new_target),
+            ChangeKind::Rerun => new_target,
             _ => new_target.saturating_sub(live),
         };
         // A stop-first rollout frees the old workloads' volumes and ports
@@ -340,8 +354,10 @@ impl Core {
             max_parallel: spec.update.max_parallel,
         };
 
-        let nothing_to_write =
-            hash == existing.spec_hash && new_target == existing.target_replicas && !halted;
+        let nothing_to_write = hash == existing.spec_hash
+            && new_target == existing.target_replicas
+            && !halted
+            && change != ChangeKind::Rerun;
         if dry_run || nothing_to_write {
             // AT-01: an identical re-apply writes nothing and sends nothing.
             return Ok(outcome);
@@ -372,6 +388,9 @@ impl Core {
                 format!("{id} replicas {} → {new_target}", existing.target_replicas)
             }
             ChangeKind::PolicyOnly => format!("{id} policy updated"),
+            ChangeKind::Rerun => {
+                format!("{id} v{} → v{version} (batch: run again)", existing.version)
+            }
             _ => format!("{id} re-applied"),
         };
         self.event(EventKind::Deploy, SubjectType::Service, &id, msg, actor);
@@ -429,7 +448,7 @@ impl Core {
                 && spec
                     .volumes
                     .iter()
-                    .all(|v| n.host_volumes.contains(&v.source))
+                    .all(|v| !v.is_host() || n.host_volumes.contains(&v.source))
         });
         (!fits).then(|| {
             let class = spec.required_class.as_deref().unwrap_or("any");
@@ -620,6 +639,38 @@ impl Core {
             .count() as u32
     }
 
+    /// COMPLETED runs of the service's current version.
+    fn completed_runs(&self, s: &Service) -> u32 {
+        self.workloads
+            .values()
+            .filter(|w| {
+                w.service_id == s.service_id
+                    && w.service_version == s.version
+                    && w.status == WorkloadStatus::Completed
+            })
+            .count() as u32
+    }
+
+    /// The status shown for a service. A batch service that is ACTIVE shows
+    /// where its run is instead: ACTIVE would read as "still running" for a
+    /// job that finished. DEGRADED and DELETING show as they are.
+    pub(crate) fn display_status(&self, s: &Service) -> String {
+        if !s.spec.is_batch() || s.status != ServiceStatus::Active {
+            return s.status.to_string();
+        }
+        if self.completed_runs(s) >= s.target_replicas {
+            "COMPLETED".into()
+        } else if self
+            .workloads
+            .values()
+            .any(|w| w.service_id == s.service_id && w.is_live())
+        {
+            "RUNNING".into()
+        } else {
+            "RETRYING".into()
+        }
+    }
+
     fn service_detail(&self, id: &str) -> Result<pb::ServiceDetail, ValkvorkError> {
         let s = self
             .services
@@ -635,7 +686,9 @@ impl Core {
             service_id: s.service_id.clone(),
             version: s.version,
             spec_toml: spec_to_toml(&s.spec),
-            status: s.status.to_string(),
+            status: self.display_status(s),
+            r#type: s.spec.service_type.as_str().into(),
+            completed_replicas: self.completed_runs(s),
             rollout_status: s.rollout_status.to_string(),
             target_replicas: s.target_replicas,
             running_replicas: self.count(id, WorkloadStatus::Running),
@@ -656,7 +709,9 @@ impl Core {
                 service_id: s.service_id.clone(),
                 version: s.version,
                 image: s.spec.image.clone(),
-                status: s.status.to_string(),
+                status: self.display_status(s),
+                r#type: s.spec.service_type.as_str().into(),
+                completed_replicas: self.completed_runs(s),
                 target_replicas: s.target_replicas,
                 running_replicas: self.count(&s.service_id, WorkloadStatus::Running),
                 cpu_utilization: self.service_utilisation(&s.service_id).unwrap_or(0.0),
@@ -737,6 +792,9 @@ pub fn spec_to_toml(s: &valkvork_common::models::ServiceSpec) -> String {
         "[service]\nid = {:?}\nimage = {:?}\nreplicas = {}\nkill_timeout = \"{}s\"",
         s.id, s.image, s.replicas, s.kill_timeout_seconds
     );
+    if s.is_batch() {
+        let _ = writeln!(o, "type = \"batch\"");
+    }
     for (key, list) in [("entrypoint", &s.entrypoint), ("command", &s.command)] {
         if let Some(l) = list {
             let _ = writeln!(o, "{key} = {}", toml_list(l));

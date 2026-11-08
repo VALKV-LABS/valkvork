@@ -32,6 +32,8 @@ const LABEL_KILL_TIMEOUT: &str = "valkvork.kill_timeout";
 const LABEL_DISK: &str = "valkvork.disk_bytes";
 /// The health check, so an adopted container keeps it (see `health::Probe`).
 const LABEL_CHECK: &str = "valkvork.check";
+/// "1" on a batch workload's container, so adoption knows exit 0 is success.
+const LABEL_BATCH: &str = "valkvork.batch";
 
 /// Paths a workload may never mount (FR-SEC-06).
 const FORBIDDEN_MOUNTS: &[&str] = &[
@@ -84,6 +86,8 @@ struct Local {
     /// The agent stopped the container for failing its check; its exit is
     /// restarted with reason UNHEALTHY.
     unhealthy_stop: bool,
+    /// A batch workload: exit 0 is COMPLETED, not a crash.
+    batch: bool,
 }
 
 impl Local {
@@ -122,6 +126,7 @@ impl Local {
             probing: false,
             check_gen: 0,
             unhealthy_stop: false,
+            batch: false,
         }
     }
 
@@ -177,6 +182,13 @@ impl Supervisor {
         self.cfg.data_dir.join("alloc").join(wid)
     }
 
+    /// A workload's ephemeral volumes, `<data_dir>/volumes/<wid>/<name>`:
+    /// next to its alloc directory, counted against the same disk limit and
+    /// removed with it.
+    fn volumes_dir(&self, wid: &str) -> PathBuf {
+        self.cfg.data_dir.join("volumes").join(wid)
+    }
+
     /// Marker that survives agent restarts so a FAILED container is not
     /// restarted on adoption.
     fn failed_marker(&self, wid: &str) -> PathBuf {
@@ -224,6 +236,7 @@ impl Supervisor {
                 );
                 l.container_id = Some(c.id.clone());
                 l.check = c.labels.get(LABEL_CHECK).and_then(|v| Probe::from_label(v));
+                l.batch = label(LABEL_BATCH) == "1";
                 match c.state {
                     RunState::Running | RunState::Restarting | RunState::Paused => {
                         l.state = WorkloadState::Running;
@@ -319,16 +332,15 @@ impl Supervisor {
             if map.contains_key(&cmd.workload_id) {
                 return Ok(());
             }
-            map.insert(
-                cmd.workload_id.clone(),
-                Local::new(
-                    cmd.service_id.clone(),
-                    cmd.service_version,
-                    policy,
-                    cmd.kill_timeout_seconds,
-                    cmd.disk_bytes,
-                ),
+            let mut l = Local::new(
+                cmd.service_id.clone(),
+                cmd.service_version,
+                policy,
+                cmd.kill_timeout_seconds,
+                cmd.disk_bytes,
             );
+            l.batch = cmd.batch;
+            map.insert(cmd.workload_id.clone(), l);
         }
         let _ = std::fs::remove_file(self.failed_marker(&cmd.workload_id));
         let me = self.clone();
@@ -384,6 +396,18 @@ impl Supervisor {
             read_only: false,
         }];
         for v in &cmd.volumes {
+            if v.r#type == "ephemeral" {
+                let dir = self.volumes_dir(wid).join(&v.source);
+                std::fs::create_dir_all(&dir)
+                    .and_then(|()| make_alloc_writable(&dir))
+                    .map_err(|e| ("VOLUME_DIR_FAILED".to_string(), e.to_string()))?;
+                mounts.push(BindMount {
+                    source: dir,
+                    target: v.target.clone(),
+                    read_only: false,
+                });
+                continue;
+            }
             let hv = self.cfg.host_volumes.get(&v.source).ok_or_else(|| {
                 (
                     "HOST_VOLUME_NOT_FOUND".to_string(),
@@ -405,7 +429,7 @@ impl Supervisor {
 
         // Secrets first: a reference that cannot be resolved fails the start
         // before the image is pulled. Values go only into the container's env.
-        let mut secret_env = Vec::with_capacity(cmd.secrets.len());
+        let mut secret_env: Vec<(String, String)> = Vec::with_capacity(cmd.secrets.len());
         let mut names: Vec<&String> = cmd.secrets.keys().collect();
         names.sort();
         for name in names {
@@ -447,11 +471,31 @@ impl Supervisor {
             ),
             (LABEL_DISK.to_string(), cmd.disk_bytes.to_string()),
         ]);
-        let mut env: Vec<(String, String)> = cmd
-            .env
-            .iter()
-            .map(|(k, v)| (k.clone(), v.clone()))
-            .collect();
+        if cmd.batch {
+            labels.insert(LABEL_BATCH.to_string(), "1".to_string());
+        }
+        // ${secret:NAME} inside a value: substituted here, so the value with
+        // the secret in it exists only in the container's environment.
+        let mut env: Vec<(String, String)> = Vec::with_capacity(cmd.env.len());
+        for (k, v) in &cmd.env {
+            let value = if v.contains("${secret:") {
+                valkvork_common::models::interpolate_secrets(v, |name| {
+                    secret_env
+                        .iter()
+                        .find(|(n, _)| n == name)
+                        .map(|(_, val)| val.as_str())
+                })
+                .map_err(|e| {
+                    (
+                        format!("SECRET_UNRESOLVED: {k}: {e}"),
+                        format!("env {k}: {e}"),
+                    )
+                })?
+            } else {
+                v.clone()
+            };
+            env.push((k.clone(), value));
+        }
         env.sort();
         env.extend(secret_env);
         env.push(("VALKVORK_WORKLOAD_ID".into(), wid.clone()));
@@ -632,6 +676,7 @@ impl Supervisor {
             return;
         }
         let _ = std::fs::remove_dir_all(self.alloc_dir(wid));
+        let _ = std::fs::remove_dir_all(self.volumes_dir(wid));
         let _ = std::fs::remove_file(self.failed_marker(wid));
         self.workloads.lock().unwrap().remove(wid);
         tracing::info!(workload = wid, "workload stopped and removed");
@@ -659,6 +704,13 @@ impl Supervisor {
             l.recent_restarts.pop_front();
         }
         let unhealthy = std::mem::take(&mut l.unhealthy_stop);
+        if l.batch && exit_code == 0 && !oom && !unhealthy {
+            l.state = WorkloadState::Completed;
+            l.reason = "COMPLETED".into();
+            l.health = pb::HealthState::Unspecified;
+            tracing::info!(workload = wid, "batch workload completed");
+            return;
+        }
         let reason = if oom {
             "OOM_KILLED"
         } else if unhealthy {
@@ -831,7 +883,7 @@ impl Supervisor {
                 .map(|(w, l)| (w.clone(), l.container_id.clone()))
                 .collect();
             for (wid, cid) in running {
-                let alloc = dir_size(&self.alloc_dir(&wid));
+                let alloc = dir_size(&self.alloc_dir(&wid)) + dir_size(&self.volumes_dir(&wid));
                 let rw = match (&cid, check_rw) {
                     (Some(cid), true) => self.rt.writable_layer_size(cid).await.ok(),
                     _ => None,
@@ -866,11 +918,17 @@ impl Supervisor {
     /// Sample cgroup counters and return a status for every managed container.
     /// Managed containers by state, for metrics. Cheap: no cgroup reads.
     pub fn state_counts(&self) -> std::collections::BTreeMap<&'static str, u32> {
-        let mut out: std::collections::BTreeMap<&'static str, u32> =
-            ["starting", "running", "restarting", "stopped", "failed"]
-                .into_iter()
-                .map(|s| (s, 0))
-                .collect();
+        let mut out: std::collections::BTreeMap<&'static str, u32> = [
+            "starting",
+            "running",
+            "restarting",
+            "stopped",
+            "failed",
+            "completed",
+        ]
+        .into_iter()
+        .map(|s| (s, 0))
+        .collect();
         for l in self.workloads.lock().unwrap().values() {
             let key = match l.state {
                 WorkloadState::Starting => "starting",
@@ -878,6 +936,7 @@ impl Supervisor {
                 WorkloadState::Restarting => "restarting",
                 WorkloadState::Stopped => "stopped",
                 WorkloadState::Failed => "failed",
+                WorkloadState::Completed => "completed",
                 WorkloadState::Unspecified => continue,
             };
             *out.entry(key).or_default() += 1;

@@ -766,3 +766,111 @@ async fn paused_container_is_not_an_exit() {
     assert_eq!(state_of(&s, "w1").unwrap().0, WorkloadState::Running);
     assert_eq!(rt.starts(), starts);
 }
+
+/// A batch workload that exits 0 is COMPLETED and not restarted; a non-zero
+/// exit is restarted under the policy, as for a service.
+#[tokio::test]
+async fn batch_exit_zero_completes() {
+    let d = tempfile::tempdir().unwrap();
+    let rt = Fake::new();
+    let s = supervisor(rt.clone(), d.path());
+    tokio::spawn(s.clone().run_events());
+    let mut cmd = start_cmd("job", 3);
+    cmd.batch = true;
+    s.start(cmd).await.unwrap();
+    settle().await;
+    assert_eq!(
+        rt.last_created()
+            .labels
+            .get("valkvork.batch")
+            .map(String::as_str),
+        Some("1")
+    );
+    let starts = rt.starts();
+
+    rt.crash("job", 1);
+    settle().await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(rt.starts(), starts + 1, "exit 1 is restarted");
+
+    rt.crash("job", 0);
+    settle().await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(state_of(&s, "job").unwrap().0, WorkloadState::Completed);
+    assert_eq!(rt.starts(), starts + 1, "exit 0 is not restarted");
+
+    // Adopted after an agent restart, it is still COMPLETED.
+    let s2 = supervisor(rt.clone(), d.path());
+    s2.adopt().await.unwrap();
+    assert_eq!(state_of(&s2, "job").unwrap().0, WorkloadState::Completed);
+}
+
+/// ${secret:NAME} in an env value gets the resolved secret.
+#[tokio::test]
+async fn secret_inside_a_value() {
+    let d = tempfile::tempdir().unwrap();
+    let rt = Fake::new();
+    let s = supervisor_with_secrets(rt.clone(), d.path());
+    let secrets = d.path().join("secrets");
+    std::fs::write(secrets.join("pw"), "s3cret\n").unwrap();
+    let mut cmd = start_cmd("w1", 3);
+    cmd.secrets = [(
+        "PW".to_string(),
+        format!("file:{}", secrets.join("pw").display()),
+    )]
+    .into();
+    cmd.env = [(
+        "URL".to_string(),
+        "postgresql://u:${secret:PW}@db/x".to_string(),
+    )]
+    .into();
+    s.start(cmd).await.unwrap();
+    settle().await;
+    let env = rt.last_created().env;
+    assert!(
+        env.contains(&("URL".into(), "postgresql://u:s3cret@db/x".into())),
+        "{env:?}"
+    );
+}
+
+/// An ephemeral volume is a fresh directory per workload, mounted at its
+/// target, and removed with the workload.
+#[tokio::test]
+async fn ephemeral_volume_lives_with_the_workload() {
+    let d = tempfile::tempdir().unwrap();
+    let rt = Fake::new();
+    let s = supervisor(rt.clone(), d.path());
+    let mut cmd = start_cmd("w1", 3);
+    cmd.volumes = vec![pb::VolumeMount {
+        r#type: "ephemeral".into(),
+        source: "cache".into(),
+        target: "/var/cache/app".into(),
+        read_only: false,
+    }];
+    s.start(cmd).await.unwrap();
+    settle().await;
+    let dir = d.path().join("volumes").join("w1").join("cache");
+    assert!(dir.is_dir());
+    let mount = rt
+        .last_created()
+        .mounts
+        .into_iter()
+        .find(|m| m.target == "/var/cache/app")
+        .expect("mounted at its target");
+    assert_eq!(mount.source, dir);
+    assert!(!mount.read_only);
+    std::fs::write(dir.join("f"), "x").unwrap();
+
+    s.stop(pb::StopWorkload {
+        workload_id: "w1".into(),
+        kill_timeout_seconds: 1,
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+    settle().await;
+    assert!(
+        !d.path().join("volumes").join("w1").exists(),
+        "removed with the workload"
+    );
+}

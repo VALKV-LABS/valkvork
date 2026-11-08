@@ -413,6 +413,11 @@ impl Core {
                     self.fail_workload(wid, &reason);
                 }
             }
+            WorkloadState::Completed => {
+                if matches!(status, WorkloadStatus::Assigned | WorkloadStatus::Running) {
+                    self.complete_workload(wid);
+                }
+            }
             WorkloadState::Stopped => match status {
                 WorkloadStatus::Stopping => {
                     if let Some(w) = self.wl(wid) {
@@ -455,6 +460,38 @@ impl Core {
                 format!("{svc_id} workload UNHEALTHY: health check failed; the agent restarts it"),
                 CONTROLLER,
             );
+        }
+    }
+
+    /// A batch workload exited 0: COMPLETED, its container removed, and the
+    /// service's failure streak cleared. Never replaced.
+    pub(crate) fn complete_workload(&mut self, wid: &str) {
+        let Some(w) = self.wl(wid) else { return };
+        w.status = WorkloadStatus::Completed;
+        w.status_reason = Some("COMPLETED".into());
+        w.desired_state = DesiredState::Stop;
+        if w.started_at.is_none() {
+            w.started_at = Some(now_ms());
+        }
+        let (svc_id, version, node) = (w.service_id.clone(), w.service_version, w.node_id.clone());
+        self.assigned_at.remove(wid);
+        self.cpu_samples.remove(wid);
+        if let Some(node) = node {
+            self.queue_stop(wid, &node);
+        }
+        self.event(
+            EventKind::Workload,
+            SubjectType::Workload,
+            wid,
+            format!("{svc_id} workload COMPLETED"),
+            CONTROLLER,
+        );
+        if self
+            .services
+            .get(&svc_id)
+            .is_some_and(|s| s.version == version)
+        {
+            self.clear_failures(&svc_id);
         }
     }
 
