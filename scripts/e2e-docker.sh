@@ -11,7 +11,7 @@
 # directory; folders shared from macOS cannot be chowned). Each run uses a new
 # run-<time> directory there. It uses ports 50061, 50062, 9410, 9411, 15432
 # and 18080 on the Docker host and the service ids global-pg, bad-secret,
-# web-check, pg-init, pg-fail and cache-demo, so do not run it next to a dev cluster with
+# web-check, exec-check, pg-init, pg-fail and cache-demo, so do not run it next to a dev cluster with
 # those services.
 set -eu
 W=/var/tmp/vk-e2e/run-$(date +%s)
@@ -21,7 +21,7 @@ pass() { echo "PASS: $*"; }
 
 # Remove this test's containers however it ends.
 cleanup() {
-  for svc in global-pg bad-secret web-check pg-init pg-fail cache-demo; do
+  for svc in global-pg bad-secret web-check exec-check pg-init pg-fail cache-demo; do
     for c in $(docker ps -aq --filter "label=valkvork.service_id=$svc"); do
       docker stop "$c" >/dev/null 2>&1 || true
       docker rm "$c" >/dev/null 2>&1 || true
@@ -269,7 +269,59 @@ vk events | grep 'web-check' | head -4
 vk events | grep -q 'web-check workload UNHEALTHY' || fail "no UNHEALTHY event"
 vk events | grep -q 'web-check workload FAILED: UNHEALTHY' || fail "not FAILED after its restarts"
 pass "http check failing (404): restarted under the policy, then FAILED UNHEALTHY"
+
+# The FAILED container is kept, stopped, for its logs: one per service.
+for _ in $(seq 30); do [ -n "$(ls "$W/data/kept" 2>/dev/null)" ] && break; sleep 1; done
+KEPT="$(ls "$W/data/kept" 2>/dev/null)"
+[ -n "$KEPT" ] || { tail -20 "$W/agent.log"; fail "no FAILED container kept"; }
+[ "$(echo "$KEPT" | wc -l)" = 1 ] || fail "more than one kept for the service: $KEPT"
+[ "$(docker inspect -f '{{.State.Status}}' "vk-$KEPT")" = exited ] || fail "the kept container is not stopped"
+docker logs "vk-$KEPT" 2>&1 | grep -q 'GET /missing' || fail "the kept container's logs do not show the failing requests"
 vk delete service web-check >/dev/null
+for _ in $(seq 30); do [ "$(docker ps -aq --filter label=valkvork.service_id=web-check | wc -l)" = 1 ] && break; sleep 1; done
+[ "$(docker ps -aq --filter label=valkvork.service_id=web-check | wc -l)" = 1 ] || fail "deleting the service left other containers, or removed the kept one"
+if grep -q 'adopted unknown labelled containers' "$W/agent.log"; then fail "the agent adopted the kept container"; fi
+pass "the FAILED container is kept for docker logs (vk-$KEPT), one per service, and not adopted"
+
+# ── an exec check notices a frozen process (finding F2) ─────────────────────
+cat > "$W/exec.toml" <<EOF
+[service]
+id       = "exec-check"
+image    = "docker.io/library/nginx:1.27.2-alpine"
+replicas = 1
+
+[resources]
+cpu    = 0.1
+memory = "64MiB"
+
+[check]
+type     = "exec"
+command  = ["wget", "-q", "-O", "/dev/null", "http://127.0.0.1/"]
+interval = "1s"
+timeout  = "2s"
+failures = 2
+
+[restart]
+attempts = 2
+delay    = "1s"
+EOF
+vk apply -f "$W/exec.toml" >/dev/null
+for _ in $(seq 60); do vk workloads 2>/dev/null | grep exec-check | grep -q 'RUNNING.*HEALTHY' && break; sleep 1; done
+vk workloads | grep exec-check | grep -q 'RUNNING.*HEALTHY' || { tail -20 "$W/agent.log"; fail "exec-check did not become healthy"; }
+pass "exec check passing (wget in the container)"
+ECID="$(docker ps -q --no-trunc --filter label=valkvork.service_id=exec-check)"
+docker pause "$ECID" >/dev/null
+for _ in $(seq 30); do vk events 2>/dev/null | grep -q 'exec-check workload UNHEALTHY' && break; sleep 1; done
+vk events | grep -q 'exec-check workload UNHEALTHY' || { tail -20 "$W/agent.log"; fail "a paused container was not found UNHEALTHY"; }
+for _ in $(seq 60); do
+  [ "$(docker inspect -f '{{.State.Status}}' "$ECID")" = running ] \
+    && vk workloads 2>/dev/null | grep exec-check | grep -q 'RUNNING.*HEALTHY' && break
+  sleep 1
+done
+[ "$(docker inspect -f '{{.State.Status}}' "$ECID")" = running ] || fail "the paused container was not restarted"
+vk workloads | grep exec-check | grep -q 'RUNNING.*HEALTHY' || { vk workloads; fail "not HEALTHY again after the restart"; }
+pass "a paused container fails its exec check and is restarted in place"
+vk delete service exec-check >/dev/null
 
 # ── a batch job, with a secret inside a value ───────────────────────────────
 cat > "$W/init.toml" <<EOF

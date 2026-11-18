@@ -128,9 +128,9 @@ All checked 2026-11-08, except where marked. **Checked again** the same day on t
 | # | Finding | Where | Blocks |
 |---|---|---|---|
 | F1 | **Fixed, verified on the redeployed cell.** **Every node can read every SSM parameter.** `AmazonSSMManagedInstanceCore` grants `ssm:GetParameter(s)` on `*`, which overrides the template's narrow per-node policy. Fix: an explicit `Deny` on the agent role for `/valkv/<cell>/valkvork/controller/*`, and on every role for other cells' `/valkv/*` paths; or replace the managed policy with one without the parameter actions | goldenimage template | **Fixed in goldenimage#14:** `iam.tf` denies parameter reads outside each node's list. Checked with the IAM policy simulator; needs `tofu apply` |
-| F2 | **A `tcp` check can't detect a hung process.** Postgres needs an `exec` check (`type = "exec"`, `command = ["pg_isready", "-U", "valkv"]`, run with `docker exec`) | Valkvork | Stage 1's pause check. Not Stage 2. **Open** |
+| F2 | **A `tcp` check can't detect a hung process.** Postgres needs an `exec` check (`type = "exec"`, `command = ["pg_isready", "-U", "valkv"]`, run with `docker exec`) | Valkvork | Stage 1's pause check. Not Stage 2. **Fixed** (branch `feat/failed-logs-exec-checks-restart-retry`): `type = "exec"` checks; `make e2e` pauses a container with one and sees it UNHEALTHY and restarted. Not yet run on AWS: switch global-pg's check to `pg_isready` and repeat the pause check |
 | F3 | **Fixed, verified on the redeployed cell.** **A container can't reach its own node's address.** UFW's input policy is `DROP`, and a container connecting to the node's own IP (`10.12.0.240:5432`) goes through the host's input chain, where it is dropped. From another node it works (Docker's forward rules) | goldenimage image | **Fixed in goldenimage#14:** Docker's userland proxy off, so Docker NATs that traffic through FORWARD and UFW is never involved. Tested on the agent node; needs an image rebuild, or the `daemon.json` change on running nodes. Affected any container that reaches a service on its own node by the node's address. **Not Stage 2** any more: with the controller node's class `controller`, valkv-apg runs on the agent node and reaches Postgres from there, which works |
-| F4 | A failed in-place restart fails the workload at once, instead of retrying under the restart policy. The controller then replaces it, which works, but the restart count and reason are lost | Valkvork | Nothing. **Open** |
+| F4 | A failed in-place restart fails the workload at once, instead of retrying under the restart policy. The controller then replaces it, which works, but the restart count and reason are lost | Valkvork | Nothing. **Fixed** (same branch): a failed start uses another attempt, and the workload is FAILED `START_FAILED` only once they are used up |
 
 ---
 
@@ -256,9 +256,9 @@ Names in the private zone for each (`postgres`, `apg-admin`, `global-cp`, `porta
 
 ### Open
 
-- **Logs of a FAILED workload are lost:** its container is removed, so the reason a start failed is gone unless caught live. Wanted: keep the last failed container, or its last log lines in the status.
+- **Fixed** (branch `feat/failed-logs-exec-checks-restart-retry`): **Logs of a FAILED workload were lost** when its container was removed. The agent now keeps the last FAILED container per service, stopped, for 24 hours: `docker logs vk-<workload_id>` on its node (see [supervisor.md](components/supervisor.md#keeping-a-failed-container-for-its-logs)). Logs stay on the node, so no program output reaches the controller.
 - Not deployed or not configured on this cell: cloudlaunch, OAuth sign-in, Stripe, the customer-zone launch settings (BaaS, dedicated cachedb), the Cloudflare DNS challenge and real certificates, CloudWatch log shipping.
-- From Stage 1: `exec` health checks (F2), retrying a failed in-place restart (F4).
+- **Fixed** (same branch): from Stage 1, `exec` health checks (F2) and retrying a failed in-place restart (F4).
 - System jobs (one per node) and host networking for a multi-node supavisor cluster: with one proxy node, supavisor clusters with itself over bridge networking.
 
 ## Results

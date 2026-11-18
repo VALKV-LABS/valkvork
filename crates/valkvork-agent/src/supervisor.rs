@@ -8,7 +8,7 @@
 //! It never acts on its own when the controller is unreachable except for
 //! restart-on-failure, which the policy delegates to it (FR-AGE-05).
 
-use crate::health::Probe;
+use crate::health::{CheckKind, Probe};
 use crate::runtime::{
     BindMount, ContainerRuntime, ContainerSpec, PublishedPort, RunState, RuntimeEvent,
     LABEL_WORKLOAD,
@@ -34,6 +34,10 @@ const LABEL_DISK: &str = "valkvork.disk_bytes";
 const LABEL_CHECK: &str = "valkvork.check";
 /// "1" on a batch workload's container, so adoption knows exit 0 is success.
 const LABEL_BATCH: &str = "valkvork.batch";
+
+/// How long a FAILED workload's container is kept for its logs, at most.
+/// A service's next FAILED container replaces it sooner.
+const KEEP_FAILED_FOR: Duration = Duration::from_secs(24 * 3600);
 
 /// Paths a workload may never mount (FR-SEC-06).
 const FORBIDDEN_MOUNTS: &[&str] = &[
@@ -199,6 +203,80 @@ impl Supervisor {
         self.cfg.data_dir.join("failed").join(wid)
     }
 
+    /// Marker for a FAILED workload's container kept after its stop, so
+    /// `docker logs vk-<wid>` still shows why it failed. Holds the service id.
+    /// Adoption ignores kept containers.
+    fn kept_marker(&self, wid: &str) -> PathBuf {
+        self.cfg.data_dir.join("kept").join(wid)
+    }
+
+    fn is_kept(&self, wid: &str) -> bool {
+        self.kept_marker(wid).exists()
+    }
+
+    /// Kept containers: (workload id, service id, marker age).
+    fn kept(&self) -> Vec<(String, String, Duration)> {
+        let Ok(dir) = std::fs::read_dir(self.cfg.data_dir.join("kept")) else {
+            return Vec::new();
+        };
+        dir.filter_map(|e| {
+            let e = e.ok()?;
+            let wid = e.file_name().into_string().ok()?;
+            let svc = std::fs::read_to_string(e.path()).unwrap_or_default();
+            let age = e
+                .metadata()
+                .ok()?
+                .modified()
+                .ok()?
+                .elapsed()
+                .unwrap_or_default();
+            Some((wid, svc, age))
+        })
+        .collect()
+    }
+
+    /// Remove a kept container and its marker.
+    async fn drop_kept(&self, wid: &str) {
+        match self.rt.remove(&format!("vk-{wid}")).await {
+            Ok(()) => {
+                let _ = std::fs::remove_file(self.kept_marker(wid));
+                tracing::info!(workload = wid, "removed the kept FAILED container");
+            }
+            Err(e) => {
+                tracing::warn!(workload = wid, error = %e, "removing a kept container failed")
+            }
+        }
+    }
+
+    /// Keep `wid`'s stopped container for its logs, replacing the service's
+    /// previously kept one.
+    async fn keep_failed(&self, wid: &str, service_id: &str) {
+        for (other, svc, _) in self.kept() {
+            if svc == service_id && other != wid {
+                self.drop_kept(&other).await;
+            }
+        }
+        let marker = self.kept_marker(wid);
+        if let Some(dir) = marker.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        let _ = std::fs::write(marker, service_id);
+        tracing::info!(
+            workload = wid,
+            service = service_id,
+            "kept the FAILED container for its logs: docker logs vk-{wid}"
+        );
+    }
+
+    /// Remove kept containers older than KEEP_FAILED_FOR.
+    async fn prune_kept(&self) {
+        for (wid, _, age) in self.kept() {
+            if age > KEEP_FAILED_FOR {
+                self.drop_kept(&wid).await;
+            }
+        }
+    }
+
     fn mark_failed(&self, wid: &str, l: &mut Local, reason: &str) {
         l.state = WorkloadState::Failed;
         l.reason = reason.to_string();
@@ -226,8 +304,8 @@ impl Supervisor {
                 let Some(wid) = c.labels.get(LABEL_WORKLOAD).cloned() else {
                     continue;
                 };
-                if map.contains_key(&wid) {
-                    continue; // already managed
+                if map.contains_key(&wid) || self.is_kept(&wid) {
+                    continue; // already managed, or a FAILED one kept for its logs
                 }
                 let label = |k: &str| c.labels.get(k).cloned().unwrap_or_default();
                 let policy = parse_policy(&label(LABEL_RESTART));
@@ -703,9 +781,28 @@ impl Supervisor {
     }
 
     async fn finish_stop(&self, wid: &str, container_id: Option<String>, timeout: u32) {
+        if self.is_kept(wid) {
+            return; // already stopped, and kept for its logs
+        }
+        // A FAILED container is kept, stopped, so its logs show why it failed.
+        // Not one that filled its disk: its writable layer is the problem.
+        let keep = self.workloads.lock().unwrap().get(wid).and_then(|l| {
+            (l.state == WorkloadState::Failed
+                && l.container_id.is_some()
+                && l.reason != "EPHEMERAL_DISK_EXCEEDED")
+                .then(|| l.service_id.clone())
+        });
         let id = container_id.unwrap_or_else(|| format!("vk-{wid}"));
         if let Err(e) = self.rt.stop(&id, timeout).await {
             tracing::warn!(workload = wid, error = %e, "stop failed; removing forcibly");
+        }
+        if let Some(service_id) = keep {
+            self.keep_failed(wid, &service_id).await;
+            let _ = std::fs::remove_dir_all(self.alloc_dir(wid));
+            let _ = std::fs::remove_dir_all(self.volumes_dir(wid));
+            let _ = std::fs::remove_file(self.failed_marker(wid));
+            self.workloads.lock().unwrap().remove(wid);
+            return;
         }
         if let Err(e) = self.rt.remove(&id).await {
             tracing::warn!(workload = wid, error = %e, "remove failed");
@@ -758,13 +855,8 @@ impl Supervisor {
         } else {
             "EXITED"
         };
-        if (l.recent_restarts.len() as u32) < l.policy.attempts {
-            l.state = WorkloadState::Restarting;
+        if Self::take_restart(l, now) {
             l.reason = format!("{reason}({exit_code})");
-            l.restart_count += 1;
-            crate::metrics::LOCAL_RESTARTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            l.recent_restarts.push_back(now);
-            let (delay, cid) = (l.policy.delay, l.container_id.clone());
             tracing::info!(
                 workload = wid,
                 exit_code,
@@ -772,35 +864,86 @@ impl Supervisor {
                 restart = l.restart_count,
                 "container exited; restarting in place"
             );
+            let delay = l.policy.delay;
             drop(map);
-            let me = self.clone();
-            let wid = wid.to_string();
-            tokio::spawn(async move {
-                tokio::time::sleep(delay).await;
-                if me.is_stopping(&wid) {
-                    return;
-                }
-                let ok = match &cid {
-                    Some(cid) => me.rt.start(cid).await.is_ok(),
-                    None => false,
-                };
-                let mut map = me.workloads.lock().unwrap();
-                if let Some(l) = map.get_mut(&wid) {
-                    if l.state == WorkloadState::Restarting {
-                        if ok {
-                            l.state = WorkloadState::Running;
-                            l.cpu = CpuRate::default();
-                            l.reset_check();
-                        } else {
-                            me.mark_failed(&wid, l, "START_FAILED");
-                        }
-                    }
-                }
-            });
+            self.restart_in_place(wid.to_string(), delay);
         } else {
             l.exit_code = exit_code;
             self.mark_failed(wid, l, reason);
         }
+    }
+
+    /// Use one of the policy's attempts for an in-place restart, if any are
+    /// left in the window (which the caller has already trimmed).
+    fn take_restart(l: &mut Local, now: Instant) -> bool {
+        if (l.recent_restarts.len() as u32) >= l.policy.attempts {
+            return false;
+        }
+        l.state = WorkloadState::Restarting;
+        l.restart_count += 1;
+        crate::metrics::LOCAL_RESTARTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        l.recent_restarts.push_back(now);
+        true
+    }
+
+    /// Start the stopped container again after `delay`. A start that fails
+    /// uses another attempt and tries again; the workload is FAILED
+    /// (START_FAILED) only once the attempts are used up (finding F4).
+    fn restart_in_place(self: &Arc<Self>, wid: String, delay: Duration) {
+        let me = self.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(delay).await;
+            if me.is_stopping(&wid) {
+                return;
+            }
+            let Some(cid) = me.container_of(&wid) else {
+                if let Some(l) = me.workloads.lock().unwrap().get_mut(&wid) {
+                    if l.state == WorkloadState::Restarting {
+                        me.mark_failed(&wid, l, "START_FAILED");
+                    }
+                }
+                return;
+            };
+            let result = me.rt.start(&cid).await;
+            let mut map = me.workloads.lock().unwrap();
+            let Some(l) = map.get_mut(&wid) else { return };
+            if l.state != WorkloadState::Restarting || l.stopping {
+                return;
+            }
+            match result {
+                Ok(()) => {
+                    l.state = WorkloadState::Running;
+                    l.cpu = CpuRate::default();
+                    l.reset_check();
+                }
+                Err(e) => {
+                    let now = Instant::now();
+                    let window = l.policy.interval;
+                    while l
+                        .recent_restarts
+                        .front()
+                        .is_some_and(|t| now.duration_since(*t) > window)
+                    {
+                        l.recent_restarts.pop_front();
+                    }
+                    if Self::take_restart(l, now) {
+                        l.reason = "START_FAILED".into();
+                        tracing::warn!(
+                            workload = %wid,
+                            error = %e,
+                            restart = l.restart_count,
+                            "in-place restart failed; trying again"
+                        );
+                        let delay = l.policy.delay;
+                        drop(map);
+                        me.restart_in_place(wid, delay);
+                    } else {
+                        tracing::warn!(workload = %wid, error = %e, "in-place restart failed");
+                        me.mark_failed(&wid, l, "START_FAILED");
+                    }
+                }
+            }
+        });
     }
 
     /// Consume runtime events forever, resubscribing if the runtime restarts.
@@ -850,7 +993,7 @@ impl Supervisor {
             list.iter().any(|c| {
                 c.labels
                     .get(LABEL_WORKLOAD)
-                    .is_some_and(|w| !map.contains_key(w))
+                    .is_some_and(|w| !map.contains_key(w) && !self.is_kept(w))
             })
         };
         if unknown {
@@ -897,9 +1040,14 @@ impl Supervisor {
     /// Periodic resync, for runtimes whose event stream silently stalls.
     pub async fn run_resync(self: Arc<Self>) {
         let mut tick = tokio::time::interval(Duration::from_secs(10));
+        let mut n: u64 = 0;
         loop {
             tick.tick().await;
             self.resync().await;
+            if n.is_multiple_of(30) {
+                self.prune_kept().await; // every 5 minutes
+            }
+            n += 1;
         }
     }
 
@@ -992,6 +1140,21 @@ impl Supervisor {
         ports: &[pb::PortMapping],
     ) -> Result<Probe, (String, String)> {
         let bad = |msg: String| ("CHECK_INVALID".to_string(), msg);
+        let timing = |kind| Probe {
+            kind,
+            interval: Duration::from_secs(c.interval_seconds.max(1) as u64),
+            timeout: Duration::from_secs(c.timeout_seconds.max(1) as u64),
+            failures: c.failures.max(1),
+            grace: Duration::from_secs(c.grace_seconds as u64),
+        };
+        if c.r#type == "exec" {
+            if c.command.first().is_none_or(|p| p.is_empty()) {
+                return Err(bad("an exec check needs a command".into()));
+            }
+            return Ok(timing(CheckKind::Exec {
+                command: c.command.clone(),
+            }));
+        }
         let port = ports
             .iter()
             .find(|p| p.name == c.port_name)
@@ -1013,19 +1176,19 @@ impl Supervisor {
                 .parse()
                 .map_err(|_| bad(format!("bad host_ip {other:?}")))?,
         };
-        Ok(Probe {
-            http: c.r#type == "http",
-            target: std::net::SocketAddr::new(ip, port.host_port as u16),
-            path: if c.path.is_empty() {
-                "/".into()
-            } else {
-                c.path.clone()
-            },
-            interval: Duration::from_secs(c.interval_seconds.max(1) as u64),
-            timeout: Duration::from_secs(c.timeout_seconds.max(1) as u64),
-            failures: c.failures.max(1),
-            grace: Duration::from_secs(c.grace_seconds as u64),
-        })
+        let target = std::net::SocketAddr::new(ip, port.host_port as u16);
+        Ok(timing(if c.r#type == "http" {
+            CheckKind::Http {
+                target,
+                path: if c.path.is_empty() {
+                    "/".into()
+                } else {
+                    c.path.clone()
+                },
+            }
+        } else {
+            CheckKind::Tcp { target }
+        }))
     }
 
     // ------------------------------------------------------------------
@@ -1059,15 +1222,36 @@ impl Supervisor {
                 }
                 l.probing = true;
                 l.next_check = now + p.interval;
-                due.push((wid.clone(), l.check_gen, p.clone()));
+                due.push((wid.clone(), l.check_gen, p.clone(), l.container_id.clone()));
             }
         }
-        for (wid, gen, probe) in due {
+        for (wid, gen, probe, cid) in due {
             let me = self.clone();
             tokio::spawn(async move {
-                let result = probe.run().await;
+                let result = match &probe.kind {
+                    CheckKind::Exec { command } => me.exec_probe(cid, command, probe.timeout).await,
+                    _ => probe.run().await,
+                };
                 me.probe_result(&wid, gen, result);
             });
+        }
+    }
+
+    /// An exec check: the command in the container, healthy on exit 0. A
+    /// paused container fails it (Docker refuses to exec into one), and a
+    /// hung process times it out.
+    async fn exec_probe(
+        &self,
+        cid: Option<String>,
+        command: &[String],
+        timeout: Duration,
+    ) -> Result<(), String> {
+        let cid = cid.ok_or("no container")?;
+        match tokio::time::timeout(timeout, self.rt.exec(&cid, command)).await {
+            Err(_) => Err(format!("timed out after {}s", timeout.as_secs())),
+            Ok(Err(e)) => Err(format!("exec: {e}")),
+            Ok(Ok(0)) => Ok(()),
+            Ok(Ok(code)) => Err(format!("exited {code}")),
         }
     }
 

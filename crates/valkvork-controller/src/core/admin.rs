@@ -859,9 +859,16 @@ pub fn spec_to_toml(s: &valkvork_common::models::ServiceSpec) -> String {
         );
     }
     if let Some(c) = &s.check {
-        let _ = writeln!(o, "[check]\ntype = {:?}\nport = {:?}", c.kind, c.port);
+        let _ = writeln!(o, "[check]\ntype = {:?}", c.kind);
+        if !c.port.is_empty() {
+            let _ = writeln!(o, "port = {:?}", c.port);
+        }
         if let Some(p) = &c.path {
             let _ = writeln!(o, "path = {p:?}");
+        }
+        if let Some(cmd) = &c.command {
+            let quoted: Vec<String> = cmd.iter().map(|a| format!("{a:?}")).collect();
+            let _ = writeln!(o, "command = [{}]", quoted.join(", "));
         }
         let _ = writeln!(
             o,

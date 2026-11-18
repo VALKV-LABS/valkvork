@@ -22,6 +22,7 @@ pub trait ContainerRuntime: Send + Sync + 'static {
     fn events(&self, label: &str) -> BoxStream<'static, Result<RuntimeEvent>>;   // Died, Oom
     fn cgroup_paths(&self, id: &str) -> Vec<PathBuf>;
     async fn writable_layer_size(&self, id: &str) -> Result<u64>;
+    async fn exec(&self, id: &str, cmd: &[String]) -> Result<i64>;
 }
 ```
 
@@ -41,6 +42,7 @@ pub trait ContainerRuntime: Send + Sync + 'static {
 | `inspect` | `GET /containers/{id}/json` | state, exit code, OOM flag |
 | `events` | `GET /events` filtered by `type=container`, the label, and `event=die,oom` | `exitCode` from the event attributes |
 | `writable_layer_size` | `GET /containers/{id}/json?size=true` | `SizeRw` |
+| `exec` | `POST /containers/{id}/exec`, `POST /exec/{id}/start` (attached; output read and dropped), `GET /exec/{id}/json` | Its `ExitCode`. For `exec` health checks |
 | `cgroup_paths` | none | `/sys/fs/cgroup/system.slice/docker-<id>.scope`, `/sys/fs/cgroup/docker/<id>` |
 
 ## Registry Credentials

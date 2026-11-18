@@ -65,11 +65,25 @@ A host volume is mounted read-only if either the manifest or `agent.toml` says s
 ```
 StopWorkload
   mark stopping, ack, then: stop with the kill timeout (SIGTERM, wait, SIGKILL),
-  remove the container, delete its alloc and ephemeral volume directories and its
-  failed marker, forget it
+  remove the container (or keep it, if FAILED: below), delete its alloc and
+  ephemeral volume directories and its failed marker, forget it
 ```
 
 A stop that arrives while the start is still pulling is finished as soon as the start returns. If removing the container fails, the entry is kept, so the controller keeps seeing it and asks again.
+
+### Keeping a FAILED Container for Its Logs
+
+The controller stops every FAILED workload, and removing its container would remove its logs, and with them the reason it failed. So the stop of a FAILED workload keeps its container, stopped, and the agent logs `kept the FAILED container for its logs: docker logs vk-<workload_id>`. On the node:
+
+```
+docker logs vk-<workload_id>       # the workload id is in the FAILED event
+docker inspect vk-<workload_id>    # State.ExitCode, State.Error, State.OOMKilled
+```
+
+- **One per service.** The service's next kept container replaces it. A kept one is removed after 24 hours (checked every 5 minutes).
+- **Not one that filled its disk** (`EPHEMERAL_DISK_EXCEEDED`): its writable layer is what used the disk.
+- **Logs stay on the node.** They are not sent to the controller, which never sees a workload's output (or any secret a program prints).
+- Its alloc and ephemeral volume directories are deleted as for any stop. A marker, `<data_dir>/kept/<workload_id>` holding the service id, tells adoption and resync to leave the container alone: it is not reported, adopted or restarted. A failed workload without a container (a failed pull, an unresolved secret) has nothing to keep.
 
 ## Restart Policy
 
@@ -80,6 +94,8 @@ a batch workload (label valkvork.batch=1) that exited 0, not OOM or unhealthy?
   yes → COMPLETED; never restarted (the controller then has it removed)
 attempts used in the last `interval` < `attempts`?
   yes → RESTARTING, wait `delay`, start the same container again → RUNNING
+        the start fails? the same question again: another attempt, reason START_FAILED,
+        or FAILED START_FAILED once they are used up
   no  → FAILED with reason OOM_KILLED (after an oom event), UNHEALTHY (stopped for its check) or EXITED;
         leave the container stopped
 ```
@@ -90,7 +106,7 @@ A failed workload also gets a marker file, `<data_dir>/failed/<workload_id>`, ho
 
 ## Health Checks
 
-Every second, the agent starts the probes that are due: one per RUNNING workload with a check, every `interval`, never two at once for one workload. A probe connects to the published port at its bind address (`127.0.0.1` for every address), and for `http` sends `GET <path>` and reads the status line.
+Every second, the agent starts the probes that are due: one per RUNNING workload with a check, every `interval`, never two at once for one workload. A `tcp` or `http` probe connects to the published port at its bind address (`127.0.0.1` for every address), and for `http` sends `GET <path>` and reads the status line. An `exec` probe runs the command in the container through the runtime's `exec`, discards its output and passes on exit code 0; an error from Docker (such as a paused container) or the timeout is a failure.
 
 | Result | Effect |
 |---|---|
@@ -108,6 +124,7 @@ At startup, and whenever a resync finds a labelled container it does not know, t
 |---|---|
 | running or restarting | RUNNING, untouched |
 | exited, with a failed marker | FAILED, with the marker's reason, untouched |
+| with a kept marker (a FAILED container kept for its logs) | ignored |
 | exited, no marker (it died while the agent was down) | handled as an exit under the restart policy |
 | created, never started (the agent died mid-start) | started |
 

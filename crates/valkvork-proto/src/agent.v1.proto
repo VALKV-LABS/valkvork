@@ -107,13 +107,14 @@ message StartWorkload {
 // The agent probes the workload through one of its published ports, at the
 // port's bind address (127.0.0.1 when it binds every address).
 message HealthCheck {
-  string type = 1;                     // "tcp" or "http"
-  string port_name = 2;                // a PortMapping name
+  string type = 1;                     // "tcp", "http" or "exec"
+  string port_name = 2;                // a PortMapping name; not for exec
   string path = 3;                     // http only
   uint32 interval_seconds = 4;
   uint32 timeout_seconds = 5;
   uint32 failures = 6;                 // consecutive failures before a restart
   uint32 grace_seconds = 7;            // after a start, failures before the first success are not counted
+  repeated string command = 8;         // exec only: run in the container, healthy on exit 0
 }
 
 enum HealthState {
