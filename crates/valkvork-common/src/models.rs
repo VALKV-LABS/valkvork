@@ -212,17 +212,22 @@ impl VolumeSpec {
 }
 
 /// A health check (`[check]`): the agent probes the workload through one of
-/// its published ports.
+/// its published ports, or runs a command inside its container.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CheckSpec {
-    /// `tcp` (connects) or `http` (GET, healthy on 2xx and 3xx).
+    /// `tcp` (connects), `http` (GET, healthy on 2xx and 3xx) or `exec`
+    /// (runs `command` in the container, healthy on exit 0).
     #[serde(rename = "type")]
     pub kind: String,
-    /// A `[[ports]]` name.
+    /// A `[[ports]]` name; empty for `exec`.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub port: String,
     /// HTTP path; only for `http`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub path: Option<String>,
+    /// The command; only for `exec`. Not run through a shell.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command: Option<Vec<String>>,
     pub interval_seconds: u32,
     pub timeout_seconds: u32,
     /// Consecutive failures that make the workload unhealthy and restart it.
@@ -284,6 +289,7 @@ pub const AGENT_FEATURES: &[&str] = &[
     "batch",
     "command",
     "ephemeral_volumes",
+    "exec_checks",
     "health_checks",
     "host_ip",
     "node_values",
@@ -380,8 +386,11 @@ impl ServiceSpec {
         if self.command.is_some() || self.entrypoint.is_some() {
             f.push("command");
         }
-        if self.check.is_some() {
+        if let Some(c) = &self.check {
             f.push("health_checks");
+            if c.kind == "exec" {
+                f.push("exec_checks");
+            }
         }
         if self.ports.iter().any(|p| p.host_ip.is_some()) {
             f.push("host_ip");

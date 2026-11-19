@@ -135,6 +135,9 @@ pub trait ContainerRuntime: Send + Sync + 'static {
     fn cgroup_paths(&self, id: &str) -> Vec<PathBuf>;
     /// Writable layer size (`SizeRw`), expensive (FR-AGE-08).
     async fn writable_layer_size(&self, id: &str) -> Result<u64>;
+    /// Run `cmd` inside the running container (`docker exec`) and return its
+    /// exit code. Output is discarded. The caller bounds the time.
+    async fn exec(&self, id: &str, cmd: &[String]) -> Result<i64>;
 }
 
 // ============================================================================
@@ -457,6 +460,43 @@ impl ContainerRuntime for DockerRuntime {
             .await
             .map_err(map_err)?;
         Ok(r.size_rw.unwrap_or(0).max(0) as u64)
+    }
+
+    async fn exec(&self, id: &str, cmd: &[String]) -> Result<i64> {
+        use bollard::exec::{CreateExecOptions, StartExecResults};
+        let created = self
+            .docker
+            .create_exec(
+                id,
+                CreateExecOptions {
+                    cmd: Some(cmd.to_vec()),
+                    attach_stdout: Some(true),
+                    attach_stderr: Some(true),
+                    ..Default::default()
+                },
+            )
+            .await
+            .map_err(map_err)?;
+        // Attached, so the call returns when the command ends; the output is
+        // read and dropped.
+        if let StartExecResults::Attached { mut output, .. } = self
+            .docker
+            .start_exec(&created.id, None)
+            .await
+            .map_err(map_err)?
+        {
+            while let Some(chunk) = output.next().await {
+                chunk.map_err(map_err)?;
+            }
+        }
+        let inspected = self
+            .docker
+            .inspect_exec(&created.id)
+            .await
+            .map_err(map_err)?;
+        inspected
+            .exit_code
+            .ok_or_else(|| RuntimeError::Other("exec finished without an exit code".into()))
     }
 }
 

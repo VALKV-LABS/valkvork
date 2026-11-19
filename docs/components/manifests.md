@@ -51,10 +51,11 @@ min_replicas       = 3
 max_replicas       = 10
 target_cpu_percent = 75
 
-[check]                        # optional health check, through a published port
-type     = "http"              # "tcp" (connects) or "http" (GET; healthy on 2xx and 3xx)
-port     = "http"              # a [[ports]] name
+[check]                        # optional health check
+type     = "http"              # "tcp" (connects), "http" (GET; healthy on 2xx and 3xx) or "exec"
+port     = "http"              # a [[ports]] name; tcp and http only
 path     = "/healthz"          # http only; default "/"
+# command = ["pg_isready", "-U", "valkv"]  # exec only: run in the container, healthy on exit 0
 interval = "10s"
 timeout  = "2s"
 failures = 3                   # consecutive failures before the container is restarted
@@ -90,14 +91,17 @@ Durations are `<n>s`, `<n>m`, `<n>h`, or a bare number of seconds. Sizes are an 
 
 ### Health Checks
 
-With `[check]`, the agent probes the workload through one of its published ports, at that port's bind address: `127.0.0.1` when it binds every address, the node's address for `host_ip = "advertise"`. A `tcp` check passes when it can connect; an `http` check sends `GET path` and passes on a 2xx or 3xx status. Each probe has `timeout` to answer.
+With `[check]`, the agent checks the workload every `interval`, and each check has `timeout` to finish:
+
+- `tcp` and `http` probe one of its published ports, at that port's bind address: `127.0.0.1` when it binds every address, the node's address for `host_ip = "advertise"`. A `tcp` check passes when it can connect; an `http` check sends `GET path` and passes on a 2xx or 3xx status.
+- `exec` runs `command` inside the container, as `docker exec` does, and passes when it exits 0. It needs no port. The command is not run through a shell; use `["sh", "-c", "..."]` for one. It runs as the image's user, with the container's environment.
 
 - A workload is `STARTING` until its first passing probe, then `HEALTHY`. After a (re)start, failures before the first success don't count during `grace`.
 - After `failures` consecutive failures it is `UNHEALTHY`: the agent stops the container, and the restart policy restarts it, with reason `UNHEALTHY`, or marks it FAILED when the policy is used up. The controller logs an event.
 - **Rollouts and drains wait for health.** A replacement counts once it has been `HEALTHY` for `min_healthy_time`, not merely running.
 - Health shows in `valkvork status` and `valkvork workloads` (`HEALTH`), the UI, and the metric `valkvork_workload_health`.
 
-The check needs a published port; there are no exec checks yet. A `tcp` check only proves the port accepts connections: the kernel accepts them for a listening socket even while the process is frozen or hung, so it detects a process that exited or stopped listening, not one that stopped answering. Use `http` where the service has an endpoint.
+A `tcp` check only proves the port accepts connections: the kernel accepts them for a listening socket even while the process is frozen or hung, so it detects a process that exited or stopped listening, not one that stopped answering. Use `http` where the service has an endpoint, or `exec` with the service's own client, such as `pg_isready` for Postgres. An `exec` check also fails on a frozen (`docker pause`d) container, which Docker refuses to exec into, and times out on a hung process. It needs an agent with the `exec_checks` feature.
 
 ### Volumes
 
@@ -180,7 +184,7 @@ Validation runs before any database write. A failure writes nothing, returns gRP
 | VE-05 | Ports in 1–65535; `host_port` unique within the manifest; `host_port < 1024` is a **warning**; `host_ip` is an IP address or `"advertise"` | `INVALID_PORT_SPEC` |
 | VE-06 | No unknown keys or tables (`deny_unknown_fields`). The path names the table, e.g. `service.replica` or `ports.hostport` | `UNKNOWN_FIELD` |
 | VE-07 | Each volume has a known `type` (`host` or `ephemeral`), a source, an absolute `target` that is unique and not `/alloc`. An ephemeral volume's source is a name, and it takes no `read_only` or `single_writer` | `INVALID_VOLUME_SPEC` |
-| VE-09 | `check.type` is `tcp` or `http`; `check.port` names a `[[ports]]` entry; `path` only for `http`, starting with `/`; `failures` 1–1000 | `INVALID_CHECK_SPEC` |
+| VE-09 | `check.type` is `tcp`, `http` or `exec`; `check.port` names a `[[ports]]` entry, for `tcp` and `http` only; `path` only for `http`, starting with `/`; `command` only for `exec`, and not empty; `failures` 1–1000 | `INVALID_CHECK_SPEC` |
 | VE-08 | Each secret's name is an environment variable name not also in `[env]`, and its reference is `ssm:<parameter name>` or `file:<absolute path>`. Every `${secret:NAME}` in an `[env]` value is closed and names a `[secrets]` key | `INVALID_SECRET_REF` |
 | VW-01 | **Warning** at apply or plan: no current healthy node of the class could fit one replica, or none has the host volumes | `UNSATISFIABLE_NOW` |
 

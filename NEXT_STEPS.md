@@ -1,19 +1,12 @@
 # Next steps
 
-**Current plan: [platform workloads](docs/platform-workloads.md).** Stages 0–3 are done
-and verified on AWS (2026-11-08): every platform service runs on the dev cell. It comes before
-everything below and before [phase-2.md](docs/phase-2.md). In stages, it builds what
-Valkvork needs to run the Valkv platform's own services, and verifies each one on the AWS
-dev cell:
+**The [platform workloads plan](docs/platform-workloads.md) is done.** Stages 0–3 were
+verified on AWS (2026-11-08): every platform service runs on the dev cell. Three of its
+follow-ups are built on branch `feat/failed-logs-exec-checks-restart-retry` and pass
+`make e2e`, not yet on AWS: FAILED containers kept for their logs, `exec` health checks (F2),
+and retrying a failed in-place restart (F4).
 
-0. **Test bed:** separate node groups and workload-secret access in the goldenimage
-   template, and a dev-cell upgrade script.
-1. **Postgres** (`global-pg`): secret references, bind address per port, health checks,
-   `command` and `args`.
-2. **The gateway control plane** (`valkv-apg`): secrets inside values, batch jobs, and a
-   private DNS name for Postgres.
-
-The items below remain, after that plan.
+The items below remain.
 
 What is not built yet. The rest of the [spec](spec.md)'s MVP scope is implemented and described in [docs/](docs/components/index.md); items tagged [P2], [P3] or [Later] in the spec are deliberately out of scope for now and are collected, with design sketches, in [docs/phase-2.md](docs/phase-2.md).
 
@@ -46,14 +39,8 @@ that should be revisited once Stage 2 is verified:
   and `/proc/<pid>/environ`, and rotatable without a restart.
 - **Caching resolved secrets** on the agent, so a restart while SSM is unreachable can still
   start the container.
-- **`exec` health checks** (finding F2): a `tcp` check can't detect a hung process, so
-  Postgres's check can't catch a frozen database. `type = "exec"` running `pg_isready` in
-  the container would.
-- **Keep a FAILED workload's logs.** Its container is removed, so the reason a start failed
-  is lost unless someone catches it live (seen with the gateway and supavisor in Stage 3).
-  Keep the last failed container per service, or its last log lines in the status.
-- **Retrying a failed in-place restart** (finding F4) under the restart policy, instead of
-  failing the workload at once.
+- **Use the `exec` check for global-pg** (`command = ["pg_isready", "-U", "valkv"]`) and
+  repeat Stage 1's pause check on the dev cell.
 - **Containers' access to the node's role.** Every container on a node can use its instance
   role, so it can read every secret that node can. Look at per-workload credentials, or
   blocking the metadata service from containers that don't need it.

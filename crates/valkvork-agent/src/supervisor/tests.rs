@@ -22,6 +22,11 @@ struct FakeState {
     starts: u32,
     next: u32,
     fail_pull: bool,
+    /// The next this many starts fail.
+    fail_starts: u32,
+    /// What an exec returns; None makes it error.
+    exec_exit: Option<i64>,
+    execs: Vec<(String, Vec<String>)>,
 }
 
 struct Fake {
@@ -102,6 +107,10 @@ impl ContainerRuntime for Fake {
     async fn start(&self, id: &str) -> RtResult<()> {
         let mut s = self.s.lock().unwrap();
         s.starts += 1;
+        if s.fail_starts > 0 {
+            s.fail_starts -= 1;
+            return Err(RuntimeError::Other("start refused".into()));
+        }
         s.containers
             .get_mut(id)
             .ok_or_else(|| RuntimeError::NotFound(id.into()))?
@@ -191,6 +200,17 @@ impl ContainerRuntime for Fake {
     }
     async fn writable_layer_size(&self, _: &str) -> RtResult<u64> {
         Ok(0)
+    }
+    async fn exec(&self, id: &str, cmd: &[String]) -> RtResult<i64> {
+        let mut s = self.s.lock().unwrap();
+        s.execs.push((id.into(), cmd.to_vec()));
+        if s.containers.get(id).map(|c| c.state) != Some(RunState::Running) {
+            return Err(RuntimeError::Other(format!(
+                "container {id} is not running"
+            )));
+        }
+        s.exec_exit
+            .ok_or_else(|| RuntimeError::Other("exec failed".into()))
     }
 }
 
@@ -916,4 +936,140 @@ async fn node_values_in_env() {
         env.contains(&("NODE".into(), "node-1/app/host-1".into())),
         "{env:?}"
     );
+}
+
+fn stop_cmd(wid: &str) -> pb::StopWorkload {
+    pb::StopWorkload {
+        command_id: "s".into(),
+        workload_id: wid.into(),
+        kill_timeout_seconds: 1,
+    }
+}
+
+/// An exec check runs its command in the container: exit 0 is healthy, a
+/// non-zero exit (or a paused container, which Docker refuses to exec into)
+/// counts as a failure and restarts it (finding F2).
+#[tokio::test]
+async fn exec_health_check() {
+    let d = tempfile::tempdir().unwrap();
+    let rt = Fake::new();
+    rt.s.lock().unwrap().exec_exit = Some(0);
+    let s = supervisor(rt.clone(), d.path());
+    tokio::spawn(s.clone().run_events());
+    tokio::spawn(s.clone().run_health_checks());
+    let mut cmd = start_cmd("w1", 3);
+    cmd.check = Some(pb::HealthCheck {
+        r#type: "exec".into(),
+        command: vec!["pg_isready".into(), "-U".into(), "valkv".into()],
+        interval_seconds: 1,
+        timeout_seconds: 1,
+        failures: 2,
+        ..Default::default()
+    });
+    s.start(cmd).await.unwrap();
+    settle().await;
+    let label = rt.last_created().labels["valkvork.check"].clone();
+    assert!(label.starts_with("exec|-|"), "{label}");
+
+    wait_health(&s, |h| h.0 == pb::HealthState::Healthy).await;
+    let (cid, argv) = rt.s.lock().unwrap().execs[0].clone();
+    assert_eq!(argv, ["pg_isready", "-U", "valkv"]);
+    assert_eq!(Some(cid), s.container_of("w1"));
+
+    rt.s.lock().unwrap().exec_exit = Some(2); // "no response"
+    let (_, restarts, reason) = wait_health(&s, |h| h.1 == 1).await;
+    assert_eq!(restarts, 1);
+    assert!(reason.starts_with("UNHEALTHY"), "{reason}");
+
+    // Adoption rebuilds the exec check from the label.
+    let s2 = supervisor(rt.clone(), d.path());
+    s2.adopt().await.unwrap();
+    let check = s2.workloads.lock().unwrap()["w1"].check.clone().unwrap();
+    assert_eq!(
+        check.kind,
+        CheckKind::Exec {
+            command: vec!["pg_isready".into(), "-U".into(), "valkv".into()]
+        }
+    );
+}
+
+/// A failed in-place restart uses another attempt and tries again, instead
+/// of failing the workload at once (finding F4).
+#[tokio::test]
+async fn failed_in_place_restart_is_retried() {
+    let d = tempfile::tempdir().unwrap();
+    let rt = Fake::new();
+    let s = supervisor(rt.clone(), d.path());
+    tokio::spawn(s.clone().run_events());
+    settle().await;
+    s.start(start_cmd("w1", 3)).await.unwrap();
+    settle().await;
+
+    rt.s.lock().unwrap().fail_starts = 1;
+    rt.crash("w1", 1);
+    settle().await;
+    let (st, _, restarts) = state_of(&s, "w1").unwrap();
+    assert_eq!((st, restarts), (WorkloadState::Running, 2));
+
+    // Every start failing: FAILED once the attempts are used up.
+    rt.s.lock().unwrap().fail_starts = 10;
+    rt.crash("w1", 1);
+    settle().await;
+    let (st, reason, restarts) = state_of(&s, "w1").unwrap();
+    assert_eq!(st, WorkloadState::Failed);
+    assert_eq!(reason, "START_FAILED");
+    assert_eq!(
+        restarts, 3,
+        "one exit and two failed starts, within 3 attempts"
+    );
+}
+
+/// A FAILED workload's stop keeps its container (stopped) for its logs,
+/// one per service: the service's next FAILED container replaces it.
+/// Adoption and resync leave kept containers alone.
+#[tokio::test]
+async fn failed_container_is_kept_for_its_logs() {
+    let d = tempfile::tempdir().unwrap();
+    let rt = Fake::new();
+    let s = supervisor(rt.clone(), d.path());
+    tokio::spawn(s.clone().run_events());
+    settle().await;
+
+    for wid in ["w1", "w2"] {
+        s.start(start_cmd(wid, 0)).await.unwrap();
+        settle().await;
+        rt.crash(wid, 1);
+        settle().await;
+        assert_eq!(state_of(&s, wid).unwrap().0, WorkloadState::Failed);
+        s.stop(stop_cmd(wid)).await.unwrap();
+        settle().await;
+        assert!(state_of(&s, wid).is_none(), "no longer reported");
+        assert!(!d.path().join(format!("alloc/{wid}")).exists());
+    }
+    let names: Vec<String> =
+        rt.s.lock()
+            .unwrap()
+            .containers
+            .values()
+            .map(|c| c.name.clone())
+            .collect();
+    assert_eq!(names, ["vk-w2"], "the service's latest FAILED container");
+    assert!(d.path().join("kept/w2").exists());
+    assert!(!d.path().join("kept/w1").exists());
+
+    // Not adopted, by resync or by a new agent; a repeated stop keeps it.
+    s.resync().await;
+    let s2 = supervisor(rt.clone(), d.path());
+    s2.adopt().await.unwrap();
+    assert!(state_of(&s2, "w2").is_none());
+    s.stop(stop_cmd("w2")).await.unwrap();
+    settle().await;
+    assert_eq!(rt.count(), 1);
+
+    // A clean stop of a running workload still removes its container.
+    s.start(start_cmd("w3", 3)).await.unwrap();
+    settle().await;
+    s.stop(stop_cmd("w3")).await.unwrap();
+    settle().await;
+    assert_eq!(rt.count(), 1);
 }

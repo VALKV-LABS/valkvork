@@ -49,9 +49,12 @@ struct RawManifest {
 struct RawCheck {
     #[serde(rename = "type")]
     kind: String,
-    port: String,
+    #[serde(default)]
+    port: Option<String>,
     #[serde(default)]
     path: Option<String>,
+    #[serde(default)]
+    command: Option<Vec<String>>,
     #[serde(default)]
     interval: Option<String>,
     #[serde(default)]
@@ -390,14 +393,35 @@ fn canonicalise(raw: RawManifest, out: &mut Vec<ValidationError>) -> Option<Serv
             ok = false;
         };
         let http = c.kind == "http";
-        if !http && c.kind != "tcp" {
-            bad("type", format!("{:?}: use \"tcp\" or \"http\"", c.kind));
-        }
-        if !raw.ports.iter().any(|p| p.name == c.port) {
+        let exec = c.kind == "exec";
+        if !http && !exec && c.kind != "tcp" {
             bad(
-                "port",
-                format!("{:?} is not the name of a [[ports]] entry", c.port),
+                "type",
+                format!("{:?}: use \"tcp\", \"http\" or \"exec\"", c.kind),
             );
+        }
+        match (&c.port, exec) {
+            (Some(_), true) => bad(
+                "port",
+                "an exec check runs in the container and has no port".into(),
+            ),
+            (None, false) => bad("port", "a tcp or http check needs a port".into()),
+            (Some(port), false) if !raw.ports.iter().any(|p| &p.name == port) => bad(
+                "port",
+                format!("{port:?} is not the name of a [[ports]] entry"),
+            ),
+            _ => {}
+        }
+        match (&c.command, exec) {
+            (None, true) => bad(
+                "command",
+                "an exec check needs a command, e.g. [\"pg_isready\"]".into(),
+            ),
+            (Some(cmd), true) if cmd.is_empty() || cmd[0].trim().is_empty() => {
+                bad("command", "the command must name a program".into())
+            }
+            (Some(_), false) => bad("command", "command applies to exec checks".into()),
+            _ => {}
         }
         match (&c.path, http) {
             (Some(p), true) if !p.starts_with('/') => {
@@ -412,7 +436,8 @@ fn canonicalise(raw: RawManifest, out: &mut Vec<ValidationError>) -> Option<Serv
         }
         CheckSpec {
             kind: c.kind,
-            port: c.port,
+            port: c.port.unwrap_or_default(),
+            command: c.command.filter(|_| exec),
             path: if http {
                 Some(c.path.unwrap_or_else(|| "/".into()))
             } else {
@@ -1175,6 +1200,17 @@ target_cpu_percent = 75
                 "type = \"tcp\"\nport = \"http\"\nfailures = 0",
                 "check.failures",
             ),
+            ("type = \"tcp\"", "check.port"),
+            ("type = \"exec\"", "check.command"),
+            ("type = \"exec\"\ncommand = []", "check.command"),
+            (
+                "type = \"exec\"\ncommand = [\"true\"]\nport = \"http\"",
+                "check.port",
+            ),
+            (
+                "type = \"tcp\"\nport = \"http\"\ncommand = [\"true\"]",
+                "check.command",
+            ),
         ] {
             let m = format!("{VALID}\n[check]\n{check}\n");
             assert_eq!(
@@ -1183,6 +1219,37 @@ target_cpu_percent = 75
                 "{check}"
             );
         }
+    }
+
+    #[test]
+    fn exec_health_check() {
+        let m = format!(
+            "{VALID}\n[check]\ntype = \"exec\"\ncommand = [\"pg_isready\", \"-U\", \"valkv\"]\ntimeout = \"5s\"\n"
+        );
+        let spec = parse_manifest_str(&m).unwrap().spec;
+        let c = spec.check.clone().unwrap();
+        assert_eq!(c.kind, "exec");
+        assert_eq!(c.port, "");
+        assert_eq!(
+            c.command.as_deref(),
+            Some(&["pg_isready".to_string(), "-U".into(), "valkv".into()][..])
+        );
+        assert_eq!(c.timeout_seconds, 5);
+        // Older agents would ignore the command: only agents with exec_checks.
+        let needs = spec.required_features();
+        assert!(needs.contains(&"health_checks") && needs.contains(&"exec_checks"));
+    }
+
+    /// Adding `command` and making `port` skippable must not change the
+    /// stored form of existing tcp/http checks (spec_hash relies on it).
+    #[test]
+    fn tcp_check_serialises_as_before() {
+        let tcp = format!("{VALID}\n[check]\ntype = \"tcp\"\nport = \"http\"\n");
+        let c = parse_manifest_str(&tcp).unwrap().spec.check.unwrap();
+        assert_eq!(
+            serde_json::to_string(&c).unwrap(),
+            r#"{"type":"tcp","port":"http","interval_seconds":10,"timeout_seconds":2,"failures":3,"grace_seconds":0}"#
+        );
     }
 
     #[test]

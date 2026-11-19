@@ -498,6 +498,7 @@ impl Core {
                         timeout_seconds: c.timeout_seconds,
                         failures: c.failures,
                         grace_seconds: c.grace_seconds,
+                        command: c.command.clone().unwrap_or_default(),
                     }),
                     ports: s
                         .ports
