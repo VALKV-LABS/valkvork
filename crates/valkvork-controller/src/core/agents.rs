@@ -96,6 +96,7 @@ impl Core {
 
         // The ack must precede any command on the stream.
         self.direct.push((tx, ack(true, "", interval)));
+        self.discovery.needs_set(&node_id);
 
         self.reconcile_inventory(&node_id, &r.inventory);
         self.resend_for_node(&node_id);

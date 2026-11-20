@@ -9,8 +9,10 @@
 //! * [`identity`]: node id, hostname, address and capacity (FR-AGE-02).
 //! * [`secrets`]: resolution of workloads' secret references (FR-SEC-04).
 //! * [`health`]: health-check probes.
+//! * [`discovery`]: DNS for services on the node, from the controller's endpoints.
 
 pub mod connection;
+pub mod discovery;
 pub mod health;
 pub mod identity;
 pub mod metrics;

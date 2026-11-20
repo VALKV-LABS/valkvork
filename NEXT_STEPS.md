@@ -6,6 +6,13 @@ follow-ups are built on branch `feat/failed-logs-exec-checks-restart-retry` and 
 `make e2e`, not yet on AWS: FAILED containers kept for their logs, `exec` health checks (F2),
 and retrying a failed in-place restart (F4).
 
+**Service discovery is built** on branch `feat/service-discovery` ([discovery.md](docs/components/discovery.md)):
+`<service>.svc.valkvork.internal` answered by each agent from the controller's healthy endpoints, and
+`make e2e` resolves global-pg by name from a container. To use it on the dev cell: allow port 53 from
+`docker0` in the goldenimage UFW rules, set `[discovery] enabled = true` in agent.toml, redeploy the
+services so their containers get the new nameserver, and point URLs such as global-cp's at
+`<service>.svc.valkvork.internal` in place of the per-node-group Route53 names.
+
 The items below remain.
 
 What is not built yet. The rest of the [spec](spec.md)'s MVP scope is implemented and described in [docs/](docs/components/index.md); items tagged [P2], [P3] or [Later] in the spec are deliberately out of scope for now and are collected, with design sketches, in [docs/phase-2.md](docs/phase-2.md).

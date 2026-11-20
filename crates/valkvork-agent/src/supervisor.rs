@@ -169,6 +169,11 @@ pub struct SupervisorConfig {
     pub hostname: String,
     /// Resolves [secrets] references at container start.
     pub secrets: Arc<SecretResolver>,
+    /// The controller's service endpoints, for the discovery DNS.
+    pub endpoints: Arc<crate::discovery::Endpoints>,
+    /// Containers' nameservers: the discovery DNS when it is on, else empty
+    /// (Docker's default).
+    pub dns: Vec<String>,
 }
 
 pub struct Supervisor {
@@ -184,6 +189,11 @@ impl Supervisor {
             cfg,
             workloads: Mutex::new(HashMap::new()),
         })
+    }
+
+    /// Replace the service endpoints with the controller's.
+    pub fn update_endpoints(&self, e: pb::Endpoints) {
+        self.cfg.endpoints.update(e);
     }
 
     fn alloc_dir(&self, wid: &str) -> PathBuf {
@@ -659,6 +669,7 @@ impl Supervisor {
             ports,
             mounts,
             labels,
+            dns: self.cfg.dns.clone(),
         };
         let cid = self
             .rt

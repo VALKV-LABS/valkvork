@@ -103,6 +103,8 @@ async fn run(args: Args) -> Result<(), ValkvorkError> {
     );
 
     let protected_paths = rt.data_root().await.into_iter().collect();
+    let endpoints = valkvork_agent::discovery::Endpoints::load(&cfg.data_dir);
+    let dns = start_discovery(&cfg, &rt, &endpoints).await?;
     let supervisor = Supervisor::new(
         rt,
         SupervisorConfig {
@@ -118,6 +120,8 @@ async fn run(args: Args) -> Result<(), ValkvorkError> {
             secrets: Arc::new(valkvork_agent::secrets::SecretResolver::new(
                 cfg.secrets.clone(),
             )),
+            endpoints,
+            dns,
         },
     );
     supervisor
@@ -152,4 +156,42 @@ async fn run(args: Args) -> Result<(), ValkvorkError> {
             Ok(())
         }
     }
+}
+
+/// With `[discovery] enabled`, serve DNS for services and return the
+/// nameserver containers should use. A failure to listen is fatal: a node
+/// whose containers expect the names but cannot resolve them is worse than
+/// an agent that does not start, which systemd retries and the journal shows.
+async fn start_discovery(
+    cfg: &AgentConfig,
+    rt: &Arc<dyn ContainerRuntime>,
+    endpoints: &Arc<valkvork_agent::discovery::Endpoints>,
+) -> Result<Vec<String>, ValkvorkError> {
+    use valkvork_agent::discovery::{resolv_conf_nameservers, DnsServer};
+    let d = &cfg.discovery;
+    if !d.enabled {
+        return Ok(Vec::new());
+    }
+    let ip = match d.listen_ip {
+        Some(ip) => ip,
+        None => rt.bridge_gateway().await.ok_or_else(|| {
+            ValkvorkError::Config(
+                "discovery: no Docker bridge gateway found; set discovery.listen_ip".into(),
+            )
+        })?,
+    };
+    let upstream = if d.upstream.is_empty() {
+        let text = std::fs::read_to_string("/etc/resolv.conf").unwrap_or_default();
+        resolv_conf_nameservers(&text, ip)
+    } else {
+        d.upstream.clone()
+    };
+    if upstream.is_empty() {
+        tracing::warn!("discovery: no upstream nameservers; only service names will resolve");
+    }
+    DnsServer::new(endpoints.clone(), &d.domain, upstream, d.ttl_seconds)
+        .bind_and_serve(ip)
+        .await
+        .map_err(|e| ValkvorkError::Config(format!("discovery: listen on {ip}:53: {e}")))?;
+    Ok(vec![ip.to_string()])
 }

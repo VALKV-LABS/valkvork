@@ -10,7 +10,7 @@
 # /var/tmp/vk-e2e on the Docker host itself (so Postgres can own its data
 # directory; folders shared from macOS cannot be chowned). Each run uses a new
 # run-<time> directory there. It uses ports 50061, 50062, 9410, 9411, 15432
-# and 18080 on the Docker host and the service ids global-pg, bad-secret,
+# and 18080 on the Docker host, and port 53 on the Docker bridge's gateway and the service ids global-pg, bad-secret,
 # web-check, exec-check, pg-init, pg-fail and cache-demo, so do not run it next to a dev cluster with
 # those services.
 set -eu
@@ -81,6 +81,9 @@ memory = "256MiB"
 
 [secrets]
 file_dirs = ["$W/secrets"]
+
+[discovery]
+enabled = true
 
 [host_volumes.pgdata]
 path = "$W/pgdata"
@@ -230,6 +233,19 @@ vk workloads | grep -E 'global-pg +2 ' | grep -q 'RUNNING.*HEALTHY' || { vk work
 if grep -q "$PW" "$W/agent2.log"; then fail "the password is in a log"; fi
 pass "agent restart: container adopted, its check passes again"
 
+# ── service discovery: <service>.svc.valkvork.internal from the agent ──────
+GW="$(docker network inspect bridge -f '{{(index .IPAM.Config 0).Gateway}}')"
+grep -q "service discovery DNS listening" "$W/agent2.log" || { tail -12 "$W/agent2.log"; fail "the agent's DNS is not listening"; }
+docker exec "$NEW" cat /etc/resolv.conf | grep -q "^nameserver $GW\$" || fail "the container's nameserver is not $GW"
+for _ in $(seq 15); do docker exec "$NEW" getent hosts global-pg.svc.valkvork.internal >/dev/null 2>&1 && break; sleep 1; done
+docker exec "$NEW" getent hosts global-pg.svc.valkvork.internal | grep -q "^$IP " \
+  || { docker exec "$NEW" getent hosts global-pg.svc.valkvork.internal; tail -12 "$W/agent2.log"; fail "global-pg.svc.valkvork.internal does not resolve to $IP"; }
+if docker exec "$NEW" getent hosts nope.svc.valkvork.internal >/dev/null 2>&1; then fail "an unknown service resolves"; fi
+docker exec "$NEW" getent hosts registry-1.docker.io >/dev/null || fail "other names are not forwarded upstream"
+nslookup global-pg.svc.valkvork.internal "$GW" | grep -q "$IP" || fail "the node itself cannot query $GW"
+[ -s "$W/data/endpoints.json" ] || fail "the endpoints are not saved"
+pass "service discovery: global-pg.svc.valkvork.internal -> $IP from a container and the node ($GW:53); unknown names NXDOMAIN; others forwarded"
+
 # ── metrics ─────────────────────────────────────────────────────────────────
 wget -qO- http://127.0.0.1:9410/metrics | grep '^valkvork_workload_health' | tr '\n' ' '; echo
 wget -qO- http://127.0.0.1:9410/metrics | grep -qF 'valkvork_workload_health{health="HEALTHY"} 1' || fail "metric"
@@ -311,8 +327,12 @@ vk workloads | grep exec-check | grep -q 'RUNNING.*HEALTHY' || { tail -20 "$W/ag
 pass "exec check passing (wget in the container)"
 ECID="$(docker ps -q --no-trunc --filter label=valkvork.service_id=exec-check)"
 docker pause "$ECID" >/dev/null
-for _ in $(seq 30); do vk events 2>/dev/null | grep -q 'exec-check workload UNHEALTHY' && break; sleep 1; done
-vk events | grep -q 'exec-check workload UNHEALTHY' || { tail -20 "$W/agent.log"; fail "a paused container was not found UNHEALTHY"; }
+# The agent's log, not the controller's events: UNHEALTHY lasts only until
+# the in-place restart, often less than a heartbeat.
+EWID="$(docker inspect -f '{{index .Config.Labels "valkvork.workload_id"}}' "$ECID")"
+for _ in $(seq 30); do grep "$EWID" "$W/agent2.log" | grep -q 'health check failed repeatedly' && break; sleep 1; done
+grep "$EWID" "$W/agent2.log" | grep 'health check failed repeatedly' | grep -q 'is paused' \
+  || { tail -20 "$W/agent2.log"; fail "a paused container was not found UNHEALTHY"; }
 for _ in $(seq 60); do
   [ "$(docker inspect -f '{{.State.Status}}' "$ECID")" = running ] \
     && vk workloads 2>/dev/null | grep exec-check | grep -q 'RUNNING.*HEALTHY' && break
@@ -340,7 +360,7 @@ memory = "64MiB"
 POSTGRES_PASSWORD = "file:$W/secrets/pg_password"
 
 [env]
-DATABASE_URL = "postgresql://valkv:\${secret:POSTGRES_PASSWORD}@$IP:15432/valkv_global"
+DATABASE_URL = "postgresql://valkv:\${secret:POSTGRES_PASSWORD}@global-pg.svc.valkvork.internal:15432/valkv_global"
 EOF
 vk apply -f "$W/init.toml" >/dev/null
 for _ in $(seq 60); do vk workloads 2>/dev/null | grep pg-init | grep -q COMPLETED && break; sleep 1; done
@@ -353,7 +373,7 @@ sleep 3
 [ -z "$(docker ps -aq --filter label=valkvork.service_id=pg-init)" ] || fail "the completed container was not removed"
 vk status pg-init | grep -q '^status: *COMPLETED' || { vk status pg-init | head -4; fail "the service does not show COMPLETED"; }
 vk status | grep pg-init | grep -q '1/1 done' || fail "the service list does not show 1/1 done"
-pass "batch job COMPLETED once (service status COMPLETED, 1/1 done), connecting with \${secret:...} in its URL; not shown, container removed"
+pass "batch job COMPLETED once (service status COMPLETED, 1/1 done), connecting with \${secret:...} in its URL and Postgres by its service name; not shown, container removed"
 
 vk plan -f "$W/init.toml" | grep -q 'batch: run again' || fail "plan does not say it runs again"
 vk apply -f "$W/init.toml" >/dev/null

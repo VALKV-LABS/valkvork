@@ -43,7 +43,7 @@ Valkvork is a lightweight workload orchestrator and autoscaler written in Rust. 
 * Multi-controller HA or distributed consensus.
 * Affinity/anti-affinity, taints/tolerations, spread across failure domains. *Node-class filtering is the only placement constraint.*
 * Overlay networking or service mesh. Workloads use host ports (§8).
-* Built-in service discovery or DNS. *The load balancer integration in §8 covers MVP traffic.*
+* Built-in service discovery or DNS. *The load balancer integration in §8 covers MVP traffic.* (Since built, opt-in: node-local DNS for `<service>.svc.valkvork.internal`; see docs/components/discovery.md.)
 * Batch and system job types (Nomad `batch` / `system`) [P2].
 * Application health checks (HTTP/TCP) [P2]. MVP liveness means "the container process is running".
 * Secrets management [P2]. Env vars are stored in plaintext (FR-SEC-04).

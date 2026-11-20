@@ -20,7 +20,20 @@ message ControllerMessage {
     RegisterAck register_ack = 1;
     StartWorkload start_workload = 2;
     StopWorkload stop_workload = 3;
+    Endpoints endpoints = 4;           // only to agents with the service_discovery feature
   }
+}
+
+// Service discovery: every service's reachable addresses, the whole set each
+// time it changes and after each Register. The agent answers DNS for them.
+message Endpoints {
+  uint64 version = 1;                  // increases while the controller runs; informational
+  repeated ServiceEndpoints services = 2;
+}
+
+message ServiceEndpoints {
+  string service_id = 1;
+  repeated string addresses = 2;       // node addresses of its RUNNING (and, with a check, HEALTHY) workloads
 }
 
 message Register {

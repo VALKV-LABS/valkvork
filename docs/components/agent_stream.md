@@ -9,7 +9,7 @@ service AgentService {
   rpc Connect(stream AgentMessage) returns (stream ControllerMessage);
 }
 message AgentMessage      { oneof msg { Register register = 1; Heartbeat heartbeat = 2; CommandResult command_result = 3; } }
-message ControllerMessage { oneof msg { RegisterAck register_ack = 1; StartWorkload start_workload = 2; StopWorkload stop_workload = 3; } }
+message ControllerMessage { oneof msg { RegisterAck register_ack = 1; StartWorkload start_workload = 2; StopWorkload stop_workload = 3; Endpoints endpoints = 4; } }
 ```
 
 tonic's generated clients have a built-in `connect()` constructor, which clashes with an RPC named `Connect`. So the agent proto is built server-only and the client is hand-written in `valkvork-proto/src/lib.rs` as `AgentServiceClient::connect_stream`. The wire path is still `/valkvork.v1.AgentService/Connect`.
@@ -41,6 +41,7 @@ tonic's generated clients have a built-in `connect()` constructor, which clashes
 |---|---|---|
 | `StartWorkload` | command id, workload id, service id and version, image, CPU millicores, memory and disk bytes, env, ports, volumes, restart policy, kill timeout | Checks Docker answers within 3 s, records the workload, and acks; then pulls, creates and starts in the background |
 | `StopWorkload` | command id, workload id, kill timeout | Marks the workload stopping and acks; then stops and removes the container and its alloc directory |
+| `Endpoints` | every service's node addresses | Not a command, so not acked. Sent after `RegisterAck` and whenever the set changes, only to agents with the `service_discovery` feature. Replaces the agent's set (see [discovery.md](discovery.md)) |
 
 Every command gets exactly one `CommandResult` (FR-AGE-04). The ack means "accepted" or "rejected"; actual progress shows up in later heartbeats. Commands are idempotent by workload id:
 

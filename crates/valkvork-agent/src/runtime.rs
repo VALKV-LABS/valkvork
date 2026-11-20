@@ -55,6 +55,8 @@ pub struct ContainerSpec {
     pub ports: Vec<PublishedPort>,
     pub mounts: Vec<BindMount>,
     pub labels: HashMap<String, String>,
+    /// Nameservers; empty: Docker's default (the host's).
+    pub dns: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -119,6 +121,11 @@ pub trait ContainerRuntime: Send + Sync + 'static {
     async fn data_root(&self) -> Option<PathBuf> {
         None
     }
+    /// The default network's gateway on the host (Docker's `bridge`, usually
+    /// 172.17.0.1): reachable from the host and its containers only.
+    async fn bridge_gateway(&self) -> Option<std::net::IpAddr> {
+        None
+    }
     async fn pull(&self, image: &str, auth: Option<RegistryCredentials>) -> Result<()>;
     /// Create; returns the container id. An existing container with the same
     /// name is returned instead of an error (idempotent create).
@@ -179,6 +186,15 @@ fn map_err(e: DockerError) -> RuntimeError {
     }
 }
 
+/// Exec errors keep Docker's message: a 409 there means a paused or stopped
+/// container, not a name conflict.
+fn exec_err(e: DockerError) -> RuntimeError {
+    match e {
+        DockerError::DockerResponseServerError { message, .. } => RuntimeError::Other(message),
+        other => RuntimeError::Unavailable(other.to_string()),
+    }
+}
+
 fn run_state(s: Option<&str>) -> RunState {
     match s.unwrap_or("") {
         "created" => RunState::Created,
@@ -214,6 +230,22 @@ impl ContainerRuntime for DockerRuntime {
             .ok()?
             .docker_root_dir
             .map(PathBuf::from)
+    }
+
+    async fn bridge_gateway(&self) -> Option<std::net::IpAddr> {
+        let net = self
+            .docker
+            .inspect_network(
+                "bridge",
+                None::<bollard::network::InspectNetworkOptions<String>>,
+            )
+            .await
+            .ok()?;
+        net.ipam?
+            .config?
+            .into_iter()
+            .filter_map(|c| c.gateway?.parse().ok())
+            .next()
     }
 
     async fn pull(&self, image: &str, auth: Option<RegistryCredentials>) -> Result<()> {
@@ -286,6 +318,7 @@ impl ContainerRuntime for DockerRuntime {
                 maximum_retry_count: None,
             }),
             privileged: Some(false),
+            dns: (!spec.dns.is_empty()).then(|| spec.dns.clone()),
             ..Default::default()
         };
         let config = Config {
@@ -476,24 +509,24 @@ impl ContainerRuntime for DockerRuntime {
                 },
             )
             .await
-            .map_err(map_err)?;
+            .map_err(exec_err)?;
         // Attached, so the call returns when the command ends; the output is
         // read and dropped.
         if let StartExecResults::Attached { mut output, .. } = self
             .docker
             .start_exec(&created.id, None)
             .await
-            .map_err(map_err)?
+            .map_err(exec_err)?
         {
             while let Some(chunk) = output.next().await {
-                chunk.map_err(map_err)?;
+                chunk.map_err(exec_err)?;
             }
         }
         let inspected = self
             .docker
             .inspect_exec(&created.id)
             .await
-            .map_err(map_err)?;
+            .map_err(exec_err)?;
         inspected
             .exit_code
             .ok_or_else(|| RuntimeError::Other("exec finished without an exit code".into()))
