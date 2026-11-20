@@ -147,7 +147,7 @@ failures = 3
 **Design sketch**
 
 - `host_port = 0` lets Docker (or CNI `portmap`) pick a free port; the agent reports the actual port in `WorkloadStatus` (new field), and the scheduler stops treating such ports as a per-node limit.
-- A **service catalogue** in the admin API: `ListEndpoints(service)` returns `node_ip:port` for RUNNING (and, with health checks, healthy) workloads.
+- A **service catalogue** in the admin API: `ListEndpoints(service)` returns `node_ip:port` for RUNNING (and, with health checks, healthy) workloads. The controller already computes this set for [service discovery](components/discovery.md), which is built: agents answer `<service>.svc.valkvork.internal` from it. With dynamic ports, those answers need the port too (SRV records).
 - **Direct target registration:** the controller adds and removes those targets in the load balancer (for AWS, ELBv2 `RegisterTargets` / `DeregisterTargets`) as workloads start and stop, draining before deregistration. This removes the health-check lag and allows several replicas per node.
 
 **Questions:** one target group per service or per port; deregistration delay versus `kill_timeout`; what the controller does when the load balancer API is unavailable (it must not block the reconciler).

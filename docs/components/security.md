@@ -72,7 +72,7 @@ The agent **runs as root**, deliberately (FR-STO-03):
 | `/var/lib/valkvork/alloc` → `/data/valkvork/alloc/<workload_id>/` | `root 0711`; each workload's directory `root 1777` (world-writable with the sticky bit, like `/tmp`, so images that run as a non-root `USER` can write to `/alloc`; it is mounted only into its own container) | Created and deleted by the agent; bind-mounted at `/alloc` |
 | `/var/run/docker.sock` | root | Read and write, and only the agent |
 
-Network: the agent opens no listening socket except metrics on loopback (FR-ARC-01); it refuses a non-loopback metrics address. Its only outbound connection is to `controller_endpoint`. Docker pulls images using its own network access.
+Network: the agent opens no listening socket except metrics on loopback (FR-ARC-01); it refuses a non-loopback metrics address. With `[discovery] enabled`, it also answers DNS on port 53 on the Docker bridge's gateway, an address only the node and its containers can reach (see [discovery.md](discovery.md)). Its only outbound connection is to `controller_endpoint`. Docker pulls images using its own network access.
 
 Limits the agent enforces on itself: it never mounts the Docker socket, `/var/lib/docker`, containerd's directories or Docker's actual data root into a workload (see [supervisor.md](supervisor.md#protected-paths)), and it never creates privileged containers. A compromised agent is root on its worker, but it holds only the join token, so it cannot act as an administrator or reach other workers.
 
@@ -164,4 +164,4 @@ The spec's network rules (FR-SEC-05):
 | `9400` | The monitoring system |
 | Workload host ports | The load balancer's security group |
 
-The agent opens no inbound ports, apart from metrics on loopback.
+The agent opens no inbound ports, apart from metrics on loopback and, with discovery on, DNS on the Docker bridge's gateway, which the node's firewall must allow from `docker0`.

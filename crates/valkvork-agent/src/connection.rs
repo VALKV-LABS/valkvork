@@ -202,6 +202,10 @@ async fn session(
                 let ids = (s.command_id.clone(), s.workload_id.clone());
                 (ids.0, ids.1, supervisor.stop(s).await)
             }
+            Some(pb::controller_message::Msg::Endpoints(e)) => {
+                supervisor.update_endpoints(e);
+                continue;
+            }
             _ => continue,
         };
         crate::metrics::command(is_start, outcome.is_ok());

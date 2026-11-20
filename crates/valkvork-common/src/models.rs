@@ -295,6 +295,8 @@ pub const AGENT_FEATURES: &[&str] = &[
     "node_values",
     "secret_values",
     "secrets",
+    // Not a manifest feature: the agent accepts Endpoints messages.
+    "service_discovery",
 ];
 
 /// What `${node.NAME}` in an [env] value can name, substituted by the agent

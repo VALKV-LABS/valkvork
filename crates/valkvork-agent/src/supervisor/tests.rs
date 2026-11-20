@@ -248,6 +248,8 @@ fn supervisor_with_secrets(rt: Arc<Fake>, dir: &Path) -> Arc<Supervisor> {
             docker_socket: PathBuf::from("/var/run/docker.sock"),
             protected_paths: vec![],
             host_volumes: BTreeMap::new(),
+            endpoints: crate::discovery::Endpoints::load(dir),
+            dns: vec![],
         },
     )
 }
@@ -266,6 +268,8 @@ fn supervisor(rt: Arc<Fake>, dir: &Path) -> Arc<Supervisor> {
             docker_socket: PathBuf::from("/var/run/docker.sock"),
             protected_paths: vec![],
             host_volumes: BTreeMap::new(),
+            endpoints: crate::discovery::Endpoints::load(dir),
+            dns: vec![],
         },
     )
 }
@@ -459,6 +463,8 @@ async fn forbidden_host_volume_is_refused() {
             registry_auth_file: d.path().join("none.json"),
             docker_socket: PathBuf::from("/var/run/docker.sock"),
             protected_paths: vec![PathBuf::from("/data/docker")],
+            endpoints: crate::discovery::Endpoints::load(d.path()),
+            dns: vec![],
             host_volumes: BTreeMap::from([
                 (
                     "sock".to_string(),
@@ -553,6 +559,8 @@ fn supervisor_with(dir: &Path, vols: Vec<(&str, HostVolume)>) -> Arc<Supervisor>
             registry_auth_file: dir.join("none.json"),
             docker_socket: PathBuf::from("/var/run/docker.sock"),
             protected_paths: vec![dir.join("docker")],
+            endpoints: crate::discovery::Endpoints::load(dir),
+            dns: vec![],
             host_volumes: vols.into_iter().map(|(n, v)| (n.to_string(), v)).collect(),
         },
     )
@@ -1072,4 +1080,41 @@ async fn failed_container_is_kept_for_its_logs() {
     s.stop(stop_cmd("w3")).await.unwrap();
     settle().await;
     assert_eq!(rt.count(), 1);
+}
+
+/// With discovery on, containers get the agent's DNS address as nameserver.
+#[tokio::test]
+async fn containers_use_the_discovery_dns() {
+    let d = tempfile::tempdir().unwrap();
+    let rt = Fake::new();
+    let cfg = SupervisorConfig {
+        advertise_ip: "10.0.0.5".into(),
+        node_id: "node-1".into(),
+        node_class: "app".into(),
+        hostname: "host-1".into(),
+        secrets: Arc::new(crate::secrets::SecretResolver::new(Default::default())),
+        data_dir: d.path().to_path_buf(),
+        registry_auth_file: d.path().join("none.json"),
+        docker_socket: PathBuf::from("/var/run/docker.sock"),
+        protected_paths: vec![],
+        host_volumes: BTreeMap::new(),
+        endpoints: crate::discovery::Endpoints::load(d.path()),
+        dns: vec!["172.17.0.1".into()],
+    };
+    let s = Supervisor::new(rt.clone(), cfg);
+    s.start(start_cmd("w1", 3)).await.unwrap();
+    settle().await;
+    assert_eq!(rt.last_created().dns, ["172.17.0.1"]);
+    // Endpoints from the controller reach the store.
+    s.update_endpoints(pb::Endpoints {
+        version: 1,
+        services: vec![pb::ServiceEndpoints {
+            service_id: "global-cp".into(),
+            addresses: vec!["10.0.0.7".into()],
+        }],
+    });
+    assert_eq!(
+        s.cfg.endpoints.lookup("global-cp"),
+        Some(vec!["10.0.0.7".parse().unwrap()])
+    );
 }

@@ -24,6 +24,7 @@
 | `agent_stream` | [agent_stream.md](agent_stream.md) | The one outbound stream: Register, Heartbeat, commands and acks, reconnect backoff |
 | `supervisor` | [supervisor.md](supervisor.md) | Local workload lifecycle: start/stop, restart policy, adoption, disk limits |
 | `container_runtime` | [container_runtime.md](container_runtime.md) | The `ContainerRuntime` trait and its Docker driver |
+| `discovery` | [discovery.md](discovery.md) | Service discovery: the controller's endpoint set and the agent's DNS for `<service>.svc.valkvork.internal` |
 
 ## Shared
 

@@ -1370,3 +1370,144 @@ fn rolling_update_with_room_elsewhere_starts_new_first() {
         "kept until the new one is healthy"
     );
 }
+
+fn endpoint_msgs(a: &mut Agent) -> Vec<BTreeMap<String, Vec<String>>> {
+    a.take()
+        .into_iter()
+        .filter_map(|m| match m {
+            pb::controller_message::Msg::Endpoints(e) => Some(
+                e.services
+                    .into_iter()
+                    .map(|s| (s.service_id, s.addresses))
+                    .collect(),
+            ),
+            _ => None,
+        })
+        .collect()
+}
+
+fn set_of(pairs: &[(&str, &[&str])]) -> BTreeMap<String, Vec<String>> {
+    pairs
+        .iter()
+        .map(|(k, v)| (k.to_string(), v.iter().map(|s| s.to_string()).collect()))
+        .collect()
+}
+
+/// Service discovery: agents get each service's healthy node addresses,
+/// after their RegisterAck, again only when the set changes, and agents
+/// without the feature get nothing.
+#[test]
+fn endpoints_follow_healthy_workloads() {
+    let mut c = core();
+    let mut a = register_with(&mut c, "a", "general", TOKEN, vec![]);
+    let first = a.take();
+    assert!(matches!(
+        first.as_slice(),
+        [
+            pb::controller_message::Msg::RegisterAck(_),
+            pb::controller_message::Msg::Endpoints(_)
+        ]
+    ));
+    let mut b = register(&mut c, "b");
+    let mut old = register(&mut c, "old1");
+    c.nodes.get_mut("b").unwrap().node.ip_address = "10.0.0.2".into();
+    endpoint_msgs(&mut b);
+
+    let checked = "[[ports]]\nname = \"http\"\ncontainer_port = 80\nhost_port = 8080\n\n\
+                   [check]\ntype = \"http\"\nport = \"http\"\n";
+    apply(&mut c, &manifest("web", "nginx:1", 2, checked));
+    apply(
+        &mut c,
+        &manifest("job", "busybox:1", 1, "")
+            .replace("replicas = 1", "replicas = 1\ntype = \"batch\""),
+    );
+    // Listed with no addresses until healthy; the batch job not at all.
+    assert_eq!(endpoint_msgs(&mut a), [set_of(&[("web", &[])])]);
+    // old1 lacks the health_checks feature, so "web" runs on a and b.
+    for agent in [&a, &b] {
+        run_all(&mut c, agent);
+    }
+    assert!(
+        endpoint_msgs(&mut a).is_empty(),
+        "running but not yet healthy"
+    );
+
+    let on = |c: &Core, node: &str| {
+        c.workloads
+            .values()
+            .find(|w| w.service_id == "web" && w.node_id.as_deref() == Some(node))
+            .unwrap()
+            .workload_id
+            .clone()
+    };
+    let healthy = |wid: String| {
+        let mut st = status(&wid, WorkloadState::Running);
+        st.health = pb::HealthState::Healthy as i32;
+        st
+    };
+    let (wa, wb) = (on(&c, "a"), on(&c, "b"));
+    heartbeat(&mut c, &a, vec![healthy(wa.clone())]);
+    assert_eq!(endpoint_msgs(&mut a), [set_of(&[("web", &["10.0.0.1"])])]);
+    heartbeat(&mut c, &b, vec![healthy(wb.clone())]);
+    let both = set_of(&[("web", &["10.0.0.1", "10.0.0.2"])]);
+    assert_eq!(endpoint_msgs(&mut a), std::slice::from_ref(&both));
+    assert_eq!(
+        endpoint_msgs(&mut b).last(),
+        Some(&both),
+        "b got every change too"
+    );
+    // Nothing changed: nothing sent.
+    heartbeat(&mut c, &a, vec![healthy(wa.clone())]);
+    assert!(endpoint_msgs(&mut a).is_empty());
+    assert!(
+        endpoint_msgs(&mut old).is_empty(),
+        "no feature, no Endpoints"
+    );
+
+    // An unhealthy workload, or one on an unhealthy node, drops out.
+    let mut st = status(&wa, WorkloadState::Running);
+    st.health = pb::HealthState::Unhealthy as i32;
+    heartbeat(&mut c, &a, vec![st]);
+    assert_eq!(endpoint_msgs(&mut b), [set_of(&[("web", &["10.0.0.2"])])]);
+    c.nodes.get_mut("b").unwrap().node.status = NodeStatus::Unhealthy;
+    c.finish().unwrap();
+    assert_eq!(endpoint_msgs(&mut a).last(), Some(&set_of(&[("web", &[])])));
+
+    // A service without a check counts once RUNNING. A reconnecting agent
+    // gets the current set after its ack.
+    apply(&mut c, &manifest("api", "api:1", 1, ""));
+    let api_node = c
+        .workloads
+        .values()
+        .find(|w| w.service_id == "api")
+        .and_then(|w| w.node_id.clone())
+        .unwrap();
+    let agent = if api_node == "a" { &a } else { &old };
+    run_all(&mut c, agent);
+    let mut a2 = register_with(&mut c, "a", "general", TOKEN, vec![]);
+    let msgs = endpoint_msgs(&mut a2);
+    let last = msgs.last().unwrap();
+    assert_eq!(last["api"], ["10.0.0.1"]);
+    assert!(last.contains_key("web") && !last.contains_key("job"));
+}
+
+/// During the recovery grace period no set is sent: health is not reported
+/// yet, and agents keep their last set instead of an empty one.
+#[test]
+fn no_endpoints_during_grace() {
+    let mut c = Core::new(
+        ControllerConfig {
+            recovery_grace_period_seconds: 60,
+            ..Default::default()
+        },
+        Db::open_in_memory().unwrap(),
+        TOKEN.into(),
+    )
+    .unwrap();
+    let mut a = register_with(&mut c, "a", "general", TOKEN, vec![]);
+    assert!(endpoint_msgs(&mut a).is_empty());
+    // Once the grace period is over, the agent that registered gets it.
+    c.grace_until = Instant::now();
+    c.finish().unwrap();
+    assert_eq!(endpoint_msgs(&mut a).len(), 1);
+}

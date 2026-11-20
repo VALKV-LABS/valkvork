@@ -179,6 +179,8 @@ pub struct AgentConfig {
     pub host_volumes: BTreeMap<String, HostVolume>,
     /// How workloads' [secrets] references are resolved.
     pub secrets: SecretsConfig,
+    /// Service discovery: DNS for `<service>.<domain>` on the node.
+    pub discovery: DiscoveryConfig,
 }
 
 impl Default for AgentConfig {
@@ -198,6 +200,7 @@ impl Default for AgentConfig {
             reserved: ReservedResources::default(),
             host_volumes: BTreeMap::new(),
             secrets: SecretsConfig::default(),
+            discovery: DiscoveryConfig::default(),
         }
     }
 }
@@ -232,6 +235,27 @@ impl AgentConfig {
                 )));
             }
         }
+        if self.discovery.enabled {
+            let d = &self.discovery;
+            let label_ok = |l: &str| {
+                !l.is_empty()
+                    && l.len() <= 63
+                    && l.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+            };
+            if d.domain.is_empty() || d.domain.len() > 200 || !d.domain.split('.').all(label_ok) {
+                return Err(ValkvorkError::Config(format!(
+                    "discovery.domain {:?} is not a DNS name",
+                    d.domain
+                )));
+            }
+            if let Some(ip) = d.listen_ip {
+                if ip.is_unspecified() || ip.is_multicast() {
+                    return Err(ValkvorkError::Config(format!(
+                        "discovery.listen_ip {ip} must be one address, such as the Docker bridge's gateway"
+                    )));
+                }
+            }
+        }
         if let Some(addr) = self.metrics_listen_addr {
             if !addr.ip().is_loopback() {
                 return Err(ValkvorkError::Config(format!(
@@ -240,6 +264,38 @@ impl AgentConfig {
             }
         }
         Ok(())
+    }
+}
+
+/// Service discovery (agent.toml `[discovery]`). The controller sends every
+/// agent each service's reachable node addresses; with `enabled`, the agent
+/// answers DNS for `<service>.<domain>` on `listen_ip`, port 53, forwards
+/// every other query to `upstream`, and gives its containers that address as
+/// their only nameserver.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct DiscoveryConfig {
+    pub enabled: bool,
+    pub domain: String,
+    /// Unset: the Docker bridge network's gateway (usually 172.17.0.1), which
+    /// only this node and its containers can reach (FR-ARC-01).
+    pub listen_ip: Option<std::net::IpAddr>,
+    /// Resolvers for every other name. Empty: the nameservers in
+    /// /etc/resolv.conf.
+    pub upstream: Vec<SocketAddr>,
+    /// TTL of the answers, in seconds.
+    pub ttl_seconds: u32,
+}
+
+impl Default for DiscoveryConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            domain: "svc.valkvork.internal".to_string(),
+            listen_ip: None,
+            upstream: Vec::new(),
+            ttl_seconds: 5,
+        }
     }
 }
 
@@ -441,6 +497,32 @@ read_only = false
         assert!(cfg.validate().is_ok());
         cfg.metrics_listen_addr = Some("0.0.0.0:9401".parse().unwrap());
         assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn discovery_settings() {
+        let cfg: AgentConfig = toml::from_str("[discovery]\nenabled = true\n").unwrap();
+        assert!(cfg.validate().is_ok());
+        assert_eq!(cfg.discovery.domain, "svc.valkvork.internal");
+        assert_eq!(
+            (cfg.discovery.listen_ip, cfg.discovery.ttl_seconds),
+            (None, 5)
+        );
+        for bad in [
+            "domain = \"\"",
+            "domain = \"svc..internal\"",
+            "domain = \"has space.internal\"",
+            "listen_ip = \"0.0.0.0\"",
+            "listen_ip = \"::\"",
+        ] {
+            let cfg: AgentConfig =
+                toml::from_str(&format!("[discovery]\nenabled = true\n{bad}\n")).unwrap();
+            assert!(cfg.validate().is_err(), "{bad}");
+        }
+        // Off: not checked, nothing listens.
+        let off: AgentConfig = toml::from_str("[discovery]\ndomain = \"\"\n").unwrap();
+        assert!(off.validate().is_ok());
+        assert!(toml::from_str::<AgentConfig>("[discovery]\nport = 53\n").is_err());
     }
 
     #[test]

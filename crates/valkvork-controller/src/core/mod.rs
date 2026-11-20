@@ -14,6 +14,7 @@
 mod admin;
 mod agents;
 mod autoscale;
+mod discovery;
 mod observe;
 mod reconcile;
 #[cfg(test)]
@@ -134,6 +135,7 @@ pub struct Core {
     direct: Vec<(AgentSender, pb::ControllerMessage)>,
     after_commit: Vec<AfterCommit>,
     command_seq: u64,
+    pub(crate) discovery: discovery::DiscoveryState,
 }
 
 impl Core {
@@ -215,6 +217,7 @@ impl Core {
             direct: Vec::new(),
             after_commit: Vec::new(),
             command_seq: 0,
+            discovery: Default::default(),
         })
     }
 
@@ -332,6 +335,7 @@ impl Core {
         for (tx, msg) in std::mem::take(&mut self.direct) {
             let _ = tx.try_send(Ok(msg));
         }
+        self.sync_endpoints();
         let now = Instant::now();
         let mut seen = HashSet::new();
         for wid in std::mem::take(&mut self.to_send) {

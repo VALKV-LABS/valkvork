@@ -73,6 +73,13 @@ aws_cli         = "aws"    # runs `aws ssm get-parameter` for ssm: references, w
 file_dirs       = []       # directories file: references may read; empty disables file: references
 timeout_seconds = 15       # per reference
 
+[discovery]                # service discovery DNS; see discovery.md
+enabled     = false        # true: answer <service>.<domain> on listen_ip:53 and use it as containers' nameserver
+domain      = "svc.valkvork.internal"
+# listen_ip = "172.17.0.1" # default: the Docker bridge gateway (this node and its containers only)
+# upstream  = ["10.12.0.2:53"]   # resolvers for other names; default: /etc/resolv.conf's nameservers
+ttl_seconds = 5
+
 [host_volumes.pgdata]      # one table per volume manifests can mount by name
 path      = "/data/pgdata"
 read_only = false
