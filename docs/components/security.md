@@ -84,7 +84,10 @@ The agent creates containers with:
 |---|---|
 | User | The image's `USER`. Valkvork does not override it |
 | Privileged | Never; there is no option for it (FR-STO-03) |
-| Capabilities | Docker's default set (for example `CHOWN`, `DAC_OVERRIDE`, `NET_BIND_SERVICE`, `SETUID`, `SETGID`, `KILL`). None added, none dropped |
+| Capabilities | Docker's default set (for example `CHOWN`, `DAC_OVERRIDE`, `NET_BIND_SERVICE`, `SETUID`, `SETGID`, `KILL`), unless the manifest's `[security]` sets `cap_drop` / `cap_add` |
+| Root filesystem | Writable, unless `[security] read_only_root = true`; `tmpfs` paths for scratch |
+| `no-new-privileges` | Off, unless `[security] no_new_privileges = true` |
+| Log driver | The daemon's default, unless the manifest sets `[logging]` |
 | Seccomp, AppArmor | Docker's default profiles |
 | Devices | None |
 | CPU, memory | `NanoCpus` from `resources.cpu`; `Memory = MemorySwap` from `resources.memory`, so no swap |
@@ -96,7 +99,7 @@ The agent creates containers with:
 
 **`/alloc` is writable by any user.** Each workload's directory is created by the agent as `root 1777` (world-writable with the sticky bit, like `/tmp`), so images that run as a non-root `USER` can write to `/alloc`. It is mounted only into its own container, and the parent `alloc/` stays `root 0711`, so other users on the host cannot list it. Host volume directories are `root 0755` unless the operator sets `owner` and `mode` for them in `agent.toml`, which the agent applies at startup (see [configuration.md](configuration.md#agent)). Images such as Postgres, whose entrypoint starts as root and changes ownership of its data directory, need neither. For an image that starts as a non-root user, set `owner` to its numeric uid. Only the operator, never a manifest, decides who owns a host directory, because volumes outlive services and can be shared between them.
 
-Not set, and worth adding for untrusted images (also tracked there): a PID limit, `no-new-privileges`, dropping capabilities, and a read-only root filesystem. Valkvork assumes workloads are trusted code you deploy; it is not a sandbox for hostile tenants.
+A manifest can opt into hardening with `[security]` (see [manifests.md](manifests.md#container-hardening)): a read-only root filesystem, `no-new-privileges`, dropped capabilities and tmpfs scratch paths. Every setting is off by default. A capability can be added back, but `cap_add = ["ALL"]` is refused, and there is still no way to run privileged. Not set and worth adding for untrusted images: a PID limit. Valkvork assumes workloads are trusted code you deploy; it is not a sandbox for hostile tenants.
 
 ### CLI and Browser
 

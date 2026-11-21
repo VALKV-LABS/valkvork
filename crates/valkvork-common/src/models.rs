@@ -278,6 +278,49 @@ pub struct ServiceSpec {
     /// Omitted when unset (stable hashes).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub check: Option<CheckSpec>,
+    /// Container hardening (`[security]`). None when every setting is off,
+    /// Docker's defaults (stable hashes).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub security: Option<SecuritySpec>,
+    /// Log driver (`[logging]`). None: the node's default (stable hashes).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub logging: Option<LoggingSpec>,
+}
+
+/// Container hardening (`[security]`). Every setting defaults to off, as
+/// Docker's defaults.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct SecuritySpec {
+    /// A read-only root filesystem; volumes, `/alloc` and `tmpfs` stay writable.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub read_only_root: bool,
+    /// setuid binaries and file capabilities can't raise privileges.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub no_new_privileges: bool,
+    /// Capability names without `CAP_`, upper case; `ALL` for every one.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub cap_drop: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub cap_add: Vec<String>,
+    /// Writable in-memory mounts: `"/tmp"` or `"/tmp:size=64m,mode=1777"`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tmpfs: Vec<String>,
+}
+
+impl SecuritySpec {
+    pub fn is_default(&self) -> bool {
+        *self == SecuritySpec::default()
+    }
+}
+
+/// A container's log driver and its options (`[logging]`). Option values
+/// may contain `${node.NAME}`, `${service.id}` and `${workload.id}`, which
+/// the agent substitutes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LoggingSpec {
+    pub driver: String,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub options: BTreeMap<String, String>,
 }
 
 /// Manifest features an agent must support to run a workload that uses them.
@@ -292,9 +335,11 @@ pub const AGENT_FEATURES: &[&str] = &[
     "exec_checks",
     "health_checks",
     "host_ip",
+    "logging",
     "node_values",
     "secret_values",
     "secrets",
+    "security",
     // Not a manifest feature: the agent accepts Endpoints messages.
     "service_discovery",
 ];
@@ -302,6 +347,21 @@ pub const AGENT_FEATURES: &[&str] = &[
 /// What `${node.NAME}` in an [env] value can name, substituted by the agent
 /// with its own node's value at container start.
 pub const NODE_VALUES: &[&str] = &["advertise_ip", "class", "hostname", "id"];
+
+/// Replace `${service.id}` and `${workload.id}` in a `[logging]` option
+/// value. An unclosed reference or another name is an error.
+pub fn interpolate_workload(
+    value: &str,
+    service_id: &str,
+    workload_id: &str,
+) -> Result<String, String> {
+    let v = interpolate(value, "${service.", "service value", |n| {
+        (n == "id").then_some(service_id)
+    })?;
+    interpolate(&v, "${workload.", "workload value", |n| {
+        (n == "id").then_some(workload_id)
+    })
+}
 
 /// What a service's workloads do when their process exits.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -412,6 +472,12 @@ impl ServiceSpec {
         if self.volumes.iter().any(|v| v.kind == "ephemeral") {
             f.push("ephemeral_volumes");
         }
+        if self.security.is_some() {
+            f.push("security");
+        }
+        if self.logging.is_some() {
+            f.push("logging");
+        }
         f
     }
 
@@ -469,6 +535,8 @@ impl ServiceSpec {
             && self.restart == other.restart
             && self.kill_timeout_seconds == other.kill_timeout_seconds
             && self.check == other.check
+            && self.security == other.security
+            && self.logging == other.logging
     }
 
     /// Classify `new` against `self` (the stored spec), ignoring live target
@@ -518,6 +586,9 @@ impl ServiceSpec {
         cmp!("autoscale", self.autoscale, new.autoscale);
         cmp!("update", self.update, new.update);
         cmp!("restart", self.restart, new.restart);
+        cmp!("check", self.check, new.check);
+        cmp!("security", self.security, new.security);
+        cmp!("logging", self.logging, new.logging);
         out
     }
 }
@@ -547,6 +618,8 @@ mod tests {
             update: UpdatePolicy::default(),
             restart: RestartPolicy::default(),
             check: None,
+            security: None,
+            logging: None,
         }
     }
 
@@ -660,5 +733,44 @@ mod tests {
         let mut s = spec();
         s.env.insert("A".into(), "${node.id}".into());
         assert_eq!(s.required_features(), vec!["node_values"]);
+    }
+
+    /// Old specs keep their hash; hardening and logging require the
+    /// agent features and replace the workloads.
+    #[test]
+    fn security_and_logging() {
+        let a = spec();
+        let json = a.canonical_json();
+        assert!(!json.contains("security") && !json.contains("logging"));
+        let mut b = spec();
+        b.security = Some(SecuritySpec {
+            read_only_root: true,
+            cap_drop: vec!["ALL".into()],
+            ..Default::default()
+        });
+        b.logging = Some(LoggingSpec {
+            driver: "awslogs".into(),
+            options: BTreeMap::from([("mode".into(), "non-blocking".into())]),
+        });
+        assert!(b
+            .canonical_json()
+            .contains("\"security\":{\"read_only_root\":true,\"cap_drop\":[\"ALL\"]}"));
+        assert_eq!(a.classify_change(&b), ChangeKind::Replacing);
+        assert_eq!(b.required_features(), vec!["security", "logging"]);
+        let back: ServiceSpec = serde_json::from_str(&b.canonical_json()).unwrap();
+        assert_eq!(back, b);
+    }
+
+    #[test]
+    fn workload_values_in_log_options() {
+        assert_eq!(
+            interpolate_workload("${service.id}-${workload.id}", "web", "w1").unwrap(),
+            "web-w1"
+        );
+        assert!(interpolate_workload("${service.name}", "web", "w1").is_err());
+        assert_eq!(
+            interpolate_workload("${node.id}", "web", "w1").unwrap(),
+            "${node.id}"
+        );
     }
 }

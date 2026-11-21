@@ -588,14 +588,14 @@ impl Supervisor {
         // ${secret:NAME} inside a value: substituted here, so the value with
         // the secret in it exists only in the container's environment.
         let mut env: Vec<(String, String)> = Vec::with_capacity(cmd.env.len());
+        let node_value = |name: &str| match name {
+            "advertise_ip" => Some(self.cfg.advertise_ip.as_str()).filter(|v| !v.is_empty()),
+            "id" => Some(self.cfg.node_id.as_str()),
+            "class" => Some(self.cfg.node_class.as_str()),
+            "hostname" => Some(self.cfg.hostname.as_str()),
+            _ => None,
+        };
         for (k, v) in &cmd.env {
-            let node_value = |name: &str| match name {
-                "advertise_ip" => Some(self.cfg.advertise_ip.as_str()).filter(|v| !v.is_empty()),
-                "id" => Some(self.cfg.node_id.as_str()),
-                "class" => Some(self.cfg.node_class.as_str()),
-                "hostname" => Some(self.cfg.hostname.as_str()),
-                _ => None,
-            };
             let v = &if v.contains("${node.") {
                 valkvork_common::models::interpolate_node(v, node_value).map_err(|e| {
                     (
@@ -657,6 +657,48 @@ impl Supervisor {
         if let Some(p) = &probe {
             labels.insert(LABEL_CHECK.to_string(), p.to_label());
         }
+        let security = cmd
+            .security
+            .as_ref()
+            .map(|x| crate::runtime::Security {
+                read_only_root: x.read_only_root,
+                no_new_privileges: x.no_new_privileges,
+                cap_drop: x.cap_drop.clone(),
+                cap_add: x.cap_add.clone(),
+                tmpfs: x
+                    .tmpfs
+                    .iter()
+                    .map(|t| match t.split_once(':') {
+                        Some((path, opts)) => (path.to_string(), opts.to_string()),
+                        None => (t.clone(), String::new()),
+                    })
+                    .collect(),
+            })
+            .unwrap_or_default();
+        let log = match &cmd.logging {
+            None => None,
+            Some(l) => {
+                let mut options = HashMap::with_capacity(l.options.len());
+                for (k, v) in &l.options {
+                    let err = |e: String| {
+                        (
+                            format!("NODE_VALUE_UNAVAILABLE: logging {k}: {e}"),
+                            format!("logging option {k}: {e}"),
+                        )
+                    };
+                    let v = valkvork_common::models::interpolate_node(v, node_value)
+                        .and_then(|v| {
+                            valkvork_common::models::interpolate_workload(&v, &cmd.service_id, wid)
+                        })
+                        .map_err(err)?;
+                    options.insert(k.clone(), v);
+                }
+                Some(crate::runtime::LogConfig {
+                    driver: l.driver.clone(),
+                    options,
+                })
+            }
+        };
         let non_empty = |l: &Vec<String>| (!l.is_empty()).then(|| l.clone());
         let spec = ContainerSpec {
             name: format!("vk-{wid}"),
@@ -670,6 +712,8 @@ impl Supervisor {
             mounts,
             labels,
             dns: self.cfg.dns.clone(),
+            security,
+            log,
         };
         let cid = self
             .rt

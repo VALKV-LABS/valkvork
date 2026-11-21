@@ -72,6 +72,8 @@ pub enum ValidationErrorCode {
     InvalidVolumeSpec,
     InvalidSecretRef,
     InvalidCheckSpec,
+    InvalidSecuritySpec,
+    InvalidLoggingSpec,
     UnsatisfiableNow,
 }
 
@@ -87,6 +89,8 @@ impl std::fmt::Display for ValidationErrorCode {
             ValidationErrorCode::InvalidVolumeSpec => "INVALID_VOLUME_SPEC",
             ValidationErrorCode::InvalidSecretRef => "INVALID_SECRET_REF",
             ValidationErrorCode::InvalidCheckSpec => "INVALID_CHECK_SPEC",
+            ValidationErrorCode::InvalidSecuritySpec => "INVALID_SECURITY_SPEC",
+            ValidationErrorCode::InvalidLoggingSpec => "INVALID_LOGGING_SPEC",
             ValidationErrorCode::UnsatisfiableNow => "UNSATISFIABLE_NOW",
         })
     }

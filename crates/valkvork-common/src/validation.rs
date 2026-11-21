@@ -6,8 +6,9 @@
 
 use crate::errors::{ValidationError, ValidationErrorCode as Code};
 use crate::models::{
-    interpolate_node, interpolate_secrets, AutoscaleSpec, CheckSpec, PortSpec, RestartPolicy,
-    ServiceSpec, ServiceType, UpdatePolicy, VolumeSpec,
+    interpolate_node, interpolate_secrets, interpolate_workload, AutoscaleSpec, CheckSpec,
+    LoggingSpec, PortSpec, RestartPolicy, SecuritySpec, ServiceSpec, ServiceType, UpdatePolicy,
+    VolumeSpec,
 };
 use crate::units::{parse_duration, parse_size};
 use regex::Regex;
@@ -42,6 +43,28 @@ struct RawManifest {
     restart: Option<RawRestart>,
     #[serde(default)]
     check: Option<RawCheck>,
+    #[serde(default)]
+    security: Option<RawSecurity>,
+    #[serde(default)]
+    logging: Option<RawLogging>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct RawSecurity {
+    read_only_root: bool,
+    no_new_privileges: bool,
+    cap_drop: Vec<String>,
+    cap_add: Vec<String>,
+    tmpfs: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawLogging {
+    driver: String,
+    #[serde(default)]
+    options: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -540,6 +563,13 @@ fn canonicalise(raw: RawManifest, out: &mut Vec<ValidationError>) -> Option<Serv
         }
     }
 
+    let tmpfs_targets: Vec<String> = raw.volumes.iter().map(|v| v.target.clone()).collect();
+    let security = raw
+        .security
+        .map(|r| canonical_security(r, &tmpfs_targets, out, &mut ok))
+        .filter(|s| !s.is_default());
+    let logging = raw.logging.map(|l| canonical_logging(l, out, &mut ok));
+
     let spec = ServiceSpec {
         id: raw.service.id,
         service_type,
@@ -581,8 +611,241 @@ fn canonicalise(raw: RawManifest, out: &mut Vec<ValidationError>) -> Option<Serv
         update,
         restart,
         check,
+        security,
+        logging,
     };
     ok.then_some(spec)
+}
+
+/// Linux capabilities, without the `CAP_` prefix (capabilities(7)).
+const CAPABILITIES: &[&str] = &[
+    "AUDIT_CONTROL",
+    "AUDIT_READ",
+    "AUDIT_WRITE",
+    "BLOCK_SUSPEND",
+    "BPF",
+    "CHECKPOINT_RESTORE",
+    "CHOWN",
+    "DAC_OVERRIDE",
+    "DAC_READ_SEARCH",
+    "FOWNER",
+    "FSETID",
+    "IPC_LOCK",
+    "IPC_OWNER",
+    "KILL",
+    "LEASE",
+    "LINUX_IMMUTABLE",
+    "MAC_ADMIN",
+    "MAC_OVERRIDE",
+    "MKNOD",
+    "NET_ADMIN",
+    "NET_BIND_SERVICE",
+    "NET_BROADCAST",
+    "NET_RAW",
+    "PERFMON",
+    "SETFCAP",
+    "SETGID",
+    "SETPCAP",
+    "SETUID",
+    "SYS_ADMIN",
+    "SYS_BOOT",
+    "SYS_CHROOT",
+    "SYS_MODULE",
+    "SYS_NICE",
+    "SYS_PACCT",
+    "SYS_PTRACE",
+    "SYS_RAWIO",
+    "SYS_RESOURCE",
+    "SYS_TIME",
+    "SYS_TTY_CONFIG",
+    "SYSLOG",
+    "WAKE_ALARM",
+];
+
+/// `[security]`: capability names upper case without `CAP_`, sorted and
+/// deduplicated; tmpfs paths absolute and not where a volume or `/alloc` is.
+fn canonical_security(
+    r: RawSecurity,
+    volume_targets: &[String],
+    out: &mut Vec<ValidationError>,
+    ok: &mut bool,
+) -> SecuritySpec {
+    let mut bad = |field: &str, msg: String| {
+        out.push(ValidationError::new(
+            Code::InvalidSecuritySpec,
+            &format!("security.{field}"),
+            &msg,
+        ));
+        *ok = false;
+    };
+    let caps = |field: &str, list: Vec<String>, bad: &mut dyn FnMut(&str, String)| {
+        let mut names: Vec<String> = Vec::new();
+        for (i, c) in list.iter().enumerate() {
+            let up = c.trim().to_ascii_uppercase();
+            let name = up.strip_prefix("CAP_").unwrap_or(&up).to_string();
+            if name == "ALL" {
+                if field == "cap_add" {
+                    bad(
+                        &format!("{field}[{i}]"),
+                        "cap_add = [\"ALL\"] gives the container every capability; name the ones it needs".into(),
+                    );
+                }
+            } else if !CAPABILITIES.contains(&name.as_str()) {
+                bad(
+                    &format!("{field}[{i}]"),
+                    format!("{c:?} is not a Linux capability, e.g. \"NET_BIND_SERVICE\""),
+                );
+            }
+            if !names.contains(&name) {
+                names.push(name);
+            }
+        }
+        names.sort();
+        names
+    };
+    let cap_drop = caps("cap_drop", r.cap_drop, &mut bad);
+    let cap_add = caps("cap_add", r.cap_add, &mut bad);
+    for c in &cap_add {
+        if cap_drop.contains(c) {
+            bad(
+                "cap_add",
+                format!(
+                    "{c} is in both cap_drop and cap_add; drop \"ALL\" and add it back instead"
+                ),
+            );
+        }
+    }
+    let mut tmpfs: Vec<String> = Vec::new();
+    for (i, t) in r.tmpfs.iter().enumerate() {
+        let field = format!("tmpfs[{i}]");
+        let (path, opts) = t.split_once(':').unwrap_or((t.as_str(), ""));
+        let path = path.trim_end_matches('/');
+        if !path.starts_with('/') || path.contains(char::is_whitespace) {
+            bad(
+                &field,
+                format!("{t:?}: the path must be absolute, e.g. \"/tmp\""),
+            );
+            continue;
+        }
+        if t.contains(':') && (opts.is_empty() || opts.contains(char::is_whitespace)) {
+            bad(
+                &field,
+                format!("{t:?}: options follow the path, e.g. \"/tmp:size=64m,mode=1777\""),
+            );
+        }
+        if path == "/alloc" || path.starts_with("/alloc/") {
+            bad(
+                &field,
+                "/alloc is the workload's own scratch directory".into(),
+            );
+        }
+        if volume_targets
+            .iter()
+            .any(|v| v.trim_end_matches('/') == path)
+        {
+            bad(&field, format!("{path} is also a volume's target"));
+        }
+        if tmpfs.iter().any(|x| x.split(':').next() == Some(path)) {
+            bad(&field, format!("duplicate tmpfs {path}"));
+        }
+        tmpfs.push(if opts.is_empty() {
+            path.to_string()
+        } else {
+            format!("{path}:{opts}")
+        });
+    }
+    SecuritySpec {
+        read_only_root: r.read_only_root,
+        no_new_privileges: r.no_new_privileges,
+        cap_drop,
+        cap_add,
+        tmpfs,
+    }
+}
+
+/// Log drivers that send over the network: with Docker's default `blocking`
+/// mode an unreachable destination can block the container's writes.
+const REMOTE_LOG_DRIVERS: &[&str] = &[
+    "awslogs",
+    "fluentd",
+    "gcplogs",
+    "gelf",
+    "logentries",
+    "splunk",
+    "syslog",
+];
+
+/// `[logging]`: a driver name, option keys Docker would accept, and in the
+/// values only `${node.NAME}`, `${service.id}` and `${workload.id}`.
+fn canonical_logging(l: RawLogging, out: &mut Vec<ValidationError>, ok: &mut bool) -> LoggingSpec {
+    static DRIVER: OnceLock<Regex> = OnceLock::new();
+    static KEY: OnceLock<Regex> = OnceLock::new();
+    // Built-in names, or a plugin's "[registry/]name[:tag]".
+    let driver_re = DRIVER.get_or_init(|| {
+        Regex::new(r"^[a-z0-9][a-z0-9._\-]*(/[a-z0-9][a-z0-9._\-]*)*(:[A-Za-z0-9_.\-]+)?$").unwrap()
+    });
+    let key_re = KEY.get_or_init(|| Regex::new(r"^[A-Za-z0-9][A-Za-z0-9_.\-]*$").unwrap());
+    let mut bad = |field: &str, msg: String| {
+        out.push(ValidationError::new(
+            Code::InvalidLoggingSpec,
+            &format!("logging.{field}"),
+            &msg,
+        ));
+        *ok = false;
+    };
+    let driver = l.driver.trim().to_string();
+    if !driver_re.is_match(&driver) {
+        bad(
+            "driver",
+            format!(
+                "{:?} is not a log driver name, e.g. \"awslogs\" or \"json-file\"",
+                l.driver
+            ),
+        );
+    }
+    if driver == "none" && !l.options.is_empty() {
+        bad("options", "the \"none\" driver takes no options".into());
+    }
+    for (k, v) in &l.options {
+        let field = format!("options.{k}");
+        if !key_re.is_match(k) {
+            bad(&field, format!("{k:?} is not a log option name"));
+        }
+        if v.contains("${secret:") {
+            bad(
+                &field,
+                "log options can't hold secrets: they are visible in docker inspect".into(),
+            );
+            continue;
+        }
+        let checked =
+            interpolate_node(v, |n| crate::models::NODE_VALUES.contains(&n).then_some(""))
+                .and_then(|v| interpolate_workload(&v, "", ""));
+        if let Err(e) = checked {
+            bad(
+                &field,
+                format!(
+                    "{e}: use ${{node.NAME}} with NAME one of {}, ${{service.id}} or ${{workload.id}}",
+                    crate::models::NODE_VALUES.join(", ")
+                ),
+            );
+        }
+    }
+    if REMOTE_LOG_DRIVERS.contains(&driver.as_str())
+        && l.options.get("mode").map(String::as_str) != Some("non-blocking")
+    {
+        out.push(ValidationError::warning(
+            Code::InvalidLoggingSpec,
+            "logging.options.mode",
+            &format!(
+                "{driver} sends over the network; without mode = \"non-blocking\" an unreachable destination can block the container's writes"
+            ),
+        ));
+    }
+    LoggingSpec {
+        driver,
+        options: l.options,
+    }
 }
 
 /// VE-08: a secret is an environment variable name not also set in [env],
@@ -1117,6 +1380,8 @@ target_cpu_percent = 75
             "\"host_ip\"",
             "\"secrets\"",
             "\"check\"",
+            "\"security\"",
+            "\"logging\"",
         ] {
             assert!(!json.contains(key), "{key} in {json}");
         }
@@ -1354,5 +1619,116 @@ target_cpu_percent = 75
         assert!(p.spec.required_features().contains(&"node_values"));
         let bad = VALID.replace("A = \"1\"", "X = \"${node.instance_id}\"");
         assert_eq!(err_code(&bad), (Code::InvalidResourceSpec, "env.X".into()));
+    }
+
+    #[test]
+    fn security() {
+        let m = format!(
+            "{VALID}\n[security]\nread_only_root = true\nno_new_privileges = true\ncap_drop = [\"all\"]\ncap_add = [\"CAP_NET_BIND_SERVICE\", \"chown\", \"CHOWN\"]\ntmpfs = [\"/tmp\", \"/run/:size=16m,mode=1777\"]\n"
+        );
+        let p = parse_manifest_str(&m).unwrap();
+        let s = p.spec.security.clone().unwrap();
+        assert!(s.read_only_root && s.no_new_privileges);
+        assert_eq!(s.cap_drop, ["ALL"]);
+        assert_eq!(s.cap_add, ["CHOWN", "NET_BIND_SERVICE"]);
+        assert_eq!(s.tmpfs, ["/tmp", "/run:size=16m,mode=1777"]);
+        assert!(p.spec.required_features().contains(&"security"));
+
+        // Every setting off is the same spec, and hash, as no [security].
+        let off = format!("{VALID}\n[security]\nread_only_root = false\ncap_drop = []\n");
+        assert_eq!(
+            parse_manifest_str(&off).unwrap().spec,
+            parse_manifest_str(VALID).unwrap().spec
+        );
+
+        for (sec, field) in [
+            ("cap_drop = [\"NET_TELEPATHY\"]", "security.cap_drop[0]"),
+            ("cap_add = [\"ALL\"]", "security.cap_add[0]"),
+            (
+                "cap_drop = [\"CHOWN\"]\ncap_add = [\"CHOWN\"]",
+                "security.cap_add",
+            ),
+            ("tmpfs = [\"tmp\"]", "security.tmpfs[0]"),
+            ("tmpfs = [\"/tmp:\"]", "security.tmpfs[0]"),
+            ("tmpfs = [\"/alloc/x\"]", "security.tmpfs[0]"),
+            ("tmpfs = [\"/tmp\", \"/tmp:size=1m\"]", "security.tmpfs[1]"),
+        ] {
+            let m = format!("{VALID}\n[security]\n{sec}\n");
+            assert_eq!(
+                err_code(&m),
+                (Code::InvalidSecuritySpec, field.into()),
+                "{sec}"
+            );
+        }
+        let clash = format!(
+            "{VALID}\n[[volumes]]\ntype = \"ephemeral\"\nsource = \"scratch\"\ntarget = \"/tmp\"\n\n[security]\ntmpfs = [\"/tmp\"]\n"
+        );
+        assert_eq!(
+            err_code(&clash),
+            (Code::InvalidSecuritySpec, "security.tmpfs[0]".into())
+        );
+        let typo = format!("{VALID}\n[security]\nreadonly_root = true\n");
+        assert_eq!(err_code(&typo).0, Code::UnknownField);
+    }
+
+    #[test]
+    fn logging() {
+        let m = format!(
+            "{VALID}\n[logging]\ndriver = \"awslogs\"\noptions = {{ awslogs-group = \"/valkv/dev\", awslogs-stream = \"${{service.id}}-${{node.id}}\", mode = \"non-blocking\" }}\n"
+        );
+        let p = parse_manifest_str(&m).unwrap();
+        let l = p.spec.logging.clone().unwrap();
+        assert_eq!(l.driver, "awslogs");
+        assert_eq!(l.options["awslogs-stream"], "${service.id}-${node.id}");
+        assert!(p.spec.required_features().contains(&"logging"));
+        assert!(!p
+            .warnings
+            .iter()
+            .any(|w| w.field_path.starts_with("logging")));
+
+        // A network driver without non-blocking mode: accepted, with a warning.
+        let blocking = format!("{VALID}\n[logging]\ndriver = \"awslogs\"\n");
+        let p = parse_manifest_str(&blocking).unwrap();
+        assert!(p
+            .warnings
+            .iter()
+            .any(|w| w.field_path == "logging.options.mode"));
+        let local = format!(
+            "{VALID}\n[logging]\ndriver = \"json-file\"\n[logging.options]\nmax-size = \"10m\"\n"
+        );
+        assert!(parse_manifest_str(&local)
+            .unwrap()
+            .warnings
+            .iter()
+            .all(|w| !w.field_path.starts_with("logging")));
+
+        for (log, field) in [
+            ("driver = \"Aws Logs\"", "logging.driver"),
+            (
+                "driver = \"none\"\noptions = { max-size = \"1m\" }",
+                "logging.options",
+            ),
+            (
+                "driver = \"awslogs\"\noptions = { awslogs-stream = \"${node.instance_id}\" }",
+                "logging.options.awslogs-stream",
+            ),
+            (
+                "driver = \"awslogs\"\noptions = { awslogs-stream = \"${service.name}\" }",
+                "logging.options.awslogs-stream",
+            ),
+            (
+                "driver = \"splunk\"\noptions = { splunk-token = \"${secret:T}\" }",
+                "logging.options.splunk-token",
+            ),
+        ] {
+            let m = format!("{VALID}\n[logging]\n{log}\n");
+            assert_eq!(
+                err_code(&m),
+                (Code::InvalidLoggingSpec, field.into()),
+                "{log}"
+            );
+        }
+        let no_driver = format!("{VALID}\n[logging]\noptions = {{ mode = \"non-blocking\" }}\n");
+        assert_eq!(err_code(&no_driver).0, Code::UnknownField);
     }
 }
