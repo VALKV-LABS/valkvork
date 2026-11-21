@@ -886,6 +886,26 @@ pub fn spec_to_toml(s: &valkvork_common::models::ServiceSpec) -> String {
         "[restart]\nattempts = {}\ninterval = \"{}s\"\ndelay = \"{}s\"\n",
         s.restart.attempts, s.restart.interval_seconds, s.restart.delay_seconds
     );
+    if let Some(x) = &s.security {
+        let _ = write!(
+            o,
+            "\n[security]\nread_only_root = {}\nno_new_privileges = {}\ncap_drop = {}\ncap_add = {}\ntmpfs = {}\n",
+            x.read_only_root,
+            x.no_new_privileges,
+            toml_list(&x.cap_drop),
+            toml_list(&x.cap_add),
+            toml_list(&x.tmpfs)
+        );
+    }
+    if let Some(l) = &s.logging {
+        let _ = writeln!(o, "\n[logging]\ndriver = {:?}", l.driver);
+        if !l.options.is_empty() {
+            let _ = writeln!(o, "[logging.options]");
+            for (k, v) in &l.options {
+                let _ = writeln!(o, "{k:?} = {v:?}");
+            }
+        }
+    }
     o
 }
 
@@ -942,6 +962,17 @@ grace = "30s"
 name = "admin"
 container_port = 9000
 host_port = 9000
+
+[security]
+read_only_root = true
+no_new_privileges = true
+cap_drop = ["ALL"]
+cap_add = ["NET_BIND_SERVICE"]
+tmpfs = ["/tmp", "/run:size=16m"]
+
+[logging]
+driver = "awslogs"
+options = { awslogs-group = "/valkv/dev", awslogs-stream = "${service.id}-${node.id}", mode = "non-blocking" }
 "#;
         let spec = parse_manifest_str(m).unwrap().spec;
         let again = parse_manifest_str(&spec_to_toml(&spec)).unwrap().spec;

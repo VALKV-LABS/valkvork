@@ -494,6 +494,21 @@ impl Core {
                         .map(|(k, v)| (k.clone(), v.clone()))
                         .collect(),
                     batch: s.is_batch(),
+                    security: s.security.as_ref().map(|x| pb::ContainerSecurity {
+                        read_only_root: x.read_only_root,
+                        no_new_privileges: x.no_new_privileges,
+                        cap_drop: x.cap_drop.clone(),
+                        cap_add: x.cap_add.clone(),
+                        tmpfs: x.tmpfs.clone(),
+                    }),
+                    logging: s.logging.as_ref().map(|l| pb::LogConfig {
+                        driver: l.driver.clone(),
+                        options: l
+                            .options
+                            .iter()
+                            .map(|(k, v)| (k.clone(), v.clone()))
+                            .collect(),
+                    }),
                     check: s.check.as_ref().map(|c| pb::HealthCheck {
                         r#type: c.kind.clone(),
                         port_name: c.port.clone(),

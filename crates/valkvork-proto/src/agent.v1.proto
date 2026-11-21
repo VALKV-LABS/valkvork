@@ -115,6 +115,24 @@ message StartWorkload {
   // Runs to completion: exit 0 is COMPLETED, not restarted. Other exits
   // follow the restart policy, as for services.
   bool batch = 18;
+  ContainerSecurity security = 19;     // unset: Docker's defaults
+  LogConfig logging = 20;              // unset: the node's default driver
+}
+
+// Container hardening. Capability names are upper case, without "CAP_".
+message ContainerSecurity {
+  bool read_only_root = 1;
+  bool no_new_privileges = 2;
+  repeated string cap_drop = 3;        // "ALL" drops every capability
+  repeated string cap_add = 4;
+  repeated string tmpfs = 5;           // "/tmp" or "/tmp:size=64m,mode=1777"
+}
+
+// The container's log driver. Option values may contain ${node.NAME},
+// ${service.id} and ${workload.id}; the agent substitutes them.
+message LogConfig {
+  string driver = 1;
+  map<string, string> options = 2;
 }
 
 // The agent probes the workload through one of its published ports, at the

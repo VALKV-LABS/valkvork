@@ -1118,3 +1118,61 @@ async fn containers_use_the_discovery_dns() {
         Some(vec!["10.0.0.7".parse().unwrap()])
     );
 }
+
+/// [security] and [logging] reach the container: hardening as given, node,
+/// service and workload values substituted in the log options.
+#[tokio::test]
+async fn security_and_logging() {
+    let d = tempfile::tempdir().unwrap();
+    let rt = Fake::new();
+    let s = supervisor(rt.clone(), d.path());
+    s.start(start_cmd("w0", 3)).await.unwrap();
+    settle().await;
+    let plain = rt.last_created();
+    assert_eq!(plain.security, crate::runtime::Security::default());
+    assert!(plain.log.is_none());
+
+    let mut cmd = start_cmd("w1", 3);
+    cmd.security = Some(pb::ContainerSecurity {
+        read_only_root: true,
+        no_new_privileges: true,
+        cap_drop: vec!["ALL".into()],
+        cap_add: vec!["NET_BIND_SERVICE".into()],
+        tmpfs: vec!["/tmp".into(), "/run:size=16m,mode=1777".into()],
+    });
+    cmd.logging = Some(pb::LogConfig {
+        driver: "awslogs".into(),
+        options: [
+            ("awslogs-group".to_string(), "/valkv/dev".to_string()),
+            (
+                "awslogs-stream".to_string(),
+                "${service.id}-${node.id}-${workload.id}".to_string(),
+            ),
+        ]
+        .into(),
+    });
+    let service = cmd.service_id.clone();
+    s.start(cmd).await.unwrap();
+    settle().await;
+    let spec = rt.last_created();
+    assert_eq!(
+        spec.security,
+        crate::runtime::Security {
+            read_only_root: true,
+            no_new_privileges: true,
+            cap_drop: vec!["ALL".into()],
+            cap_add: vec!["NET_BIND_SERVICE".into()],
+            tmpfs: vec![
+                ("/tmp".into(), String::new()),
+                ("/run".into(), "size=16m,mode=1777".into()),
+            ],
+        }
+    );
+    let log = spec.log.unwrap();
+    assert_eq!(log.driver, "awslogs");
+    assert_eq!(log.options["awslogs-group"], "/valkv/dev");
+    assert_eq!(
+        log.options["awslogs-stream"],
+        format!("{service}-node-1-w1")
+    );
+}

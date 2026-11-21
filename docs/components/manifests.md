@@ -70,6 +70,17 @@ min_healthy_time = "10s"       # how long a new workload must run (or, with [che
 attempts = 3                   # local restarts allowed ...
 interval = "5m"                # ... within this window
 delay    = "5s"                # wait before each restart
+
+[security]                     # container hardening; every setting off by default
+read_only_root    = true       # read-only root filesystem (volumes, /alloc and tmpfs stay writable)
+no_new_privileges = true       # setuid binaries can't raise privileges
+cap_drop          = ["ALL"]    # Linux capabilities to drop; "ALL" for every one
+cap_add           = []         # capabilities to give back, e.g. ["NET_BIND_SERVICE"]
+tmpfs             = ["/tmp"]   # in-memory writable paths; options after a colon: "/tmp:size=64m"
+
+[logging]                      # the container's Docker log driver; unset: the node's default
+driver  = "awslogs"
+options = { awslogs-group = "/valkv/dev", awslogs-stream = "${service.id}-${node.id}", mode = "non-blocking" }
 ```
 
 | Key | Default |
@@ -82,6 +93,8 @@ delay    = "5s"                # wait before each restart
 | `check.path`, `check.interval`, `check.timeout`, `check.failures`, `check.grace` | `"/"` (http), `"10s"`, `"2s"`, `3`, `"0s"` |
 | `update.max_parallel`, `update.min_healthy_time` | `1`, `"10s"` |
 | `restart.attempts`, `restart.interval`, `restart.delay` | `3`, `"5m"`, `"5s"` |
+| `security.*` | Docker's defaults: writable root, its default capabilities, no `no-new-privileges`, no tmpfs |
+| `logging` | the node's Docker default (the golden image sets `local`, 50 MB × 3) |
 
 Durations are `<n>s`, `<n>m`, `<n>h`, or a bare number of seconds. Sizes are an integer with an IEC unit, or a bare number of bytes. `examples/` has ready-to-apply manifests.
 
@@ -111,6 +124,39 @@ A `tcp` check only proves the port accepts connections: the kernel accepts them 
 | `ephemeral` | An empty directory of the workload's own, `<data_dir>/volumes/<workload_id>/<source>` | Any node; never shared, so no single-writer rule | The workload's: kept across in-place restarts, deleted when the workload stops |
 
 An ephemeral volume counts against `[resources] disk` together with `/alloc`, and starts empty: the image's files at `target` are not copied in, unlike a Docker named volume. `source` is its name (lowercase letters, digits, `-`, `_`); `read_only` and `single_writer` don't apply. It needs an agent with the `ephemeral_volumes` feature. No volume may be mounted at `/alloc`, which is always the workload's scratch directory. See `examples/ephemeral-volume.toml`.
+
+### Container Hardening
+
+`[security]` maps to Docker's `HostConfig`:
+
+| Key | Docker | Notes |
+|---|---|---|
+| `read_only_root` | `ReadonlyRootfs` | Volumes, `/alloc` and `tmpfs` paths stay writable. Images that write elsewhere (a temp directory, a pid file in `/run`) need a `tmpfs` for it |
+| `no_new_privileges` | `SecurityOpt: no-new-privileges:true` | setuid binaries and file capabilities can't raise the process's privileges |
+| `cap_drop`, `cap_add` | `CapDrop`, `CapAdd` | Capability names as in capabilities(7), with or without `CAP_`, any case; stored upper case without the prefix. `ALL` only in `cap_drop`. `cap_drop = ["ALL"]` with a short `cap_add` is the usual form |
+| `tmpfs` | `Tmpfs` | An absolute path, optionally followed by `:` and mount options (`size=64m,mode=1777`). Memory in a tmpfs counts against the container's `memory` limit |
+
+Health checks of type `exec` run with the same restrictions. A workload with `[security]` needs an agent with the `security` feature; with every setting off, the block is the same as leaving it out (no new hash).
+
+Validation (`INVALID_SECURITY_SPEC`) rejects an unknown capability, `ALL` in `cap_add`, a capability in both lists, and a `tmpfs` path that is relative, repeated, under `/alloc` or a volume's `target`. See `examples/hardened.toml`.
+
+### Logging
+
+`[logging]` sets the container's Docker log driver (`HostConfig.LogConfig`): `driver` is any driver the node's Docker has (`local`, `json-file`, `journald`, `awslogs`, `fluentd`, a plugin, or `none`), and `options` its `--log-opt` settings, as strings. Unset, the node's daemon default applies.
+
+Option values can contain `${node.NAME}` (as in `[env]`), `${service.id}` and `${workload.id}`; the agent substitutes them when it creates the container. `${secret:…}` is refused: log options are visible in `docker inspect`.
+
+```toml
+[logging]
+driver  = "awslogs"
+options = { awslogs-group = "/valkv/<cell>", awslogs-region = "us-west-1", awslogs-stream = "${service.id}-${node.id}", mode = "non-blocking", max-buffer-size = "4m" }
+```
+
+- **Use `mode = "non-blocking"` for drivers that send over the network.** In Docker's default `blocking` mode a write to stdout waits for the driver, so an unreachable destination (a CloudWatch outage) stalls the service. Non-blocking mode buffers up to `max-buffer-size` and drops lines beyond it. Validation warns when `awslogs`, `fluentd`, `gcplogs`, `gelf`, `logentries`, `splunk` or `syslog` is used without it.
+- **`awslogs` sends with the node's instance role**, which needs `logs:CreateLogStream` and `logs:PutLogEvents` on the group (and `logs:CreateLogGroup` with `awslogs-create-group`).
+- `docker logs` keeps working with remote drivers, through Docker's local cache (dual logging, on by default), including for a kept FAILED container.
+
+Validation (`INVALID_LOGGING_SPEC`) checks the driver's name, the option names, and the references in values. See `examples/cloudwatch-logs.toml`. Such a workload needs an agent with the `logging` feature. A changed `[security]` or `[logging]` is a replacing change.
 
 ### Batch Jobs
 
@@ -185,6 +231,8 @@ Validation runs before any database write. A failure writes nothing, returns gRP
 | VE-06 | No unknown keys or tables (`deny_unknown_fields`). The path names the table, e.g. `service.replica` or `ports.hostport` | `UNKNOWN_FIELD` |
 | VE-07 | Each volume has a known `type` (`host` or `ephemeral`), a source, an absolute `target` that is unique and not `/alloc`. An ephemeral volume's source is a name, and it takes no `read_only` or `single_writer` | `INVALID_VOLUME_SPEC` |
 | VE-09 | `check.type` is `tcp`, `http` or `exec`; `check.port` names a `[[ports]]` entry, for `tcp` and `http` only; `path` only for `http`, starting with `/`; `command` only for `exec`, and not empty; `failures` 1–1000 | `INVALID_CHECK_SPEC` |
+| VE-10 | `[security]`: capabilities are Linux capability names, `ALL` only in `cap_drop`, none in both lists; `tmpfs` paths absolute, unique, not `/alloc` or a volume `target`, options not empty after a `:` | `INVALID_SECURITY_SPEC` |
+| VE-11 | `[logging]`: `driver` is a driver or plugin name, option names are plain, values reference only `${node.NAME}`, `${service.id}` and `${workload.id}`; no options for `none`. A network driver without `mode = "non-blocking"` is a **warning** | `INVALID_LOGGING_SPEC` |
 | VE-08 | Each secret's name is an environment variable name not also in `[env]`, and its reference is `ssm:<parameter name>` or `file:<absolute path>`. Every `${secret:NAME}` in an `[env]` value is closed and names a `[secrets]` key | `INVALID_SECRET_REF` |
 | VW-01 | **Warning** at apply or plan: no current healthy node of the class could fit one replica, or none has the host volumes | `UNSATISFIABLE_NOW` |
 

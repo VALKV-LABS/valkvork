@@ -1,0 +1,52 @@
+# A service whose logs go to CloudWatch Logs: [logging].
+#
+# Without [logging] a container uses the node's Docker default log driver
+# (the golden image sets `local`, 50 MB x 3), so its logs stay on the node and
+# are lost when the node is replaced. [logging] picks the driver and its
+# options (Docker's --log-opt) per service.
+#
+# Option values can contain, substituted by the agent at container start:
+#   ${node.NAME}    advertise_ip, class, hostname or id, as in [env]
+#   ${service.id}   this service's id
+#   ${workload.id}  this workload's id
+# ${secret:...} is refused: log options are visible in `docker inspect`.
+#
+# Notes:
+#   - mode = "non-blocking" keeps a CloudWatch outage from blocking the
+#     container's writes to stdout: lines are buffered up to max-buffer-size
+#     and dropped beyond it. Without it, validation warns.
+#   - awslogs sends with the node's instance role, which needs
+#     logs:CreateLogStream and logs:PutLogEvents on the group (and
+#     logs:CreateLogGroup with awslogs-create-group = "true").
+#   - `docker logs` still works on the node, through Docker's local cache.
+#   - Other drivers work the same way, e.g.
+#       driver  = "json-file"
+#       options = { max-size = "10m", max-file = "5" }
+#     or driver = "journald", "fluentd", "gelf", or "none" (no logs at all).
+#
+# A changed [logging] replaces the workloads. It needs an agent with the
+# `logging` feature. Try it (on AWS, with a log group you can write to):
+#   valkvork apply -f examples/cloudwatch-logs.toml
+#   aws logs tail /valkvork/examples --follow
+[service]
+id           = "logs-demo"
+image        = "docker.io/library/busybox:1.37"
+replicas     = 2
+kill_timeout = "2s"
+command      = ["sh", "-c", "while true; do echo \"hello from $VALKVORK_WORKLOAD_ID\"; sleep 10; done"]
+
+[resources]
+cpu    = 0.05
+memory = "16MiB"
+
+[logging]
+driver = "awslogs"
+
+[logging.options]
+awslogs-group        = "/valkvork/examples"
+awslogs-create-group = "true"
+awslogs-region       = "us-west-1"
+# One stream per replica: two replicas on one node would otherwise share it.
+awslogs-stream       = "${service.id}-${node.id}-${workload.id}"
+mode                 = "non-blocking"
+max-buffer-size      = "4m"

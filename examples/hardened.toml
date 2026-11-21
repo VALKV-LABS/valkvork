@@ -1,0 +1,50 @@
+# A web server with container hardening: [security].
+#
+# Every [security] setting is off by default (Docker's defaults). This one
+# turns all of them on, the usual form for a service that runs untrusted
+# input, such as sqldb-node's embedded SQL engine:
+#   - read_only_root: the image's filesystem can't be changed. Volumes, /alloc
+#     and the tmpfs paths below stay writable.
+#   - no_new_privileges: setuid binaries (su, ping, ...) can't raise privileges.
+#   - cap_drop = ["ALL"]: no Linux capabilities, not even Docker's default set.
+#     Give one back with cap_add, e.g. cap_add = ["NET_BIND_SERVICE"] for a
+#     process that binds a port below 1024 as a non-root user.
+#   - tmpfs: in-memory writable paths, for an image that writes outside its
+#     volumes (here nginx's pid file and temp files in /tmp). Options follow
+#     a colon; the memory counts against [resources] memory.
+#
+# The image runs as a non-root user and listens on 8080, so it needs no
+# capability at all. Its entrypoint logs that it can't edit /etc/nginx on a
+# read-only root, and starts anyway.
+#
+# A changed [security] replaces the workloads. It needs an agent with the
+# `security` feature. Try it:
+#   valkvork apply -f examples/hardened.toml
+#   docker inspect --format '{{.HostConfig.ReadonlyRootfs}} {{.HostConfig.CapDrop}} {{.HostConfig.SecurityOpt}} {{.HostConfig.Tmpfs}}' <container>
+#   docker exec <container> sh -c 'touch /etc/x; grep -E "CapEff|NoNewPrivs" /proc/self/status'
+[service]
+id           = "hardened-web"
+image        = "docker.io/nginxinc/nginx-unprivileged:1.27-alpine"
+replicas     = 1
+kill_timeout = "5s"
+
+[resources]
+cpu    = 0.1
+memory = "64MiB"
+
+[[ports]]
+name           = "http"
+container_port = 8080
+host_port      = 8086
+
+[check]
+type = "http"
+port = "http"
+path = "/"
+
+[security]
+read_only_root    = true
+no_new_privileges = true
+cap_drop          = ["ALL"]
+cap_add           = []
+tmpfs             = ["/tmp:size=16m"]

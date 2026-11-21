@@ -292,6 +292,8 @@ mod tests {
             update: UpdatePolicy::default(),
             restart: RestartPolicy::default(),
             check: None,
+            security: None,
+            logging: None,
         }
     }
 

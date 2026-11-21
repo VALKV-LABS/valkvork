@@ -11,7 +11,8 @@ use bollard::container::{
 use bollard::errors::Error as DockerError;
 use bollard::image::CreateImageOptions;
 use bollard::models::{
-    HostConfig, Mount, MountTypeEnum, PortBinding, RestartPolicy, RestartPolicyNameEnum,
+    HostConfig, HostConfigLogConfig, Mount, MountTypeEnum, PortBinding, RestartPolicy,
+    RestartPolicyNameEnum,
 };
 use bollard::system::EventsOptions;
 use bollard::Docker;
@@ -57,6 +58,26 @@ pub struct ContainerSpec {
     pub labels: HashMap<String, String>,
     /// Nameservers; empty: Docker's default (the host's).
     pub dns: Vec<String>,
+    pub security: Security,
+    /// Log driver and its options; None: the daemon's default.
+    pub log: Option<LogConfig>,
+}
+
+/// Container hardening; the default is Docker's.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Security {
+    pub read_only_root: bool,
+    pub no_new_privileges: bool,
+    pub cap_drop: Vec<String>,
+    pub cap_add: Vec<String>,
+    /// Mount point -> tmpfs options (empty: Docker's).
+    pub tmpfs: Vec<(String, String)>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LogConfig {
+    pub driver: String,
+    pub options: HashMap<String, String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -319,7 +340,7 @@ impl ContainerRuntime for DockerRuntime {
             }),
             privileged: Some(false),
             dns: (!spec.dns.is_empty()).then(|| spec.dns.clone()),
-            ..Default::default()
+            ..hardening(&spec.security, spec.log.as_ref())
         };
         let config = Config {
             image: Some(spec.image.clone()),
@@ -592,6 +613,25 @@ pub fn image_registry(image: &str) -> String {
     }
 }
 
+/// The `HostConfig` fields for `[security]` and `[logging]`; unset ones are
+/// left to Docker's defaults.
+fn hardening(sec: &Security, log: Option<&LogConfig>) -> HostConfig {
+    HostConfig {
+        readonly_rootfs: sec.read_only_root.then_some(true),
+        security_opt: sec
+            .no_new_privileges
+            .then(|| vec!["no-new-privileges:true".to_string()]),
+        cap_drop: (!sec.cap_drop.is_empty()).then(|| sec.cap_drop.clone()),
+        cap_add: (!sec.cap_add.is_empty()).then(|| sec.cap_add.clone()),
+        tmpfs: (!sec.tmpfs.is_empty()).then(|| sec.tmpfs.iter().cloned().collect()),
+        log_config: log.map(|l| HostConfigLogConfig {
+            typ: Some(l.driver.clone()),
+            config: Some(l.options.clone()),
+        }),
+        ..Default::default()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -617,5 +657,35 @@ mod tests {
         let c = registry_credentials(&p, "ghcr.io/org/app:1").unwrap();
         assert_eq!((c.username.as_str(), c.password.as_str()), ("user", "pass"));
         assert!(registry_credentials(&p, "nginx:1").is_none());
+    }
+
+    #[test]
+    fn hardening_host_config() {
+        let none = hardening(&Security::default(), None);
+        assert_eq!(none, HostConfig::default());
+        let hc = hardening(
+            &Security {
+                read_only_root: true,
+                no_new_privileges: true,
+                cap_drop: vec!["ALL".into()],
+                cap_add: vec![],
+                tmpfs: vec![("/tmp".into(), String::new())],
+            },
+            Some(&LogConfig {
+                driver: "awslogs".into(),
+                options: HashMap::from([("mode".into(), "non-blocking".into())]),
+            }),
+        );
+        assert_eq!(hc.readonly_rootfs, Some(true));
+        assert_eq!(hc.security_opt.unwrap(), ["no-new-privileges:true"]);
+        assert_eq!(hc.cap_drop.unwrap(), ["ALL"]);
+        assert_eq!(hc.cap_add, None);
+        assert_eq!(
+            hc.tmpfs.unwrap(),
+            HashMap::from([("/tmp".into(), String::new())])
+        );
+        let log = hc.log_config.unwrap();
+        assert_eq!(log.typ.as_deref(), Some("awslogs"));
+        assert_eq!(log.config.unwrap()["mode"], "non-blocking");
     }
 }
