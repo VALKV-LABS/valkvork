@@ -72,6 +72,8 @@ pub struct Security {
     pub cap_add: Vec<String>,
     /// Mount point -> tmpfs options (empty: Docker's).
     pub tmpfs: Vec<(String, String)>,
+    /// Network-namespace kernel parameters (`[sysctls]`); empty: the host's.
+    pub sysctls: HashMap<String, String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -624,6 +626,7 @@ fn hardening(sec: &Security, log: Option<&LogConfig>) -> HostConfig {
         cap_drop: (!sec.cap_drop.is_empty()).then(|| sec.cap_drop.clone()),
         cap_add: (!sec.cap_add.is_empty()).then(|| sec.cap_add.clone()),
         tmpfs: (!sec.tmpfs.is_empty()).then(|| sec.tmpfs.iter().cloned().collect()),
+        sysctls: (!sec.sysctls.is_empty()).then(|| sec.sysctls.clone()),
         log_config: log.map(|l| HostConfigLogConfig {
             typ: Some(l.driver.clone()),
             config: Some(l.options.clone()),
@@ -670,6 +673,7 @@ mod tests {
                 cap_drop: vec!["ALL".into()],
                 cap_add: vec![],
                 tmpfs: vec![("/tmp".into(), String::new())],
+                sysctls: HashMap::from([("net.ipv4.tcp_retries2".into(), "6".into())]),
             },
             Some(&LogConfig {
                 driver: "awslogs".into(),
@@ -684,6 +688,7 @@ mod tests {
             hc.tmpfs.unwrap(),
             HashMap::from([("/tmp".into(), String::new())])
         );
+        assert_eq!(hc.sysctls.unwrap()["net.ipv4.tcp_retries2"], "6");
         let log = hc.log_config.unwrap();
         assert_eq!(log.typ.as_deref(), Some("awslogs"));
         assert_eq!(log.config.unwrap()["mode"], "non-blocking");

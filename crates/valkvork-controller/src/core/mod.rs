@@ -501,6 +501,11 @@ impl Core {
                         cap_add: x.cap_add.clone(),
                         tmpfs: x.tmpfs.clone(),
                     }),
+                    sysctls: s
+                        .sysctls
+                        .iter()
+                        .map(|(k, v)| (k.clone(), v.clone()))
+                        .collect(),
                     logging: s.logging.as_ref().map(|l| pb::LogConfig {
                         driver: l.driver.clone(),
                         options: l

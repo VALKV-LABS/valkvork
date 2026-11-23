@@ -657,7 +657,7 @@ impl Supervisor {
         if let Some(p) = &probe {
             labels.insert(LABEL_CHECK.to_string(), p.to_label());
         }
-        let security = cmd
+        let mut security = cmd
             .security
             .as_ref()
             .map(|x| crate::runtime::Security {
@@ -673,8 +673,14 @@ impl Supervisor {
                         None => (t.clone(), String::new()),
                     })
                     .collect(),
+                sysctls: HashMap::new(),
             })
             .unwrap_or_default();
+        security.sysctls = cmd
+            .sysctls
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
         let log = match &cmd.logging {
             None => None,
             Some(l) => {

@@ -117,6 +117,9 @@ message StartWorkload {
   bool batch = 18;
   ContainerSecurity security = 19;     // unset: Docker's defaults
   LogConfig logging = 20;              // unset: the node's default driver
+  // Kernel parameters of the container's network namespace (net.* only;
+  // `[sysctls]`): needs the agent feature "sysctls".
+  map<string, string> sysctls = 21;
 }
 
 // Container hardening. Capability names are upper case, without "CAP_".

@@ -285,6 +285,11 @@ pub struct ServiceSpec {
     /// Log driver (`[logging]`). None: the node's default (stable hashes).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub logging: Option<LoggingSpec>,
+    /// Kernel parameters of the container's own network namespace
+    /// (`[sysctls]`, Docker's `--sysctl`): `net.*` only. Omitted when empty
+    /// (stable hashes).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub sysctls: BTreeMap<String, String>,
 }
 
 /// Container hardening (`[security]`). Every setting defaults to off, as
@@ -340,6 +345,7 @@ pub const AGENT_FEATURES: &[&str] = &[
     "secret_values",
     "secrets",
     "security",
+    "sysctls",
     // Not a manifest feature: the agent accepts Endpoints messages.
     "service_discovery",
 ];
@@ -478,6 +484,9 @@ impl ServiceSpec {
         if self.logging.is_some() {
             f.push("logging");
         }
+        if !self.sysctls.is_empty() {
+            f.push("sysctls");
+        }
         f
     }
 
@@ -589,6 +598,7 @@ impl ServiceSpec {
         cmp!("check", self.check, new.check);
         cmp!("security", self.security, new.security);
         cmp!("logging", self.logging, new.logging);
+        cmp!("sysctls", self.sysctls, new.sysctls);
         out
     }
 }
@@ -620,6 +630,7 @@ mod tests {
             check: None,
             security: None,
             logging: None,
+            sysctls: BTreeMap::new(),
         }
     }
 

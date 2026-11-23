@@ -906,6 +906,12 @@ pub fn spec_to_toml(s: &valkvork_common::models::ServiceSpec) -> String {
             }
         }
     }
+    if !s.sysctls.is_empty() {
+        let _ = writeln!(o, "\n[sysctls]");
+        for (k, v) in &s.sysctls {
+            let _ = writeln!(o, "{k:?} = {v:?}");
+        }
+    }
     o
 }
 

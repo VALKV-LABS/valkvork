@@ -294,6 +294,7 @@ mod tests {
             check: None,
             security: None,
             logging: None,
+            sysctls: Default::default(),
         }
     }
 
