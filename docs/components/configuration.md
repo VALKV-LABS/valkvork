@@ -67,6 +67,8 @@ docker_socket       = "/var/run/docker.sock"
 registry_auth_file  = "/etc/valkvork/registry-auth.json"   # optional, Docker config.json format
 # advertise_ip      = "10.0.1.23"            # default: the local address routed to the controller
 metrics_listen_addr = "127.0.0.1:9401"       # must be loopback; omit to disable
+default_pids_limit  = 4096                   # processes and threads per container, unless the manifest
+                                             # sets [security] pids_limit; 0 for no limit
 default_host_ip     = "advertise"            # ports whose manifest sets no host_ip: "advertise" (the
                                              # node's address), "0.0.0.0" (every address) or an IP
 

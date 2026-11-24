@@ -136,8 +136,9 @@ An ephemeral volume counts against `[resources] disk` together with `/alloc`, an
 | `cap_drop`, `cap_add` | `CapDrop`, `CapAdd` | Capability names as in capabilities(7), with or without `CAP_`, any case; stored upper case without the prefix. `ALL` only in `cap_drop`. `cap_drop = ["ALL"]` with a short `cap_add` is the usual form |
 | `tmpfs` | `Tmpfs` | An absolute path, optionally followed by `:` and mount options (`size=64m,mode=1777`). Memory in a tmpfs counts against the container's `memory` limit |
 | `instance_metadata` | (agent iptables rule) | `true` lets the container reach the cloud metadata service, 169.254.169.254, and so use the node's instance role. Agents block it by default (agent.toml `[instance_metadata] block`); see [security.md](security.md#instance-metadata). Set it only for workloads that call AWS with the node's role |
+| `pids_limit` | `PidsLimit` | The most processes and threads the container may have at once, 16 to 4194304. A fork bomb or a thread leak then fails inside the container instead of exhausting the node. Unset: the agent's `default_pids_limit` (4096 unless agent.toml changes it). Threads count: size it for a JVM or a database with many connections. Needs an agent with the `pids_limit` feature |
 
-Health checks of type `exec` run with the same restrictions. A workload with hardening settings needs an agent with the `security` feature; `instance_metadata` alone does not, since an agent without it does not block the service either. With every setting off, the block is the same as leaving it out (no new hash).
+Health checks of type `exec` run with the same restrictions. A workload with hardening settings needs an agent with the `security` feature; `instance_metadata` alone does not, since an agent without it does not block the service either; `pids_limit` needs the `pids_limit` feature instead. With every setting off, the block is the same as leaving it out (no new hash).
 
 Validation (`INVALID_SECURITY_SPEC`) rejects an unknown capability, `ALL` in `cap_add`, a capability in both lists, and a `tmpfs` path that is relative, repeated, under `/alloc` or a volume's `target`. See `examples/hardened.toml`.
 

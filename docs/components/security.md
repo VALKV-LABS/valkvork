@@ -92,6 +92,7 @@ The agent creates containers with:
 | Seccomp, AppArmor | Docker's default profiles |
 | Devices | None |
 | CPU, memory | `NanoCpus` from `resources.cpu`; `Memory = MemorySwap` from `resources.memory`, so no swap |
+| Processes | `PidsLimit` from `[security] pids_limit`, else agent.toml `default_pids_limit` (4096; 0 for none) |
 | Disk | `/alloc` plus the writable layer, limited by polling (`resources.disk`) |
 | Network | Docker's default bridge; each `host_port` is published on the node's address (agent.toml `default_host_ip`) unless the manifest sets `host_ip`. The metadata service is rejected unless `[security] instance_metadata = true` (see [Instance Metadata](#instance-metadata)) |
 | Mounts | `/alloc` (read-write) and declared host volumes (read-only if either side says so); never the Docker socket |
@@ -100,7 +101,7 @@ The agent creates containers with:
 
 **`/alloc` is writable by any user.** Each workload's directory is created by the agent as `root 1777` (world-writable with the sticky bit, like `/tmp`), so images that run as a non-root `USER` can write to `/alloc`. It is mounted only into its own container, and the parent `alloc/` stays `root 0711`, so other users on the host cannot list it. Host volume directories are `root 0755` unless the operator sets `owner` and `mode` for them in `agent.toml`, which the agent applies at startup (see [configuration.md](configuration.md#agent)). Images such as Postgres, whose entrypoint starts as root and changes ownership of its data directory, need neither. For an image that starts as a non-root user, set `owner` to its numeric uid. Only the operator, never a manifest, decides who owns a host directory, because volumes outlive services and can be shared between them.
 
-A manifest can opt into hardening with `[security]` (see [manifests.md](manifests.md#container-hardening)): a read-only root filesystem, `no-new-privileges`, dropped capabilities and tmpfs scratch paths. Every setting is off by default. A capability can be added back, but `cap_add = ["ALL"]` is refused, and there is still no way to run privileged. Not set and worth adding for untrusted images: a PID limit. Valkvork assumes workloads are trusted code you deploy; it is not a sandbox for hostile tenants.
+A manifest can opt into hardening with `[security]` (see [manifests.md](manifests.md#container-hardening)): a read-only root filesystem, `no-new-privileges`, dropped capabilities and tmpfs scratch paths. Every setting is off by default. A capability can be added back, but `cap_add = ["ALL"]` is refused, and there is still no way to run privileged. Every container also gets a PID limit (agent.toml `default_pids_limit`, 4096 by default), which a manifest can lower or raise with `pids_limit`. Valkvork assumes workloads are trusted code you deploy; it is not a sandbox for hostile tenants.
 
 ### CLI and Browser
 

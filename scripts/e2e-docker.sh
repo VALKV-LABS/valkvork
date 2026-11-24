@@ -432,7 +432,7 @@ pass "ephemeral volumes are deleted with their workloads"
 
 # ── the instance metadata service: blocked unless the manifest allows it ────
 for svc in imds-on imds-off; do
-  allow=false; [ "$svc" = imds-on ] && allow=true
+  allow=false; pids=""; [ "$svc" = imds-on ] && allow=true && pids="pids_limit = 128"
   cat > "$W/$svc.toml" <<EOF
 [service]
 id           = "$svc"
@@ -446,6 +446,7 @@ memory = "32MiB"
 
 [security]
 instance_metadata = $allow
+$pids
 EOF
   vk apply -f "$W/$svc.toml" >/dev/null
 done
@@ -464,6 +465,9 @@ iptables -w -S VALKVORK-IMDS | grep -- "-j REJECT" | grep -- "-d 169.254.169.254
 OUT="$(docker exec "$OFF" wget -T 3 -qO- http://169.254.169.254/latest/meta-data/ 2>&1 || true)"
 echo "$OUT" | grep -qi refused || fail "imds-off reached the metadata address: $OUT"
 pass "instance metadata: imds-off refused, imds-on ($ON_IP) let through"
+[ "$(docker inspect -f '{{.HostConfig.PidsLimit}}' "$ON")" = 128 ] || fail "imds-on PidsLimit $(docker inspect -f '{{.HostConfig.PidsLimit}}' "$ON"), not 128"
+[ "$(docker inspect -f '{{.HostConfig.PidsLimit}}' "$OFF")" = 4096 ] || fail "imds-off PidsLimit $(docker inspect -f '{{.HostConfig.PidsLimit}}' "$OFF"), not the agent default 4096"
+pass "pids limit: [security] pids_limit = 128 applied; the agent default (4096) otherwise"
 vk delete service imds-on >/dev/null
 for _ in $(seq 30); do [ -z "$(docker ps -aq --filter label=valkvork.service_id=imds-on)" ] && break; sleep 1; done
 if iptables -w -S VALKVORK-IMDS | grep -q -- "-s $ON_IP/32"; then fail "imds-on's rule left after it stopped"; fi

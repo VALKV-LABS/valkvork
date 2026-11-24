@@ -315,6 +315,10 @@ pub struct SecuritySpec {
     /// `[instance_metadata] block`) let only these containers through.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub instance_metadata: bool,
+    /// The most processes and threads the container may have (Docker's
+    /// `PidsLimit`). Unset: agent.toml `default_pids_limit`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pids_limit: Option<u32>,
 }
 
 impl SecuritySpec {
@@ -328,6 +332,7 @@ impl SecuritySpec {
     pub fn needs_hardening(&self) -> bool {
         SecuritySpec {
             instance_metadata: false,
+            pids_limit: None,
             ..self.clone()
         } != SecuritySpec::default()
     }
@@ -357,6 +362,7 @@ pub const AGENT_FEATURES: &[&str] = &[
     "host_ip",
     "logging",
     "node_values",
+    "pids_limit",
     "secret_values",
     "secrets",
     "security",
@@ -495,6 +501,13 @@ impl ServiceSpec {
         }
         if self.security.as_ref().is_some_and(|s| s.needs_hardening()) {
             f.push("security");
+        }
+        if self
+            .security
+            .as_ref()
+            .is_some_and(|s| s.pids_limit.is_some())
+        {
+            f.push("pids_limit");
         }
         if self.logging.is_some() {
             f.push("logging");

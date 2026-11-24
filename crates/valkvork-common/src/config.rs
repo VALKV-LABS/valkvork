@@ -222,6 +222,9 @@ pub struct AgentConfig {
     pub default_host_ip: String,
     /// Containers' access to the cloud instance metadata service.
     pub instance_metadata: InstanceMetadataConfig,
+    /// The most processes and threads a container may have when its
+    /// manifest sets no `[security] pids_limit`; 0 for no limit.
+    pub default_pids_limit: u32,
 }
 
 /// agent.toml `[instance_metadata]`. With `block`, the agent drops traffic
@@ -269,6 +272,7 @@ impl Default for AgentConfig {
             discovery: DiscoveryConfig::default(),
             default_host_ip: "advertise".to_string(),
             instance_metadata: InstanceMetadataConfig::default(),
+            default_pids_limit: 4096,
         }
     }
 }
