@@ -17,7 +17,7 @@ PLATFORM ?= linux/$(shell uname -m | sed -e 's/x86_64/amd64/' -e 's/aarch64/arm6
 .PHONY: help build build-release test test-unit fmt fmt-check check ci \
         dev-up dev-down dev-status dev-logs dev-reset env demo ui \
         dev-add-node dev-stop-node dev-remove-node \
-        dist image e2e clean
+        dist image e2e load load-linux clean
 
 help:  ## Show this help
 	@awk 'BEGIN {FS = ":.*## "} /^[a-zA-Z_-]+:.*## / {printf "  \033[36m%-17s\033[0m %s\n", $$1, $$2}' $(MAKEFILE_LIST)
@@ -99,6 +99,12 @@ e2e: dist  ## End-to-end test against your Docker: Postgres with secrets, bind a
 	  -v /var/tmp/vk-e2e:/var/tmp/vk-e2e -v "$(CURDIR)/dist:/dist:ro" \
 	  -v "$(CURDIR)/examples:/examples:ro" \
 	  -v "$(CURDIR)/scripts/e2e-docker.sh:/e2e.sh:ro" docker:27-cli sh /e2e.sh
+
+load:  ## Controller memory at the NFR-01 load (AT-11): 50 agents, 500 workloads, 10 UI sessions (~3 min)
+	@scripts/load-test.sh
+
+load-linux: dist  ## The same against the static musl controller from dist/, in a container
+	@scripts/load-test.sh --linux
 
 image:  ## Controller and agent images (valkvork-controller:dev, valkvork-agent:dev)
 	docker buildx build --platform $(PLATFORM) --load --target controller -t valkvork-controller:dev .

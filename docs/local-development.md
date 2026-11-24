@@ -121,6 +121,8 @@ make ci          # fmt check, clippy -D warnings, tests: what CI runs
 make dist        # static musl binaries in dist/ (PLATFORM=linux/amd64 to cross-build)
 make image       # valkvork-controller:dev and valkvork-agent:dev images
 make e2e         # end-to-end against your Docker, about 2 minutes
+make load        # controller memory at the NFR-01 load (AT-11), about 3 minutes
+make load-linux  # the same against the static musl build, in a container
 ```
 
 `make e2e` builds the Linux binaries and runs a controller, an agent and the CLI against real Docker (`scripts/e2e-docker.sh`). It runs Postgres with a `[secrets]` password, `host_ip = "advertise"`, a `command` and a `tcp` health check. Then it checks that:
@@ -135,3 +137,23 @@ make e2e         # end-to-end against your Docker, about 2 minutes
 - `examples/ephemeral-volume.toml`: each replica gets its own directory, mounted at its target and writable, deleted with the workload.
 
 It works in `/var/tmp/vk-e2e` on the Docker host, and cleans up its containers.
+
+### Load Test (AT-11)
+
+`make load` measures the controller's memory at the NFR-01 load: under 50 MiB RSS at 50 nodes and 500 workloads with 10 web UI sessions open. `scripts/load-test.sh` starts a throwaway controller with TLS (ports 50071, 50072 and 9420, state under `target/load-test/`) and runs `valkvork-loadtest` (`crates/valkvork-loadtest`) against it from the same machine:
+
+- **50 simulated agents**, each on its own agent stream: `Register`, heartbeats at the controller's interval with a status for every workload, acks for every command. Each enrols for a client certificate and reconnects with it, as a restarted agent does. No containers run.
+- **500 workloads** in 10 services, applied through the admin API, then **churn** every 15 s: alternately a rolling update (`max_parallel = 10`) and a scale change.
+- **10 web UI sessions**: signed in, holding `/ui/api/events` open, and fetching their page (overview, services, workloads, nodes or events) on every change and every 5 s.
+- The controller's RSS, sampled every second, against `LIMIT_MIB` (50): the run fails if the peak is over it. It also prints how many `StopWorkload` commands each stopped workload got (1 is right).
+
+`NODES`, `WORKLOADS`, `SERVICES`, `UI_SESSIONS`, `DURATION` (seconds of full load), `CHURN` and `LIMIT_MIB` change the load. `make load-linux` runs `dist/valkvork-controller`, the static musl build the golden image installs, in an Alpine container and reads `/proc/1/status`; that is the number that counts, since musl and macOS allocate differently.
+
+Measured on 2026-11-24 (Apple silicon, Docker in Colima), 120 s window:
+
+| Controller | Idle | 50 nodes | + 500 workloads | + 10 UI sessions | Peak under churn |
+|---|---|---|---|---|---|
+| `make load-linux` (musl) | 7.2 MiB | 11.5 MiB | 15.9 MiB | 16.4 MiB | **17.9 MiB** |
+| `make load` (macOS) | 11.9 MiB | 17.8 MiB | 23.4 MiB | 24.0 MiB | **25.1 MiB** |
+
+Both include SQLite's page cache (capped at 8 MiB by `PRAGMA cache_size`), which NFR-01 excludes.
