@@ -1677,3 +1677,62 @@ mod node_certificates {
         assert!(connect(&mut c, "a", "", Some(cert)).1.accepted);
     }
 }
+
+/// An accepted stop is not sent again while the container takes its kill
+/// timeout to go, by reconcile or by heartbeats that still report it; only
+/// once it outlasts the kill timeout plus STOP_GRACE, or the agent
+/// re-registers.
+#[test]
+fn accepted_stop_is_not_resent_while_the_container_stops() {
+    let mut c = core();
+    let mut a = register(&mut c, "a");
+    apply(&mut c, &manifest("web", "nginx:1", 1, ""));
+    a.take();
+    run_all(&mut c, &a);
+    let wid = c.workloads.keys().next().unwrap().clone();
+    c.scale_service_for_test("web", 0);
+    let sent: Vec<_> = a
+        .take()
+        .into_iter()
+        .filter_map(|m| match m {
+            pb::controller_message::Msg::StopWorkload(s) => Some(s),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(sent.len(), 1);
+    c.handle(CoreMsg::AgentMsg {
+        node_id: a.id.clone(),
+        conn_id: a.conn,
+        msg: pb::agent_message::Msg::CommandResult(pb::CommandResult {
+            command_id: sent[0].command_id.clone(),
+            workload_id: wid.clone(),
+            accepted: true,
+            error: String::new(),
+        }),
+    });
+    c.finish().unwrap();
+
+    // Still stopping: reported RUNNING for a few heartbeats, reconciled.
+    for _ in 0..5 {
+        heartbeat(&mut c, &a, vec![status(&wid, WorkloadState::Running)]);
+        c.reconcile();
+        c.finish().unwrap();
+    }
+    assert!(
+        stops(&a.take()).is_empty(),
+        "an accepted stop was sent again"
+    );
+
+    // Outlasting kill timeout + grace: sent again.
+    c.acked_stops.get_mut(&wid).unwrap().1 =
+        Instant::now() - Duration::from_secs(10) - STOP_GRACE - Duration::from_secs(1);
+    c.reconcile();
+    c.finish().unwrap();
+    assert_eq!(stops(&a.take()), vec![wid.clone()]);
+
+    // Gone from the heartbeat: STOPPED, and nothing left behind.
+    heartbeat(&mut c, &a, vec![]);
+    assert_eq!(c.workloads[&wid].status, WorkloadStatus::Stopped);
+    c.reconcile();
+    assert!(c.acked_stops.is_empty());
+}

@@ -102,6 +102,10 @@ pub(crate) struct Outstanding {
     pub resent: bool,
 }
 
+/// How long past its kill timeout an accepted stop may take before the
+/// controller sends it again (the container is still reported).
+pub(crate) const STOP_GRACE: Duration = Duration::from_secs(30);
+
 type AfterCommit = Box<dyn FnOnce() + Send>;
 
 pub struct Core {
@@ -127,6 +131,10 @@ pub struct Core {
     pub(crate) assigned_at: HashMap<String, Instant>,
     /// Outstanding commands keyed by workload id.
     pub(crate) outstanding: HashMap<String, Outstanding>,
+    /// Stops the agent accepted, by workload: (node, when). The container
+    /// may take its kill timeout to go; until then the stop is in progress
+    /// and is not sent again.
+    pub(crate) acked_stops: HashMap<String, (String, Instant)>,
     pub(crate) cpu_samples: CpuSamples,
 
     // Pending writes and side effects for the current step.
@@ -214,6 +222,7 @@ impl Core {
             workloads,
             assigned_at,
             outstanding: HashMap::new(),
+            acked_stops: HashMap::new(),
             cpu_samples: HashMap::new(),
             dirty_nodes: HashSet::new(),
             dirty_services: HashSet::new(),
@@ -476,6 +485,7 @@ impl Core {
     /// delete its row in the next commit.
     pub(crate) fn remove_node_entry(&mut self, node_id: &str) {
         self.nodes.remove(node_id);
+        self.acked_stops.retain(|_, (n, _)| n != node_id);
         self.node_certs.remove(node_id);
         self.dirty_nodes.remove(node_id);
         self.heartbeats.retain(|(id, _)| id != node_id);
@@ -636,10 +646,26 @@ impl Core {
         self.to_send.push(workload_id.to_string());
     }
 
+    /// A stop is sent and unanswered, or accepted and still within the
+    /// container's kill timeout plus [`STOP_GRACE`].
     pub(crate) fn has_outstanding_stop(&self, workload_id: &str) -> bool {
         self.outstanding
             .get(workload_id)
             .is_some_and(|o| !o.is_start)
+            || self.stop_in_progress(workload_id)
+    }
+
+    pub(crate) fn stop_in_progress(&self, workload_id: &str) -> bool {
+        let Some((_, at)) = self.acked_stops.get(workload_id) else {
+            return false;
+        };
+        let kill_timeout = self
+            .workloads
+            .get(workload_id)
+            .and_then(|w| self.services.get(&w.service_id))
+            .map(|s| s.spec.kill_timeout_seconds)
+            .unwrap_or(10);
+        at.elapsed() < Duration::from_secs(u64::from(kill_timeout)) + STOP_GRACE
     }
 
     /// Send an outstanding command if its node has an open stream. Commands
