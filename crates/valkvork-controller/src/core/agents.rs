@@ -114,6 +114,9 @@ impl Core {
         self.direct.push((tx, ack(true, "", interval)));
         self.discovery.needs_set(&node_id);
 
+        // The agent may have restarted and lost an accepted stop: its
+        // inventory decides again.
+        self.acked_stops.retain(|_, (n, _)| *n != node_id);
         self.reconcile_inventory(&node_id, &r.inventory);
         self.resend_for_node(&node_id);
         self.reconcile();
@@ -643,8 +646,13 @@ impl Core {
             return; // ack for a superseded command
         }
         let is_start = o.is_start;
+        let node = o.node_id.clone();
         self.outstanding.remove(&res.workload_id);
         if res.accepted {
+            if !is_start {
+                self.acked_stops
+                    .insert(res.workload_id.clone(), (node, Instant::now()));
+            }
             return;
         }
         tracing::warn!(node = node_id, workload = %res.workload_id, error = %res.error, "agent rejected command");

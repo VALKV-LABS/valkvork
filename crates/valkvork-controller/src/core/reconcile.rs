@@ -98,14 +98,22 @@ impl Core {
     }
 
     /// STOPPING workloads on a connected node whose stop was never acked
-    /// (rejected, or the retry gave up) get another `StopWorkload`.
+    /// (rejected, or the retry gave up), or was acked but has outlasted the
+    /// kill timeout plus `STOP_GRACE`, get another `StopWorkload`.
     fn reissue_stops(&mut self) {
+        let workloads = &self.workloads;
+        self.acked_stops.retain(|wid, _| {
+            workloads
+                .get(wid)
+                .is_some_and(|w| w.status == WorkloadStatus::Stopping)
+        });
         let stuck: Vec<(String, String)> = self
             .workloads
             .values()
             .filter(|w| {
                 w.status == WorkloadStatus::Stopping
                     && !self.outstanding.contains_key(&w.workload_id)
+                    && !self.stop_in_progress(&w.workload_id)
             })
             .filter_map(|w| {
                 let node = w.node_id.as_ref()?;
