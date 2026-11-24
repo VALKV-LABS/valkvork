@@ -19,11 +19,10 @@ issued a client certificate" in `valkvork events --kind NODE`.
 
 What is not built yet. The rest of the [spec](spec.md)'s MVP scope is implemented and described in [docs/](docs/components/index.md); items tagged [P2], [P3] or [Later] in the spec are deliberately out of scope for now and are collected, with design sketches, in [docs/phase-2.md](docs/phase-2.md).
 
-1. **Measure controller memory** at the NFR-01 load (AT-11): under 50 MB RSS at 50 nodes and
-   500 workloads with 10 UI sessions open. Needs a load harness that registers simulated agents
-   from one machine. The agent half passed on the AWS dev cell on 2026-11-07: 6.8 MB RSS (peak
-   7.2 MB) with 21 running workloads, against a 15 MB limit. The controller used 8.9 MB at
-   2 nodes and ~42 workloads, which is not the required load.
+1. **Controller memory is measured** (AT-11, NFR-01): 17.9 MiB peak RSS for the static musl
+   build at 50 nodes, 500 workloads, 10 UI sessions and churn, against 50 MiB; `make load-linux`,
+   results in [local-development.md](docs/local-development.md#load-test-at-11). The agent half
+   passed on the AWS dev cell on 2026-11-07 (6.8 MB RSS with 21 workloads, against 15 MB).
 2. **Run the merged features on AWS** when the dev cell is next up: discovery in place of the
    per-node-group Route53 names, the `exec` check for global-pg (repeat Stage 1's pause check),
    node certificates, metadata blocking.
