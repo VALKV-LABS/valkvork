@@ -11,7 +11,7 @@
 # directory; folders shared from macOS cannot be chowned). Each run uses a new
 # run-<time> directory there. It uses ports 50061, 50062, 9410, 9411, 15432
 # and 18080 on the Docker host, and port 53 on the Docker bridge's gateway and the service ids global-pg, bad-secret,
-# web-check, exec-check, pg-init, pg-fail, cache-demo, imds-on and imds-off, so do not run it next
+# web-check, exec-check, pg-init, pg-fail, cache-demo, imds-on, imds-off and secret-file, so do not run it next
 # to a dev cluster with those services. It needs NET_ADMIN on the Docker host: the agent manages
 # its VALKVORK-IMDS iptables chain there.
 set -eu
@@ -22,7 +22,7 @@ pass() { echo "PASS: $*"; }
 
 # Remove this test's containers however it ends.
 cleanup() {
-  for svc in global-pg bad-secret web-check exec-check pg-init pg-fail cache-demo imds-on imds-off; do
+  for svc in global-pg bad-secret web-check exec-check pg-init pg-fail cache-demo imds-on imds-off secret-file; do
     for c in $(docker ps -aq --filter "label=valkvork.service_id=$svc"); do
       docker stop "$c" >/dev/null 2>&1 || true
       docker rm "$c" >/dev/null 2>&1 || true
@@ -82,6 +82,10 @@ memory = "256MiB"
 
 [secrets]
 file_dirs = ["$W/secrets"]
+# This agent runs in a container: a tmpfs it mounted would be invisible to
+# dockerd, so file secrets stay in a plain directory here.
+files_tmpfs     = false
+refresh_seconds = 5
 
 [discovery]
 enabled = true
@@ -429,6 +433,45 @@ for _ in $(seq 30); do [ -z "$(docker ps -aq --filter label=valkvork.service_id=
 sleep 1
 [ -z "$(ls "$W/data/volumes" 2>/dev/null)" ] || fail "ephemeral volume directories left behind: $(ls "$W/data/volumes")"
 pass "ephemeral volumes are deleted with their workloads"
+
+# ── secrets as files: /run/secrets, not in docker inspect, rotated in place ─
+printf 'k3y-%s\n' "$(head -c 6 /dev/urandom | od -An -tx1 | tr -d ' \n')" > "$W/secrets/api_key"
+KEY="$(cat "$W/secrets/api_key")"
+cat > "$W/sf.toml" <<EOF
+[service]
+id           = "secret-file"
+image        = "docker.io/library/nginx:1.27-alpine"
+replicas     = 1
+kill_timeout = "2s"
+
+[resources]
+cpu    = 0.1
+memory = "32MiB"
+
+[secrets]
+API_KEY = { ref = "file:$W/secrets/api_key", file = true, owner = "101:101", mode = "0400" }
+EOF
+vk apply -f "$W/sf.toml" >/dev/null
+for _ in $(seq 60); do vk workloads 2>/dev/null | grep -q 'secret-file.*RUNNING' && break; sleep 1; done
+vk workloads | grep -q 'secret-file.*RUNNING' || { tail -20 "$W/agent.log"; fail "secret-file did not run"; }
+SF="$(docker ps -q --filter label=valkvork.service_id=secret-file)"
+[ "$(docker exec "$SF" cat /run/secrets/API_KEY)" = "$KEY" ] || fail "/run/secrets/API_KEY is not the value"
+[ "$(docker exec "$SF" stat -c '%u:%g %a' /run/secrets/API_KEY)" = "101:101 400" ] || fail "owner/mode: $(docker exec "$SF" stat -c '%u:%g %a' /run/secrets/API_KEY)"
+docker exec "$SF" sh -c 'echo x > /run/secrets/API_KEY' 2>/dev/null && fail "/run/secrets is writable"
+if docker inspect "$SF" | grep -qF "$KEY"; then fail "the value is in docker inspect"; fi
+if docker exec "$SF" cat /proc/1/environ | tr '\0' '\n' | grep -qF "$KEY"; then fail "the value is in the environment"; fi
+pass "file secret: /run/secrets/API_KEY 101:101 0400, read-only, absent from docker inspect and the environment"
+printf 'k3y-rotated\n' > "$W/secrets/api_key"
+for _ in $(seq 20); do [ "$(docker exec "$SF" cat /run/secrets/API_KEY)" = "k3y-rotated" ] && break; sleep 1; done
+[ "$(docker exec "$SF" cat /run/secrets/API_KEY)" = "k3y-rotated" ] || fail "the file secret was not rotated"
+[ "$(docker ps -q --filter label=valkvork.service_id=secret-file)" = "$SF" ] || fail "rotation replaced the container"
+pass "file secret rotated in place, same container"
+WID="$(docker inspect -f '{{index .Config.Labels "valkvork.workload_id"}}' "$SF")"
+vk delete service secret-file >/dev/null
+for _ in $(seq 30); do [ -z "$(docker ps -aq --filter label=valkvork.service_id=secret-file)" ] && break; sleep 1; done
+sleep 1
+[ ! -e "$W/data/secrets/$WID" ] || fail "secret files left behind in $W/data/secrets/$WID"
+pass "file secrets are removed with the workload"
 
 # ── the instance metadata service: blocked unless the manifest allows it ────
 for svc in imds-on imds-off; do

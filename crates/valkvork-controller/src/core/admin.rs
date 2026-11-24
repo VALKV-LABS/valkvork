@@ -818,10 +818,20 @@ pub fn spec_to_toml(s: &valkvork_common::models::ServiceSpec) -> String {
         }
         o.push('\n');
     }
-    if !s.secrets.is_empty() {
+    if !s.secrets.is_empty() || !s.secret_files.is_empty() {
         let _ = writeln!(o, "[secrets]");
         for (k, v) in &s.secrets {
             let _ = writeln!(o, "{k} = {v:?}");
+        }
+        for (k, f) in &s.secret_files {
+            let _ = write!(o, "{k} = {{ ref = {:?}, file = true", f.reference);
+            if let Some(owner) = &f.owner {
+                let _ = write!(o, ", owner = {owner:?}");
+            }
+            if let Some(mode) = &f.mode {
+                let _ = write!(o, ", mode = {mode:?}");
+            }
+            o.push_str(" }\n");
         }
         o.push('\n');
     }
@@ -963,6 +973,8 @@ host_ip = "advertise"
 
 [secrets]
 POSTGRES_PASSWORD = "ssm:/valkv/dev/workloads/POSTGRES_PASSWORD"
+TLS_KEY = { ref = "ssm:/valkv/dev/workloads/TLS_KEY", file = true, owner = "70:70", mode = "0440" }
+API_KEY = { ref = "file:/etc/valkv/api_key", file = true }
 
 [check]
 type = "tcp"

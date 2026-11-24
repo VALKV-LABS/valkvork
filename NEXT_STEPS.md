@@ -35,11 +35,9 @@ What is not built yet. The rest of the [spec](spec.md)'s MVP scope is implemente
 Decisions taken for the [platform workloads plan](docs/platform-workloads.md#decisions-2026-11-07)
 that should be revisited once Stage 2 is verified:
 
-- **Secrets as files.** Secrets are delivered as environment variables. Add delivery as files on
-  an in-memory filesystem, readable only by the container's user: kept out of `docker inspect`
-  and `/proc/<pid>/environ`, and rotatable without a restart.
-- **Caching resolved secrets** on the agent, so a restart while SSM is unreachable can still
-  start the container.
+- **Secrets as files** and **caching resolved secrets** are built: `[secrets]` entries with
+  `file = true`, on an in-memory filesystem at `/run/secrets`, rotated in place; the last
+  resolved values are reused, from memory, when the secrets store fails at a start.
 - **Per-workload credentials.** Containers are blocked from the metadata service unless their
   manifest sets `[security] instance_metadata = true` (security.md#instance-metadata), but those
   that may reach it still share the node's whole role. Look at per-workload credentials.

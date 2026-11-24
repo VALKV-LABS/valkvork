@@ -270,6 +270,11 @@ pub struct ServiceSpec {
     /// the references are stored. Omitted when empty (stable hashes).
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub secrets: BTreeMap<String, String>,
+    /// Secrets the agent writes to files at `/run/secrets/<NAME>` on an
+    /// in-memory filesystem instead of the environment. Omitted when empty
+    /// (stable hashes).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub secret_files: BTreeMap<String, SecretFileSpec>,
     pub ports: Vec<PortSpec>,
     pub volumes: Vec<VolumeSpec>,
     pub autoscale: Option<AutoscaleSpec>,
@@ -290,6 +295,51 @@ pub struct ServiceSpec {
     /// (stable hashes).
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub sysctls: BTreeMap<String, String>,
+}
+
+/// A `[secrets]` entry delivered as a file (`file = true`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SecretFileSpec {
+    /// `ssm:<parameter>` or `file:<path>`, as for environment secrets.
+    pub reference: String,
+    /// Numeric `uid` or `uid:gid` owning the file. Unset: root.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner: Option<String>,
+    /// Octal permission bits. Unset: `0400` with an owner, else `0444`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<String>,
+}
+
+impl SecretFileSpec {
+    /// (uid, gid, mode) the agent writes the file with.
+    pub fn file_owner_mode(&self) -> Result<(u32, u32, u32), String> {
+        let (uid, gid) = match self.owner.as_deref() {
+            None => (0, 0),
+            Some(o) => {
+                let num = |s: &str| {
+                    s.parse::<u32>()
+                        .map_err(|_| format!("owner {o:?} must be a numeric uid or uid:gid"))
+                };
+                match o.split_once(':') {
+                    None => (num(o)?, 0),
+                    Some((u, g)) => (num(u)?, num(g)?),
+                }
+            }
+        };
+        let mode = match self.mode.as_deref() {
+            None if self.owner.is_some() => 0o400,
+            None => 0o444,
+            Some(m) => match u32::from_str_radix(m, 8) {
+                Ok(bits) if bits <= 0o777 && !m.is_empty() => bits,
+                _ => {
+                    return Err(format!(
+                        "mode {m:?} must be octal permission bits, e.g. \"0440\""
+                    ))
+                }
+            },
+        };
+        Ok((uid, gid, mode))
+    }
 }
 
 /// Container hardening (`[security]`). Every setting defaults to off, as
@@ -363,6 +413,7 @@ pub const AGENT_FEATURES: &[&str] = &[
     "logging",
     "node_values",
     "pids_limit",
+    "secret_files",
     "secret_values",
     "secrets",
     "security",
@@ -487,6 +538,9 @@ impl ServiceSpec {
         if !self.secrets.is_empty() {
             f.push("secrets");
         }
+        if !self.secret_files.is_empty() {
+            f.push("secret_files");
+        }
         if self.env.values().any(|v| v.contains("${secret:")) {
             f.push("secret_values");
         }
@@ -567,6 +621,7 @@ impl ServiceSpec {
             && self.required_class == other.required_class
             && self.env == other.env
             && self.secrets == other.secrets
+            && self.secret_files == other.secret_files
             && self.ports == other.ports
             && self.volumes == other.volumes
             && self.restart == other.restart
@@ -650,6 +705,7 @@ mod tests {
             required_class: None,
             env: BTreeMap::new(),
             secrets: BTreeMap::new(),
+            secret_files: BTreeMap::new(),
             ports: vec![],
             volumes: vec![],
             autoscale: None,

@@ -81,6 +81,9 @@ aws_cli         = "aws"    # runs `aws ssm get-parameter` for ssm: references, w
 # aws_region    = "us-west-1"   # default: the instance's region (EC2 metadata), else the CLI's default
 file_dirs       = []       # directories file: references may read; empty disables file: references
 timeout_seconds = 15       # per reference
+files_tmpfs     = true     # file secrets on an in-memory filesystem at <data_dir>/secrets; false: on disk (development)
+refresh_seconds = 300      # resolve file secrets again and rewrite changed ones; 0 never
+cache           = true     # reuse the last value resolved for a reference when resolving fails at a start (memory only)
 
 [discovery]                # service discovery DNS; see discovery.md
 enabled     = false        # true: answer <service>.<domain> on listen_ip:53 and use it as containers' nameserver

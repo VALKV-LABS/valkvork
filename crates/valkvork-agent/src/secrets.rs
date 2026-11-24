@@ -25,6 +25,9 @@ pub struct SecretResolver {
     region: OnceCell<Option<String>>,
     /// ECR registry -> (password, fetched at). Tokens last 12 h; reused for 6.
     ecr: Mutex<HashMap<String, (String, Instant)>>,
+    /// Reference -> the last value resolved for it, in memory only, for
+    /// `resolve_for_start` when the secrets store is unreachable.
+    last: Mutex<HashMap<String, String>>,
 }
 
 /// How long an ECR login is reused (they are valid for 12 hours).
@@ -52,6 +55,40 @@ impl SecretResolver {
             imds: IMDS.to_string(),
             region: OnceCell::new(),
             ecr: Mutex::new(HashMap::new()),
+            last: Mutex::new(HashMap::new()),
+        }
+    }
+
+    pub fn refresh_seconds(&self) -> u64 {
+        self.cfg.refresh_seconds
+    }
+
+    /// `resolve` for a container about to start: on failure, the last value
+    /// this agent resolved for the same reference, when `cache` is on, so a
+    /// start does not depend on the secrets store being reachable right now.
+    pub async fn resolve_for_start(&self, reference: &str) -> Result<String, String> {
+        match self.resolve(reference).await {
+            Ok(v) => {
+                if self.cfg.cache {
+                    self.last
+                        .lock()
+                        .unwrap()
+                        .insert(reference.to_string(), v.clone());
+                }
+                Ok(v)
+            }
+            Err(e) => match self
+                .cfg
+                .cache
+                .then(|| self.last.lock().unwrap().get(reference).cloned())
+                .flatten()
+            {
+                Some(v) => {
+                    tracing::warn!(reference, error = %e, "cannot resolve the secret; using the value this agent resolved last");
+                    Ok(v)
+                }
+                None => Err(e),
+            },
         }
     }
 
@@ -270,6 +307,7 @@ mod tests {
             aws_region: Some("us-west-1".into()),
             file_dirs,
             timeout_seconds: 1,
+            ..Default::default()
         })
     }
 
@@ -402,6 +440,7 @@ mod tests {
             aws_region: None,
             file_dirs: vec![],
             timeout_seconds: 2,
+            ..Default::default()
         });
         let reg = "936356193095.dkr.ecr.us-west-1.amazonaws.com";
         assert_eq!(r.ecr_password(reg, "us-west-1").await.unwrap(), "tok3n");

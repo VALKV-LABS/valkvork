@@ -534,6 +534,16 @@ impl Core {
                         .iter()
                         .map(|(k, v)| (k.clone(), v.clone()))
                         .collect(),
+                    secret_files: s
+                        .secret_files
+                        .iter()
+                        .map(|(name, f)| pb::SecretFile {
+                            name: name.clone(),
+                            reference: f.reference.clone(),
+                            owner: f.owner.clone().unwrap_or_default(),
+                            mode: f.mode.clone().unwrap_or_default(),
+                        })
+                        .collect(),
                     batch: s.is_batch(),
                     security: s.security.as_ref().map(|x| pb::ContainerSecurity {
                         read_only_root: x.read_only_root,

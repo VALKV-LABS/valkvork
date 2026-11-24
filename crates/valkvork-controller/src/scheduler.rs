@@ -286,6 +286,7 @@ mod tests {
             required_class: None,
             env: Default::default(),
             secrets: Default::default(),
+            secret_files: Default::default(),
             ports: vec![],
             volumes: vec![],
             autoscale: None,

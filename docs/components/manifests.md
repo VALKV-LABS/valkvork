@@ -194,7 +194,29 @@ Nothing waits for a batch job: a service that needs its result must cope until i
 | `ssm:<name>` | `aws ssm get-parameter --with-decryption`, run by the agent with the node's instance role, in the instance's region (agent.toml `secrets.aws_region` overrides it) | The role may read the parameter |
 | `file:<path>` | Reading the file on the node; one trailing newline is dropped | The file is inside a directory in agent.toml `secrets.file_dirs`. Off by default |
 
-If a reference cannot be resolved, the workload fails before anything is pulled or created, with `SECRET_UNRESOLVED: <NAME> (<reference>): <cause>` in its status and the event log. The cause never contains a value. The service's failure backoff then applies, as for a failed image pull.
+If a reference cannot be resolved, the workload fails before anything is pulled or created, with `SECRET_UNRESOLVED: <NAME> (<reference>): <cause>` in its status and the event log. The cause never contains a value. The service's failure backoff then applies, as for a failed image pull. With agent.toml `secrets.cache` (on by default), a start first falls back to the last value this agent resolved for the same reference, held in memory only, so an unreachable secrets store does not stop a container the node has started before.
+
+**Secrets as files.** An entry can instead be a table with `file = true`. The agent then writes the value to `/run/secrets/<NAME>` in the container, and not into its environment:
+
+```toml
+[secrets]
+DB_PASSWORD = { ref = "ssm:/valkv/dev/workloads/DB_PASSWORD", file = true, owner = "70:70", mode = "0400" }
+API_KEY     = { ref = "ssm:/valkv/dev/workloads/API_KEY", file = true }   # root:root 0444
+SMTP_PASS   = "ssm:/valkv/dev/workloads/SMTP_PASS"                        # an environment variable
+```
+
+| Key | Default | |
+|---|---|---|
+| `ref` | (required) | An `ssm:` or `file:` reference, as above |
+| `file` | `false` | `true` delivers a file; `false` is the same as a plain reference string |
+| `owner` | root | Numeric `uid` or `uid:gid` owning the file: the image's user, so only it can read the file |
+| `mode` | `0400` with an owner, else `0444` | Octal permission bits |
+
+- **Where it lives.** On an in-memory filesystem the agent mounts at `<data_dir>/secrets`, one directory per workload, bind-mounted read-only at `/run/secrets`. The value is never part of the container's definition (`docker inspect`, Docker's `config.v2.json` on the data volume), never in the process environment (`/proc/<pid>/environ`, child processes, crash dumps that print the environment), and never on a disk. Root on the node can still read it, as it can any secret a workload uses.
+- **Rotation.** The agent resolves file secrets again every `secrets.refresh_seconds` (300) and replaces a file whose value changed, atomically, without restarting the container. An application that reads the file when it needs the value sees the new one. A failure keeps the current file. Environment secrets still change only when the container is replaced.
+- **Lifetime.** The files are created before the container and deleted with the workload.
+- `${secret:NAME}` cannot name a file secret: that would put the value back in the environment. Use the file, or make it an environment secret.
+- A workload with file secrets needs an agent with the `secret_files` feature. Validation (`INVALID_SECRET_REF` at `secrets.<NAME>`) rejects a non-numeric owner, bad mode bits, and `owner` or `mode` without `file = true`.
 
 **Node values.** An `[env]` value can contain `${node.NAME}`, which the agent replaces with its own node's value at container start, for a replica that must say where it is reachable or needs an identity that survives redeploys:
 

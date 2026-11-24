@@ -237,6 +237,9 @@ fn supervisor_with_secrets(rt: Arc<Fake>, dir: &Path) -> Arc<Supervisor> {
             advertise_ip: "10.0.0.5".into(),
             default_host_ip: String::new(),
             metadata: None,
+            secret_files: Some(Arc::new(
+                crate::secret_files::SecretFiles::prepare(dir, false).unwrap(),
+            )),
             default_pids_limit: 0,
             node_id: "node-1".into(),
             node_class: "app".into(),
@@ -265,6 +268,7 @@ fn supervisor(rt: Arc<Fake>, dir: &Path) -> Arc<Supervisor> {
             advertise_ip: "10.0.0.5".into(),
             default_host_ip: String::new(),
             metadata: None,
+            secret_files: None,
             default_pids_limit: 0,
             node_id: "node-1".into(),
             node_class: "app".into(),
@@ -464,6 +468,7 @@ async fn forbidden_host_volume_is_refused() {
             advertise_ip: "10.0.0.5".into(),
             default_host_ip: String::new(),
             metadata: None,
+            secret_files: None,
             default_pids_limit: 0,
             node_id: "node-1".into(),
             node_class: "app".into(),
@@ -563,6 +568,7 @@ fn supervisor_with(dir: &Path, vols: Vec<(&str, HostVolume)>) -> Arc<Supervisor>
             advertise_ip: "10.0.0.5".into(),
             default_host_ip: String::new(),
             metadata: None,
+            secret_files: None,
             default_pids_limit: 0,
             node_id: "node-1".into(),
             node_class: "app".into(),
@@ -692,6 +698,7 @@ async fn default_bind_address_and_metadata_label() {
             advertise_ip: "10.0.0.5".into(),
             default_host_ip: "advertise".into(),
             metadata: None,
+            secret_files: None,
             default_pids_limit: 0,
             node_id: "node-1".into(),
             node_class: "app".into(),
@@ -786,6 +793,111 @@ async fn secrets_become_environment_variables() {
         "{env:?}"
     );
     assert!(env.contains(&("PGDATA".into(), "/data".into())));
+}
+
+/// A file secret is written to the store and mounted read-only at
+/// /run/secrets: not in the environment, and the label lists names and
+/// references only. A changed value is rewritten by the refresh; the files
+/// go with the workload.
+#[tokio::test]
+async fn file_secrets_are_mounted_refreshed_and_removed() {
+    let d = tempfile::tempdir().unwrap();
+    let rt = Fake::new();
+    let s = supervisor_with_secrets(rt.clone(), d.path());
+    let src = d.path().join("secrets/pw");
+    std::fs::write(&src, "hunter2\n").unwrap();
+    let mut cmd = start_cmd("w1", 3);
+    cmd.secret_files = vec![pb::SecretFile {
+        name: "DB_PASSWORD".into(),
+        reference: format!("file:{}", src.display()),
+        owner: String::new(),
+        mode: "0440".into(),
+    }];
+    s.start(cmd).await.unwrap();
+    settle().await;
+    let st = state_of(&s, "w1").unwrap();
+    assert_eq!(st.0, WorkloadState::Running, "{}", st.1);
+    let spec = rt.last_created();
+    assert!(
+        !spec.env.iter().any(|(_, v)| v.contains("hunter2")),
+        "{:?}",
+        spec.env
+    );
+    let m = spec
+        .mounts
+        .iter()
+        .find(|m| m.target == "/run/secrets")
+        .expect("mounted");
+    assert!(m.read_only);
+    let file = m.source.join("DB_PASSWORD");
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), "hunter2");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            std::fs::metadata(&file).unwrap().permissions().mode() & 0o777,
+            0o440
+        );
+    }
+    let label = &spec.labels[crate::secret_files::LABEL_SECRET_FILES];
+    assert!(
+        label.contains("DB_PASSWORD") && !label.contains("hunter2"),
+        "{label}"
+    );
+
+    // Rotation: the refresh rewrites the file in place.
+    std::fs::write(&src, "rotated\n").unwrap();
+    let store = s.cfg.secret_files.clone().unwrap();
+    s.refresh_secret_files(&store).await;
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), "rotated");
+    // The source disappearing keeps the current value.
+    std::fs::remove_file(&src).unwrap();
+    s.refresh_secret_files(&store).await;
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), "rotated");
+
+    s.stop(pb::StopWorkload {
+        command_id: "2".into(),
+        workload_id: "w1".into(),
+        kill_timeout_seconds: 1,
+    })
+    .await
+    .unwrap();
+    settle().await;
+    assert!(
+        !m.source.exists(),
+        "the workload's secret files are removed"
+    );
+}
+
+/// The last value resolved for a reference is reused when resolving fails
+/// at a later start; without it the start fails.
+#[tokio::test]
+async fn a_start_reuses_the_last_resolved_value() {
+    let d = tempfile::tempdir().unwrap();
+    let rt = Fake::new();
+    let s = supervisor_with_secrets(rt.clone(), d.path());
+    let src = d.path().join("secrets/tok");
+    std::fs::write(&src, "t0k3n").unwrap();
+    let reference = format!("file:{}", src.display());
+    assert_eq!(
+        s.cfg.secrets.resolve_for_start(&reference).await.unwrap(),
+        "t0k3n"
+    );
+    std::fs::remove_file(&src).unwrap();
+    assert!(s.cfg.secrets.resolve(&reference).await.is_err());
+    assert_eq!(
+        s.cfg.secrets.resolve_for_start(&reference).await.unwrap(),
+        "t0k3n"
+    );
+    assert!(s
+        .cfg
+        .secrets
+        .resolve_for_start(&format!(
+            "file:{}",
+            d.path().join("secrets/never").display()
+        ))
+        .await
+        .is_err());
 }
 
 /// An unresolvable reference fails the start before anything is created, and
@@ -1189,6 +1301,7 @@ async fn containers_use_the_discovery_dns() {
         advertise_ip: "10.0.0.5".into(),
         default_host_ip: String::new(),
         metadata: None,
+        secret_files: None,
         default_pids_limit: 4096,
         node_id: "node-1".into(),
         node_class: "app".into(),
