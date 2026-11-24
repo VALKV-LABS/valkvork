@@ -122,6 +122,8 @@ block = false
 # Manifests' [secrets] may use file: references to files in .dev/secrets/.
 [secrets]
 file_dirs = ["$DEV/secrets"]
+# macOS can't mount an in-memory filesystem for file secrets: keep them on disk.
+files_tmpfs = false
 EOF
   install -d -m 0700 "$DEV/secrets"
 
@@ -337,7 +339,8 @@ cpu    = 0.25
 memory = "256MiB"
 
 [secrets]
-file_dirs = ["$DEV/secrets"]
+file_dirs   = ["$DEV/secrets"]
+files_tmpfs = false
 EOF
   render_volumes "$dir/agent.toml" "$dir/volumes" "${VALKVORK_DEV_NODE_VOLUMES:-}"
 

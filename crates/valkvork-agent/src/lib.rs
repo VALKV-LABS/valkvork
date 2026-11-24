@@ -9,6 +9,7 @@
 //! * [`certs`]: the node's client certificate (FR-SEC-02).
 //! * [`identity`]: node id, hostname, address and capacity (FR-AGE-02).
 //! * [`secrets`]: resolution of workloads' secret references (FR-SEC-04).
+//! * [`secret_files`]: secrets delivered as files on an in-memory filesystem.
 //! * [`health`]: health-check probes.
 //! * [`metadata`]: blocks containers from the cloud instance metadata service.
 //! * [`discovery`]: DNS for services on the node, from the controller's endpoints.
@@ -21,6 +22,7 @@ pub mod identity;
 pub mod metadata;
 pub mod metrics;
 pub mod runtime;
+pub mod secret_files;
 pub mod secrets;
 pub mod supervisor;
 pub mod telemetry;

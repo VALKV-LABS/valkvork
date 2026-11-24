@@ -135,6 +135,16 @@ message StartWorkload {
   // Kernel parameters of the container's network namespace (net.* only;
   // `[sysctls]`): needs the agent feature "sysctls".
   map<string, string> sysctls = 21;
+  // Secrets delivered as files at /run/secrets/<name> (an in-memory
+  // filesystem, read-only): needs the agent feature "secret_files".
+  repeated SecretFile secret_files = 22;
+}
+
+message SecretFile {
+  string name = 1;
+  string reference = 2;                // ssm:<parameter> or file:<path>
+  string owner = 3;                    // "uid" or "uid:gid"; empty: root
+  string mode = 4;                     // octal; empty: 0400 with an owner, else 0444
 }
 
 // Container hardening. Capability names are upper case, without "CAP_".

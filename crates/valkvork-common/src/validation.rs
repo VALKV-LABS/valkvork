@@ -7,8 +7,8 @@
 use crate::errors::{ValidationError, ValidationErrorCode as Code};
 use crate::models::{
     interpolate_node, interpolate_secrets, interpolate_workload, AutoscaleSpec, CheckSpec,
-    LoggingSpec, PortSpec, RestartPolicy, SecuritySpec, ServiceSpec, ServiceType, UpdatePolicy,
-    VolumeSpec,
+    LoggingSpec, PortSpec, RestartPolicy, SecretFileSpec, SecuritySpec, ServiceSpec, ServiceType,
+    UpdatePolicy, VolumeSpec,
 };
 use crate::units::{parse_duration, parse_size};
 use regex::Regex;
@@ -30,7 +30,7 @@ struct RawManifest {
     #[serde(default)]
     env: BTreeMap<String, String>,
     #[serde(default)]
-    secrets: BTreeMap<String, String>,
+    secrets: BTreeMap<String, RawSecret>,
     #[serde(default)]
     ports: Vec<RawPort>,
     #[serde(default)]
@@ -61,6 +61,27 @@ struct RawSecurity {
     tmpfs: Vec<String>,
     instance_metadata: bool,
     pids_limit: Option<i64>,
+}
+
+/// A `[secrets]` entry: `"ssm:..."`, or `{ ref = "ssm:...", file = true, ... }`.
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum RawSecret {
+    Ref(String),
+    Table(RawSecretTable),
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawSecretTable {
+    #[serde(rename = "ref")]
+    reference: String,
+    #[serde(default)]
+    file: bool,
+    #[serde(default)]
+    owner: Option<String>,
+    #[serde(default)]
+    mode: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -253,7 +274,7 @@ fn size_field(path: &str, s: &str, out: &mut Vec<ValidationError>) -> u64 {
     }
 }
 
-fn canonicalise(raw: RawManifest, out: &mut Vec<ValidationError>) -> Option<ServiceSpec> {
+fn canonicalise(mut raw: RawManifest, out: &mut Vec<ValidationError>) -> Option<ServiceSpec> {
     let mut ok = true;
 
     if raw.service.replicas < 0 || raw.service.replicas > u32::MAX as i64 {
@@ -478,14 +499,49 @@ fn canonicalise(raw: RawManifest, out: &mut Vec<ValidationError>) -> Option<Serv
         }
     });
 
-    for (name, reference) in &raw.secrets {
-        if let Err(msg) = check_secret(name, reference, &raw.env) {
+    // [secrets]: a reference string is an environment variable; a table with
+    // file = true is delivered as /run/secrets/<NAME>.
+    let mut env_secrets: BTreeMap<String, String> = BTreeMap::new();
+    let mut secret_files: BTreeMap<String, SecretFileSpec> = BTreeMap::new();
+    for (name, s) in std::mem::take(&mut raw.secrets) {
+        let mut bad = |msg: String| {
             out.push(ValidationError::new(
                 Code::InvalidSecretRef,
                 &format!("secrets.{name}"),
                 &msg,
             ));
+        };
+        let (reference, file) = match &s {
+            RawSecret::Ref(r) => (r.clone(), None),
+            RawSecret::Table(t) => {
+                let spec = SecretFileSpec {
+                    reference: t.reference.clone(),
+                    owner: t.owner.clone(),
+                    mode: t.mode.clone(),
+                };
+                if !t.file && (t.owner.is_some() || t.mode.is_some()) {
+                    bad("owner and mode apply to file = true only".into());
+                    ok = false;
+                }
+                (t.reference.clone(), t.file.then_some(spec))
+            }
+        };
+        if let Err(msg) = check_secret(&name, &reference, &raw.env) {
+            bad(msg);
             ok = false;
+            continue;
+        }
+        match file {
+            Some(spec) => {
+                if let Err(msg) = spec.file_owner_mode() {
+                    bad(msg);
+                    ok = false;
+                }
+                secret_files.insert(name, spec);
+            }
+            None => {
+                env_secrets.insert(name, reference);
+            }
         }
     }
 
@@ -508,11 +564,24 @@ fn canonicalise(raw: RawManifest, out: &mut Vec<ValidationError>) -> Option<Serv
         }
     }
 
-    // ${secret:NAME} in a value must name one of [secrets].
+    // ${secret:NAME} in a value must name one of [secrets], and not one
+    // delivered as a file: that would put its value back in the environment.
     for (key, value) in &raw.env {
         if value.contains("${secret:") {
+            if let Some(n) = crate::models::secret_refs(value)
+                .into_iter()
+                .find(|n| secret_files.contains_key(*n))
+            {
+                out.push(ValidationError::new(
+                    Code::InvalidSecretRef,
+                    &format!("env.{key}"),
+                    &format!("${{secret:{n}}}: {n} is delivered as a file (file = true), which keeps it out of the environment; read /run/secrets/{n}, or make it an environment secret"),
+                ));
+                ok = false;
+                continue;
+            }
             if let Err(e) =
-                interpolate_secrets(value, |n| raw.secrets.contains_key(n).then_some(""))
+                interpolate_secrets(value, |n| env_secrets.contains_key(n).then_some(""))
             {
                 out.push(ValidationError::new(
                     Code::InvalidSecretRef,
@@ -599,7 +668,8 @@ fn canonicalise(raw: RawManifest, out: &mut Vec<ValidationError>) -> Option<Serv
             .and_then(|c| c.required_class)
             .filter(|c| !c.is_empty()),
         env: raw.env,
-        secrets: raw.secrets,
+        secrets: env_secrets,
+        secret_files,
         ports,
         volumes: raw
             .volumes
@@ -1607,6 +1677,60 @@ target_cpu_percent = 75
             (Code::InvalidResourceSpec, "service.type".into())
         );
         assert!(!parse_manifest_str(VALID).unwrap().spec.is_batch());
+    }
+
+    #[test]
+    fn secret_files() {
+        let m = format!(
+            "{VALID}\n[secrets]\nENV_ONE = \"ssm:/p/E\"\nDB_PASSWORD = {{ ref = \"ssm:/p/DB\", file = true, owner = \"70:70\", mode = \"0440\" }}\nTOKEN = {{ ref = \"ssm:/p/T\", file = true }}\nAS_ENV = {{ ref = \"ssm:/p/A\" }}\n"
+        );
+        let p = parse_manifest_str(&m).unwrap();
+        assert_eq!(
+            p.spec.secrets.len(),
+            2,
+            "strings and file = false are environment secrets"
+        );
+        assert_eq!(p.spec.secrets["AS_ENV"], "ssm:/p/A");
+        let f = &p.spec.secret_files;
+        assert_eq!(f.len(), 2);
+        assert_eq!(f["DB_PASSWORD"].file_owner_mode().unwrap(), (70, 70, 0o440));
+        assert_eq!(f["TOKEN"].file_owner_mode().unwrap(), (0, 0, 0o444));
+        let feats = p.spec.required_features();
+        assert!(feats.contains(&"secret_files") && feats.contains(&"secrets"));
+
+        // Without file secrets the spec is the same as before.
+        let plain = format!("{VALID}\n[secrets]\nENV_ONE = \"ssm:/p/E\"\n");
+        let json = parse_manifest_str(&plain).unwrap().spec.canonical_json();
+        assert!(!json.contains("secret_files"));
+
+        for (entry, field) in [
+            (
+                "X = { ref = \"ssm:/p/X\", file = true, owner = \"postgres\" }",
+                "secrets.X",
+            ),
+            (
+                "X = { ref = \"ssm:/p/X\", file = true, mode = \"0999\" }",
+                "secrets.X",
+            ),
+            ("X = { ref = \"ssm:/p/X\", owner = \"70\" }", "secrets.X"),
+            ("X = { ref = \"vault:x\", file = true }", "secrets.X"),
+        ] {
+            let m = format!("{VALID}\n[secrets]\n{entry}\n");
+            assert_eq!(
+                err_code(&m),
+                (Code::InvalidSecretRef, field.into()),
+                "{entry}"
+            );
+        }
+        // An unknown key in the table is a parse error.
+        let m = format!("{VALID}\n[secrets]\nX = {{ ref = \"ssm:/p/X\", path = \"/x\" }}\n");
+        assert!(parse_manifest_str(&m).is_err());
+
+        // ${secret:NAME} of a file secret would put it in the environment.
+        let m = VALID.replace("A = \"1\"", "URL = \"x${secret:F}\"")
+            + "\n[secrets]\nF = { ref = \"ssm:/p/F\", file = true }\n";
+        let (code, field) = err_code(&m);
+        assert_eq!((code, field.as_str()), (Code::InvalidSecretRef, "env.URL"));
     }
 
     #[test]

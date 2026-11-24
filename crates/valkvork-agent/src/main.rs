@@ -105,6 +105,15 @@ async fn run(args: Args) -> Result<(), ValkvorkError> {
     let protected_paths = rt.data_root().await.into_iter().collect();
     let endpoints = valkvork_agent::discovery::Endpoints::load(&cfg.data_dir);
     let dns = start_discovery(&cfg, &rt, &endpoints).await?;
+    let secret_files = Arc::new(
+        valkvork_agent::secret_files::SecretFiles::prepare(&cfg.data_dir, cfg.secrets.files_tmpfs)
+            .map_err(ValkvorkError::Config)?,
+    );
+    if !secret_files.in_memory {
+        tracing::warn!(
+            "secrets.files_tmpfs is off: file secrets are kept on disk (development only)"
+        );
+    }
     let metadata = if cfg.instance_metadata.block {
         let im = &cfg.instance_metadata;
         let g = valkvork_agent::metadata::MetadataGuard::install(&im.iptables, &im.bridge)
@@ -134,6 +143,7 @@ async fn run(args: Args) -> Result<(), ValkvorkError> {
             },
             metadata,
             default_pids_limit: cfg.default_pids_limit,
+            secret_files: Some(secret_files),
             node_id: node.node_id.clone(),
             node_class: cfg.node_class.clone(),
             hostname: node.hostname.clone(),
@@ -164,6 +174,7 @@ async fn run(args: Args) -> Result<(), ValkvorkError> {
     tokio::spawn(supervisor.clone().run_resync());
     tokio::spawn(supervisor.clone().run_disk_checks());
     tokio::spawn(supervisor.clone().run_health_checks());
+    tokio::spawn(supervisor.clone().run_secret_refresh());
     if let Some(addr) = cfg.metrics_listen_addr {
         tokio::spawn(valkvork_agent::metrics::serve(addr, supervisor.clone()));
     }

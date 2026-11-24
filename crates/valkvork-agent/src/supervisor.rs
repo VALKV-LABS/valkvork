@@ -172,6 +172,8 @@ pub struct SupervisorConfig {
     pub metadata: Option<Arc<crate::metadata::MetadataGuard>>,
     /// `PidsLimit` for containers whose manifest sets none; 0: no limit.
     pub default_pids_limit: u32,
+    /// Where file secrets are written; None: workloads with them fail.
+    pub secret_files: Option<Arc<crate::secret_files::SecretFiles>>,
     /// This node's id, class and hostname, for `${node.NAME}` in [env].
     pub node_id: String,
     pub node_class: String,
@@ -480,6 +482,130 @@ impl Supervisor {
         }
     }
 
+    /// Resolve `cmd`'s file secrets, write them for `wid` and add their
+    /// mount; returns the container label that lists them (no values).
+    async fn write_secret_files(
+        &self,
+        wid: &str,
+        cmd: &pb::StartWorkload,
+        mounts: &mut Vec<BindMount>,
+    ) -> Result<String, (String, String)> {
+        let Some(store) = self.cfg.secret_files.as_ref() else {
+            return Err((
+                "SECRET_FILES_UNAVAILABLE".into(),
+                "this agent has no store for file secrets".into(),
+            ));
+        };
+        let mut files: Vec<&pb::SecretFile> = cmd.secret_files.iter().collect();
+        files.sort_by(|a, b| a.name.cmp(&b.name));
+        let mut entries = Vec::with_capacity(files.len());
+        for f in files {
+            let spec = valkvork_common::models::SecretFileSpec {
+                reference: f.reference.clone(),
+                owner: (!f.owner.is_empty()).then(|| f.owner.clone()),
+                mode: (!f.mode.is_empty()).then(|| f.mode.clone()),
+            };
+            let bad = |e: String| {
+                (
+                    format!("SECRET_UNRESOLVED: {} ({}): {e}", f.name, f.reference),
+                    format!("secret {} ({}): {e}", f.name, f.reference),
+                )
+            };
+            let (uid, gid, mode) = spec.file_owner_mode().map_err(bad)?;
+            let value = self
+                .cfg
+                .secrets
+                .resolve_for_start(&f.reference)
+                .await
+                .map_err(bad)?;
+            entries.push((
+                crate::secret_files::LabelEntry {
+                    name: f.name.clone(),
+                    reference: f.reference.clone(),
+                    uid,
+                    gid,
+                    mode,
+                },
+                value,
+            ));
+        }
+        let refs: Vec<_> = entries.iter().map(|(e, v)| (e, v.as_str())).collect();
+        store
+            .write(wid, &refs)
+            .map_err(|e| ("SECRET_FILES_FAILED".to_string(), e))?;
+        mounts.push(BindMount {
+            source: store.dir(wid),
+            target: crate::secret_files::MOUNT_TARGET.into(),
+            read_only: true,
+        });
+        let label: Vec<_> = entries.into_iter().map(|(e, _)| e).collect();
+        Ok(serde_json::to_string(&label).expect("serialisable"))
+    }
+
+    fn remove_secret_files(&self, wid: &str) {
+        if let Some(store) = &self.cfg.secret_files {
+            store.remove(wid);
+        }
+    }
+
+    /// Resolve running workloads' file secrets again every
+    /// `secrets.refresh_seconds` and rewrite those whose value changed, so
+    /// a rotated secret reaches the container without a restart. A failure
+    /// keeps the current file. Found from container labels, so this works
+    /// for workloads adopted after an agent restart too.
+    pub async fn run_secret_refresh(self: Arc<Self>) {
+        let (Some(store), every) = (
+            self.cfg.secret_files.clone(),
+            self.cfg.secrets.refresh_seconds(),
+        ) else {
+            return;
+        };
+        if every == 0 {
+            return;
+        }
+        let mut tick = tokio::time::interval(Duration::from_secs(every));
+        tick.tick().await;
+        loop {
+            tick.tick().await;
+            self.refresh_secret_files(&store).await;
+        }
+    }
+
+    pub(crate) async fn refresh_secret_files(&self, store: &crate::secret_files::SecretFiles) {
+        let Ok(list) = self.rt.list_by_label(LABEL_WORKLOAD).await else {
+            return;
+        };
+        for c in list.into_iter().filter(|c| c.state == RunState::Running) {
+            let (Some(wid), Some(label)) = (
+                c.labels.get(LABEL_WORKLOAD),
+                c.labels.get(crate::secret_files::LABEL_SECRET_FILES),
+            ) else {
+                continue;
+            };
+            let Ok(entries) = serde_json::from_str::<Vec<crate::secret_files::LabelEntry>>(label)
+            else {
+                tracing::warn!(workload = %wid, "unreadable secret files label");
+                continue;
+            };
+            for e in entries {
+                match self.cfg.secrets.resolve(&e.reference).await {
+                    Ok(v) => match store.update(wid, &e, &v) {
+                        Ok(true) => {
+                            tracing::info!(workload = %wid, secret = %e.name, reference = %e.reference, "secret file updated")
+                        }
+                        Ok(false) => {}
+                        Err(err) => {
+                            tracing::warn!(workload = %wid, secret = %e.name, error = %err, "cannot update the secret file")
+                        }
+                    },
+                    Err(err) => {
+                        tracing::warn!(workload = %wid, secret = %e.name, reference = %e.reference, error = %err, "cannot refresh the secret file; keeping its current value")
+                    }
+                }
+            }
+        }
+    }
+
     async fn do_start(
         &self,
         cmd: &pb::StartWorkload,
@@ -535,14 +661,26 @@ impl Supervisor {
         names.sort();
         for name in names {
             let reference = &cmd.secrets[name];
-            let value = self.cfg.secrets.resolve(reference).await.map_err(|e| {
-                (
-                    format!("SECRET_UNRESOLVED: {name} ({reference}): {e}"),
-                    format!("secret {name} ({reference}): {e}"),
-                )
-            })?;
+            let value = self
+                .cfg
+                .secrets
+                .resolve_for_start(reference)
+                .await
+                .map_err(|e| {
+                    (
+                        format!("SECRET_UNRESOLVED: {name} ({reference}): {e}"),
+                        format!("secret {name} ({reference}): {e}"),
+                    )
+                })?;
             secret_env.push((name.clone(), value));
         }
+        // File secrets: written to the in-memory store and mounted read-only
+        // at /run/secrets; never in the container's definition or env.
+        let secret_label = if cmd.secret_files.is_empty() {
+            None
+        } else {
+            Some(self.write_secret_files(wid, cmd, &mut mounts).await?)
+        };
 
         let mut auth =
             crate::runtime::registry_credentials(&self.cfg.registry_auth_file, &cmd.image);
@@ -665,6 +803,9 @@ impl Supervisor {
         };
         if let Some(p) = &probe {
             labels.insert(LABEL_CHECK.to_string(), p.to_label());
+        }
+        if let Some(l) = secret_label {
+            labels.insert(crate::secret_files::LABEL_SECRET_FILES.to_string(), l);
         }
         if cmd.security.as_ref().is_some_and(|s| s.instance_metadata) {
             labels.insert(LABEL_INSTANCE_METADATA.to_string(), "true".to_string());
@@ -932,6 +1073,7 @@ impl Supervisor {
             self.keep_failed(wid, &service_id).await;
             let _ = std::fs::remove_dir_all(self.alloc_dir(wid));
             let _ = std::fs::remove_dir_all(self.volumes_dir(wid));
+            self.remove_secret_files(wid);
             let _ = std::fs::remove_file(self.failed_marker(wid));
             self.workloads.lock().unwrap().remove(wid);
             return;
@@ -946,6 +1088,7 @@ impl Supervisor {
         }
         let _ = std::fs::remove_dir_all(self.alloc_dir(wid));
         let _ = std::fs::remove_dir_all(self.volumes_dir(wid));
+        self.remove_secret_files(wid);
         let _ = std::fs::remove_file(self.failed_marker(wid));
         self.workloads.lock().unwrap().remove(wid);
         tracing::info!(workload = wid, "workload stopped and removed");

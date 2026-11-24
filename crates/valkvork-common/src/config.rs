@@ -407,6 +407,16 @@ pub struct SecretsConfig {
     pub file_dirs: Vec<PathBuf>,
     /// Limit for resolving one reference.
     pub timeout_seconds: u64,
+    /// Keep file secrets (`file = true`) on an in-memory filesystem the agent
+    /// mounts at `<data_dir>/secrets`. false keeps them in a plain directory
+    /// on disk: only for development, where the agent cannot mount one.
+    pub files_tmpfs: bool,
+    /// How often running workloads' file secrets are resolved again and
+    /// rewritten when the value changed; 0 never.
+    pub refresh_seconds: u64,
+    /// Reuse the last value this agent resolved for a reference when
+    /// resolving it fails at container start (kept in memory only).
+    pub cache: bool,
 }
 
 impl Default for SecretsConfig {
@@ -416,6 +426,9 @@ impl Default for SecretsConfig {
             aws_region: None,
             file_dirs: Vec::new(),
             timeout_seconds: 15,
+            files_tmpfs: true,
+            refresh_seconds: 300,
+            cache: true,
         }
     }
 }
