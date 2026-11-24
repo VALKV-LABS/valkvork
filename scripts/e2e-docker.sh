@@ -11,8 +11,9 @@
 # directory; folders shared from macOS cannot be chowned). Each run uses a new
 # run-<time> directory there. It uses ports 50061, 50062, 9410, 9411, 15432
 # and 18080 on the Docker host, and port 53 on the Docker bridge's gateway and the service ids global-pg, bad-secret,
-# web-check, exec-check, pg-init, pg-fail and cache-demo, so do not run it next to a dev cluster with
-# those services.
+# web-check, exec-check, pg-init, pg-fail, cache-demo, imds-on and imds-off, so do not run it next
+# to a dev cluster with those services. It needs NET_ADMIN on the Docker host: the agent manages
+# its VALKVORK-IMDS iptables chain there.
 set -eu
 W=/var/tmp/vk-e2e/run-$(date +%s)
 BIN=/dist
@@ -21,7 +22,7 @@ pass() { echo "PASS: $*"; }
 
 # Remove this test's containers however it ends.
 cleanup() {
-  for svc in global-pg bad-secret web-check exec-check pg-init pg-fail cache-demo; do
+  for svc in global-pg bad-secret web-check exec-check pg-init pg-fail cache-demo imds-on imds-off; do
     for c in $(docker ps -aq --filter "label=valkvork.service_id=$svc"); do
       docker stop "$c" >/dev/null 2>&1 || true
       docker rm "$c" >/dev/null 2>&1 || true
@@ -34,7 +35,7 @@ IP="$(ip -4 route get 1.1.1.1 | awk '{for(i=1;i<=NF;i++) if($i=="src") print $(i
 ip -4 addr | grep -q "inet $IP/" || fail "advertise address $IP is not on this host"
 echo "advertise address: $IP"
 
-apk add -q --no-cache openssl >/dev/null
+apk add -q --no-cache openssl iptables >/dev/null
 mkdir -p "$W/secrets" "$W/data" "$W/db" "$W/pgdata" "$W/tls"
 (
   cd "$W/tls"
@@ -428,6 +429,46 @@ for _ in $(seq 30); do [ -z "$(docker ps -aq --filter label=valkvork.service_id=
 sleep 1
 [ -z "$(ls "$W/data/volumes" 2>/dev/null)" ] || fail "ephemeral volume directories left behind: $(ls "$W/data/volumes")"
 pass "ephemeral volumes are deleted with their workloads"
+
+# ── the instance metadata service: blocked unless the manifest allows it ────
+for svc in imds-on imds-off; do
+  allow=false; [ "$svc" = imds-on ] && allow=true
+  cat > "$W/$svc.toml" <<EOF
+[service]
+id           = "$svc"
+image        = "docker.io/library/nginx:1.27-alpine"
+replicas     = 1
+kill_timeout = "2s"
+
+[resources]
+cpu    = 0.1
+memory = "32MiB"
+
+[security]
+instance_metadata = $allow
+EOF
+  vk apply -f "$W/$svc.toml" >/dev/null
+done
+for _ in $(seq 60); do [ "$(vk workloads 2>/dev/null | grep -c 'imds-o.*RUNNING')" = 2 ] && break; sleep 1; done
+[ "$(vk workloads | grep -c 'imds-o.*RUNNING')" = 2 ] || { tail -20 "$W/agent.log"; fail "imds services did not run"; }
+ON="$(docker ps -q --filter label=valkvork.service_id=imds-on)"
+OFF="$(docker ps -q --filter label=valkvork.service_id=imds-off)"
+ON_IP="$(docker inspect -f '{{.NetworkSettings.Networks.bridge.IPAddress}}' "$ON")"
+OFF_IP="$(docker inspect -f '{{.NetworkSettings.Networks.bridge.IPAddress}}' "$OFF")"
+iptables -w -C DOCKER-USER -j VALKVORK-IMDS || fail "no jump from DOCKER-USER to VALKVORK-IMDS"
+for _ in $(seq 15); do iptables -w -S VALKVORK-IMDS | grep -q -- "-s $ON_IP/32" && break; sleep 1; done
+iptables -w -S VALKVORK-IMDS
+iptables -w -S VALKVORK-IMDS | grep -q -- "-s $ON_IP/32 -d 169.254.169.254/32 -j RETURN" || fail "imds-on ($ON_IP) not let through"
+if iptables -w -S VALKVORK-IMDS | grep -q -- "-s $OFF_IP/32"; then fail "imds-off ($OFF_IP) let through"; fi
+iptables -w -S VALKVORK-IMDS | grep -- "-j REJECT" | grep -- "-d 169.254.169.254/32" | grep -q -- "-i docker0" || fail "no REJECT rule"
+OUT="$(docker exec "$OFF" wget -T 3 -qO- http://169.254.169.254/latest/meta-data/ 2>&1 || true)"
+echo "$OUT" | grep -qi refused || fail "imds-off reached the metadata address: $OUT"
+pass "instance metadata: imds-off refused, imds-on ($ON_IP) let through"
+vk delete service imds-on >/dev/null
+for _ in $(seq 30); do [ -z "$(docker ps -aq --filter label=valkvork.service_id=imds-on)" ] && break; sleep 1; done
+if iptables -w -S VALKVORK-IMDS | grep -q -- "-s $ON_IP/32"; then fail "imds-on's rule left after it stopped"; fi
+pass "instance metadata: a stopped workload's address is no longer let through"
+vk delete service imds-off >/dev/null
 
 vk delete service global-pg >/dev/null
 for _ in $(seq 30); do [ -z "$(docker ps -aq --filter label=valkvork.service_id=global-pg)" ] && break; sleep 1; done

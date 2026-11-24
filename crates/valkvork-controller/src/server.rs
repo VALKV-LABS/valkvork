@@ -7,8 +7,8 @@ use crate::grpc::{admin_auth, AdminApi, AgentApi};
 use crate::http::{serve_metrics, UiLayer};
 use crate::ui::UiState;
 use std::sync::Arc;
-use tonic::transport::Server;
-use valkvork_common::config::ControllerConfig;
+use tonic::transport::{Certificate, Server, ServerTlsConfig};
+use valkvork_common::config::{ControllerConfig, NodeCertificateMode};
 use valkvork_common::tls::server_tls_config;
 use valkvork_common::ValkvorkError;
 use valkvork_proto::v1::admin_service_server::AdminServiceServer;
@@ -23,8 +23,7 @@ pub async fn run(cfg: ControllerConfig) -> Result<(), ValkvorkError> {
 
     let db = Db::open(&cfg.database_path)?;
     let reader = Arc::new(EventReader::open(&cfg.database_path)?);
-    let core = Core::new(cfg.clone(), db, join_token)?;
-    let (handle, core_task) = core.spawn();
+    let mut core = Core::new(cfg.clone(), db, join_token)?;
 
     let tls = match (&cfg.tls_cert_file, &cfg.tls_key_file) {
         (Some(cert), Some(key)) => Some(server_tls_config(cert, key)?),
@@ -40,11 +39,34 @@ pub async fn run(cfg: ControllerConfig) -> Result<(), ValkvorkError> {
             ))
         }
     };
-    let builder = || -> Result<Server, ValkvorkError> {
+    // FR-SEC-02: the agent listener also asks for a client certificate from
+    // the node CA. It is optional at the TLS layer, so a new node can enrol
+    // with the join token; the core decides what each Register needs.
+    let mode = cfg.node_certificates.mode;
+    let agent_tls = match (&tls, mode) {
+        (None, NodeCertificateMode::Require) => {
+            return Err(ValkvorkError::Config(
+                "node_certificates.mode = \"require\" needs tls_cert_file and tls_key_file".into(),
+            ))
+        }
+        (Some(t), NodeCertificateMode::Issue | NodeCertificateMode::Require) => {
+            let ca = core.enable_node_certificates()?;
+            tracing::info!(mode = ?mode, "node client certificates enabled");
+            Some(
+                t.clone()
+                    .client_ca_root(Certificate::from_pem(ca))
+                    .client_auth_optional(true),
+            )
+        }
+        (t, _) => t.clone(),
+    };
+    let (handle, core_task) = core.spawn();
+
+    let builder = |tls: &Option<ServerTlsConfig>| -> Result<Server, ValkvorkError> {
         let b = Server::builder()
             .http2_keepalive_interval(Some(std::time::Duration::from_secs(10)))
             .http2_keepalive_timeout(Some(std::time::Duration::from_secs(5)));
-        match &tls {
+        match tls {
             Some(t) => b
                 .tls_config(t.clone())
                 .map_err(|e| ValkvorkError::Tls(e.to_string())),
@@ -52,7 +74,7 @@ pub async fn run(cfg: ControllerConfig) -> Result<(), ValkvorkError> {
         }
     };
 
-    let agent_srv = builder()?
+    let agent_srv = builder(&agent_tls)?
         .add_service(AgentServiceServer::new(AgentApi::new(handle.clone())))
         .serve(cfg.agent_listen_addr);
     // The UI shares the admin listener (FR-UI-02). Browsers speak HTTP/1.1
@@ -67,7 +89,7 @@ pub async fn run(cfg: ControllerConfig) -> Result<(), ValkvorkError> {
             cfg.database_path.clone(),
         )
     });
-    let admin_srv = builder()?
+    let admin_srv = builder(&tls)?
         .accept_http1(true)
         .layer(UiLayer::new(ui))
         .add_service(AdminServiceServer::with_interceptor(

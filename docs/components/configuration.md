@@ -43,6 +43,11 @@ cooldown_seconds            = 180
 [ui]
 enabled             = true
 session_ttl_seconds = 43200          # 12 h
+
+# Per-node client certificates on the agent listener (FR-SEC-02). Needs TLS.
+[node_certificates]
+mode          = "issue"   # off | issue | require; see security.md#node-certificates
+lifetime_days = 30        # agents renew at two thirds of it
 ```
 
 Keep `recovery_grace_period_seconds` above the agents' maximum reconnect delay (18 s), and `node_unhealthy_timeout_seconds` at several heartbeat intervals.
@@ -62,6 +67,8 @@ docker_socket       = "/var/run/docker.sock"
 registry_auth_file  = "/etc/valkvork/registry-auth.json"   # optional, Docker config.json format
 # advertise_ip      = "10.0.1.23"            # default: the local address routed to the controller
 metrics_listen_addr = "127.0.0.1:9401"       # must be loopback; omit to disable
+default_host_ip     = "advertise"            # ports whose manifest sets no host_ip: "advertise" (the
+                                             # node's address), "0.0.0.0" (every address) or an IP
 
 [reserved]                 # kept back from scheduling for the OS, dockerd and the agent
 cpu    = 0.25
@@ -79,6 +86,12 @@ domain      = "svc.valkvork.internal"
 # listen_ip = "172.17.0.1" # default: the Docker bridge gateway (this node and its containers only)
 # upstream  = ["10.12.0.2:53"]   # resolvers for other names; default: /etc/resolv.conf's nameservers
 ttl_seconds = 5
+
+[instance_metadata]        # containers' access to 169.254.169.254; see security.md#instance-metadata
+block    = true            # reject it from the Docker bridge, except for manifests with
+                           # [security] instance_metadata = true. Needs iptables and Docker's DOCKER-USER chain
+iptables = "iptables"      # must drive the same backend as Docker (iptables-nft on Ubuntu 22.04)
+bridge   = "docker0"
 
 [host_volumes.pgdata]      # one table per volume manifests can mount by name
 path      = "/data/pgdata"

@@ -8,8 +8,8 @@ Each agent keeps exactly one long-lived, bidirectional gRPC stream to the contro
 service AgentService {
   rpc Connect(stream AgentMessage) returns (stream ControllerMessage);
 }
-message AgentMessage      { oneof msg { Register register = 1; Heartbeat heartbeat = 2; CommandResult command_result = 3; } }
-message ControllerMessage { oneof msg { RegisterAck register_ack = 1; StartWorkload start_workload = 2; StopWorkload stop_workload = 3; Endpoints endpoints = 4; } }
+message AgentMessage      { oneof msg { Register register = 1; Heartbeat heartbeat = 2; CommandResult command_result = 3; CertificateRequest certificate_request = 4; } }
+message ControllerMessage { oneof msg { RegisterAck register_ack = 1; StartWorkload start_workload = 2; StopWorkload stop_workload = 3; Endpoints endpoints = 4; NodeCertificate node_certificate = 5; } }
 ```
 
 tonic's generated clients have a built-in `connect()` constructor, which clashes with an RPC named `Connect`. So the agent proto is built server-only and the client is hand-written in `valkvork-proto/src/lib.rs` as `AgentServiceClient::connect_stream`. The wire path is still `/valkvork.v1.AgentService/Connect`.
@@ -18,19 +18,23 @@ tonic's generated clients have a built-in `connect()` constructor, which clashes
 
 ```
  agent                                               controller
-   │── TLS to controller_endpoint (CA from ca_file) ──►│
+   │── TLS to controller_endpoint (CA from ca_file), ─►│
+   │     with the node's client certificate if any     │
    │── Register ──────────────────────────────────────►│ must arrive within 10 s, first
-   │     node_id, join_token, hostname, ip, class,     │ check join token (constant time)
+   │     node_id, join_token, hostname, ip, class,     │ check the certificate or join token
    │     allocatable CPU/memory, host volumes,         │ upsert node → HEALTHY
    │     agent version, runtime, inventory             │ reconcile the inventory (FR-CON-03)
-   │◄────────────────────────── RegisterAck ───────────│ accepted, heartbeat_interval_ms
+   │◄────────────────────────── RegisterAck ───────────│ accepted, heartbeat_interval_ms,
+   │                                                   │ issues_certificates
+   │── CertificateRequest (none yet, or renewal due) ─►│ sign, store the serial
+   │◄─────────────────────────── NodeCertificate ──────│
    │◄──────────────── re-sent outstanding commands ────│
    │── Heartbeat every heartbeat_interval_ms ─────────►│ last_seen = now (controller clock)
    │◄──────────────── StartWorkload / StopWorkload ────│
    │── CommandResult (accepted or rejected) ──────────►│
 ```
 
-- **Register first.** The first message on every stream must be `Register` (FR-AGE-02); anything else is rejected with `INVALID_ARGUMENT`. A wrong join token gets `RegisterAck { accepted: false, reject_reason }` and the stream ends.
+- **Register first.** The first message on every stream must be `Register` (FR-AGE-02); anything else is rejected with `INVALID_ARGUMENT`. A wrong join token, or in `require` mode a missing client certificate, gets `RegisterAck { accepted: false, reject_reason }` and the stream ends.
 - **Inventory.** `Register` carries a `WorkloadStatus` for every container labelled `valkvork.workload_id` on the host, so the controller can re-adopt or stop old copies.
 - **Ack first.** The controller always sends `RegisterAck` before any command. The agent waits up to 15 s for it.
 - **Heartbeats.** The interval comes from the ack (default 2000 ms, at least 500). Each carries node CPU and memory and a `WorkloadStatus` per managed container.
@@ -42,6 +46,7 @@ tonic's generated clients have a built-in `connect()` constructor, which clashes
 | `StartWorkload` | command id, workload id, service id and version, image, CPU millicores, memory and disk bytes, env, ports, volumes, restart policy, kill timeout | Checks Docker answers within 3 s, records the workload, and acks; then pulls, creates and starts in the background |
 | `StopWorkload` | command id, workload id, kill timeout | Marks the workload stopping and acks; then stops and removes the container and its alloc directory |
 | `Endpoints` | every service's node addresses | Not a command, so not acked. Sent after `RegisterAck` and whenever the set changes, only to agents with the `service_discovery` feature. Replaces the agent's set (see [discovery.md](discovery.md)) |
+| `NodeCertificate` | the signed client certificate, or an error | The answer to the agent's `CertificateRequest`; not acked. The agent stores it and presents it from its next connection (see [security.md](security.md#node-certificates)) |
 
 Every command gets exactly one `CommandResult` (FR-AGE-04). The ack means "accepted" or "rejected"; actual progress shows up in later heartbeats. Commands are idempotent by workload id:
 
@@ -76,4 +81,4 @@ Keepalives: HTTP/2 pings every 10 s, with a 5 s timeout, on both sides, so a dea
 
 ## Transport Security
 
-`controller_endpoint` should be `https://…`. The agent then verifies the controller's certificate against `ca_file`, using `tls_domain` as the expected name if set, else the endpoint's host. With `http://` the stream is unencrypted and the agent logs a warning; that is for development only. Per-node mutual TLS is planned (FR-SEC-02). See [security.md](security.md).
+`controller_endpoint` should be `https://…`. The agent then verifies the controller's certificate against `ca_file`, using `tls_domain` as the expected name if set, else the endpoint's host. With `http://` the stream is unencrypted and the agent logs a warning; that is for development only. Over TLS the agent also presents its own client certificate, issued by the controller (FR-SEC-02). See [security.md](security.md#node-certificates).

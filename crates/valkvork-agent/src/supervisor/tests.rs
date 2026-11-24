@@ -180,6 +180,7 @@ impl ContainerRuntime for Fake {
             state: c.state,
             exit_code: c.exit_code,
             oom_killed: false,
+            ip_address: None,
         })
     }
     fn events(&self, _: &str) -> BoxStream<'static, RtResult<RuntimeEvent>> {
@@ -234,6 +235,8 @@ fn supervisor_with_secrets(rt: Arc<Fake>, dir: &Path) -> Arc<Supervisor> {
         rt,
         SupervisorConfig {
             advertise_ip: "10.0.0.5".into(),
+            default_host_ip: String::new(),
+            metadata: None,
             node_id: "node-1".into(),
             node_class: "app".into(),
             hostname: "host-1".into(),
@@ -259,6 +262,8 @@ fn supervisor(rt: Arc<Fake>, dir: &Path) -> Arc<Supervisor> {
         rt,
         SupervisorConfig {
             advertise_ip: "10.0.0.5".into(),
+            default_host_ip: String::new(),
+            metadata: None,
             node_id: "node-1".into(),
             node_class: "app".into(),
             hostname: "host-1".into(),
@@ -455,6 +460,8 @@ async fn forbidden_host_volume_is_refused() {
         rt.clone(),
         SupervisorConfig {
             advertise_ip: "10.0.0.5".into(),
+            default_host_ip: String::new(),
+            metadata: None,
             node_id: "node-1".into(),
             node_class: "app".into(),
             hostname: "host-1".into(),
@@ -551,6 +558,8 @@ fn supervisor_with(dir: &Path, vols: Vec<(&str, HostVolume)>) -> Arc<Supervisor>
         Fake::new(),
         SupervisorConfig {
             advertise_ip: "10.0.0.5".into(),
+            default_host_ip: String::new(),
+            metadata: None,
             node_id: "node-1".into(),
             node_class: "app".into(),
             hostname: "host-1".into(),
@@ -664,6 +673,90 @@ async fn passes_command_and_bind_addresses() {
     assert_eq!(spec.entrypoint, None, "unset keeps the image's entrypoint");
     let ips: Vec<Option<&str>> = spec.ports.iter().map(|p| p.host_ip.as_deref()).collect();
     assert_eq!(ips, vec![Some("10.0.0.5"), Some("127.0.0.1"), None]);
+}
+
+/// agent.toml `default_host_ip` binds ports whose manifest sets no
+/// `host_ip`, and their checks probe that address; an explicit `host_ip`
+/// wins. `[security] instance_metadata` labels the container.
+#[tokio::test]
+async fn default_bind_address_and_metadata_label() {
+    let d = tempfile::tempdir().unwrap();
+    let rt = Fake::new();
+    let s = Supervisor::new(
+        rt.clone(),
+        SupervisorConfig {
+            advertise_ip: "10.0.0.5".into(),
+            default_host_ip: "advertise".into(),
+            metadata: None,
+            node_id: "node-1".into(),
+            node_class: "app".into(),
+            hostname: "host-1".into(),
+            secrets: Arc::new(crate::secrets::SecretResolver::new(Default::default())),
+            data_dir: d.path().to_path_buf(),
+            registry_auth_file: d.path().join("none.json"),
+            docker_socket: PathBuf::from("/var/run/docker.sock"),
+            protected_paths: vec![],
+            host_volumes: BTreeMap::new(),
+            endpoints: crate::discovery::Endpoints::load(d.path()),
+            dns: vec![],
+        },
+    );
+    let mut cmd = start_cmd("w1", 3);
+    cmd.ports = vec![
+        pb::PortMapping {
+            name: "web".into(),
+            container_port: 80,
+            host_port: 8080,
+            host_ip: String::new(),
+        },
+        pb::PortMapping {
+            name: "all".into(),
+            container_port: 81,
+            host_port: 8081,
+            host_ip: "0.0.0.0".into(),
+        },
+    ];
+    cmd.check = Some(pb::HealthCheck {
+        r#type: "tcp".into(),
+        port_name: "web".into(),
+        interval_seconds: 10,
+        timeout_seconds: 2,
+        failures: 3,
+        ..Default::default()
+    });
+    cmd.security = Some(pb::ContainerSecurity {
+        instance_metadata: true,
+        ..Default::default()
+    });
+    s.start(cmd).await.unwrap();
+    settle().await;
+    let spec = rt.last_created();
+    let ips: Vec<Option<&str>> = spec.ports.iter().map(|p| p.host_ip.as_deref()).collect();
+    assert_eq!(ips, vec![Some("10.0.0.5"), Some("0.0.0.0")]);
+    assert!(
+        spec.labels[LABEL_CHECK].contains("10.0.0.5:8080"),
+        "{}",
+        spec.labels[LABEL_CHECK]
+    );
+    assert_eq!(
+        spec.labels
+            .get(crate::metadata::LABEL_INSTANCE_METADATA)
+            .map(String::as_str),
+        Some("true")
+    );
+
+    // Without the flag, no label.
+    let mut cmd = start_cmd("w2", 3);
+    cmd.security = Some(pb::ContainerSecurity {
+        read_only_root: true,
+        ..Default::default()
+    });
+    s.start(cmd).await.unwrap();
+    settle().await;
+    assert!(!rt
+        .last_created()
+        .labels
+        .contains_key(crate::metadata::LABEL_INSTANCE_METADATA));
 }
 
 /// A resolved secret becomes an environment variable of the container.
@@ -1089,6 +1182,8 @@ async fn containers_use_the_discovery_dns() {
     let rt = Fake::new();
     let cfg = SupervisorConfig {
         advertise_ip: "10.0.0.5".into(),
+        default_host_ip: String::new(),
+        metadata: None,
         node_id: "node-1".into(),
         node_class: "app".into(),
         hostname: "host-1".into(),
@@ -1139,6 +1234,7 @@ async fn security_and_logging() {
         cap_drop: vec!["ALL".into()],
         cap_add: vec!["NET_BIND_SERVICE".into()],
         tmpfs: vec!["/tmp".into(), "/run:size=16m,mode=1777".into()],
+        instance_metadata: false,
     });
     cmd.logging = Some(pb::LogConfig {
         driver: "awslogs".into(),

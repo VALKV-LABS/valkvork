@@ -12,6 +12,10 @@
 #   - tmpfs: in-memory writable paths, for an image that writes outside its
 #     volumes (here nginx's pid file and temp files in /tmp). Options follow
 #     a colon; the memory counts against [resources] memory.
+#   - instance_metadata (not set here, so false): the container can't reach
+#     the cloud metadata service, 169.254.169.254, on agents that block it
+#     (the default). Set it to true only for a workload that calls AWS with
+#     the node's instance role.
 #
 # The image runs as a non-root user and listens on 8080, so it needs no
 # capability at all. Its entrypoint logs that it can't edit /etc/nginx on a

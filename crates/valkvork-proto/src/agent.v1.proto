@@ -12,6 +12,7 @@ message AgentMessage {
     Register register = 1;
     Heartbeat heartbeat = 2;
     CommandResult command_result = 3;
+    CertificateRequest certificate_request = 4; // only after RegisterAck.issues_certificates
   }
 }
 
@@ -21,7 +22,20 @@ message ControllerMessage {
     StartWorkload start_workload = 2;
     StopWorkload stop_workload = 3;
     Endpoints endpoints = 4;           // only to agents with the service_discovery feature
+    NodeCertificate node_certificate = 5; // the answer to a CertificateRequest
   }
+}
+
+// Per-node client certificates (FR-SEC-02). The agent asks for one when it
+// has none or its own is two thirds through its lifetime; it presents it as
+// its TLS client certificate on later connections.
+message CertificateRequest {
+  string csr_pem = 1;                  // PKCS#10; only its public key is used
+}
+
+message NodeCertificate {
+  string certificate_pem = 1;          // empty when error is set
+  string error = 2;
 }
 
 // Service discovery: every service's reachable addresses, the whole set each
@@ -55,6 +69,7 @@ message RegisterAck {
   bool accepted = 1;
   string reject_reason = 2;
   uint32 heartbeat_interval_ms = 3;    // default 2000
+  bool issues_certificates = 4;        // the controller answers CertificateRequest
 }
 
 message Heartbeat {
@@ -129,6 +144,7 @@ message ContainerSecurity {
   repeated string cap_drop = 3;        // "ALL" drops every capability
   repeated string cap_add = 4;
   repeated string tmpfs = 5;           // "/tmp" or "/tmp:size=64m,mode=1777"
+  bool instance_metadata = 6;          // may reach 169.254.169.254 where the agent blocks it
 }
 
 // The container's log driver. Option values may contain ${node.NAME},

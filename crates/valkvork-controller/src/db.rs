@@ -132,7 +132,39 @@ CREATE INDEX idx_workloads_node           ON workloads(node_id) WHERE node_id IS
 CREATE INDEX idx_workloads_status         ON workloads(status);
 "#,
     ),
+    (
+        3,
+        // Per-node client certificates (FR-SEC-02). The node CA lives here so
+        // the controller volume's snapshots back it up with the node rows.
+        // node_certs has no foreign key: a certificate can be issued in the
+        // same step as the Register that creates the node row. Deleting a
+        // node deletes its row here, which revokes its certificates.
+        r#"
+CREATE TABLE node_ca (
+    id          INTEGER PRIMARY KEY CHECK (id = 1),
+    cert_pem    TEXT NOT NULL,
+    key_pem     TEXT NOT NULL,
+    created_at  INTEGER NOT NULL
+);
+CREATE TABLE node_certs (
+    node_id      TEXT PRIMARY KEY,
+    serial       TEXT NOT NULL,
+    prev_serial  TEXT,
+    not_after    INTEGER NOT NULL,
+    issued_at    INTEGER NOT NULL
+);
+"#,
+    ),
 ];
+
+/// The serials a node may present: the newest, and the one before it so an
+/// agent that lost the new certificate before saving it can still connect.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NodeCertRecord {
+    pub serial: String,
+    pub prev_serial: Option<String>,
+    pub not_after: i64,
+}
 
 fn db_err(e: impl std::fmt::Display) -> ValkvorkError {
     ValkvorkError::Database(e.to_string())
@@ -255,6 +287,81 @@ impl Db {
             tx.commit().map_err(db_err)?;
             tracing::info!(version, "applied schema migration");
         }
+        Ok(())
+    }
+
+    // ------------------------------------------------------------------
+    // Node CA and node certificates (FR-SEC-02)
+    // ------------------------------------------------------------------
+
+    /// The stored node CA as (cert_pem, key_pem), if one was created.
+    pub fn load_node_ca(&self) -> Result<Option<(String, String)>, ValkvorkError> {
+        self.conn
+            .query_row(
+                "SELECT cert_pem, key_pem FROM node_ca WHERE id = 1",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .map(Some)
+            .or_else(|e| match e {
+                rusqlite::Error::QueryReturnedNoRows => Ok(None),
+                e => Err(db_err(e)),
+            })
+    }
+
+    /// Store the node CA. Never replaces an existing one.
+    pub fn save_node_ca(&self, cert_pem: &str, key_pem: &str) -> Result<(), ValkvorkError> {
+        self.conn
+            .execute(
+                "INSERT INTO node_ca (id, cert_pem, key_pem, created_at) VALUES (1, ?1, ?2, ?3)",
+                params![cert_pem, key_pem, now_ms()],
+            )
+            .map_err(db_err)?;
+        Ok(())
+    }
+
+    pub fn load_node_certs(
+        &self,
+    ) -> Result<std::collections::HashMap<String, NodeCertRecord>, ValkvorkError> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT node_id, serial, prev_serial, not_after FROM node_certs")
+            .map_err(db_err)?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    NodeCertRecord {
+                        serial: r.get(1)?,
+                        prev_serial: r.get(2)?,
+                        not_after: r.get(3)?,
+                    },
+                ))
+            })
+            .map_err(db_err)?;
+        rows.collect::<Result<_, _>>().map_err(db_err)
+    }
+
+    /// Written at once, not in the step's batch: the agent gets the
+    /// certificate in the same step, and must never hold one the database
+    /// does not know.
+    pub fn save_node_cert(&self, node_id: &str, rec: &NodeCertRecord) -> Result<(), ValkvorkError> {
+        self.conn
+            .execute(
+                "INSERT INTO node_certs (node_id, serial, prev_serial, not_after, issued_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5)
+                 ON CONFLICT(node_id) DO UPDATE SET serial = excluded.serial,
+                     prev_serial = excluded.prev_serial, not_after = excluded.not_after,
+                     issued_at = excluded.issued_at",
+                params![
+                    node_id,
+                    rec.serial,
+                    rec.prev_serial,
+                    rec.not_after,
+                    now_ms()
+                ],
+            )
+            .map_err(db_err)?;
         Ok(())
     }
 
@@ -495,6 +602,8 @@ impl Db {
         for id in &b.deleted_nodes {
             tx.execute("DELETE FROM nodes WHERE node_id = ?1", params![id])
                 .map_err(db_err)?;
+            tx.execute("DELETE FROM node_certs WHERE node_id = ?1", params![id])
+                .map_err(db_err)?;
         }
         let now = now_ms();
         for e in &b.scaling_events {
@@ -721,7 +830,10 @@ mod migration_tests {
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .unwrap();
-        assert_eq!((status.as_str(), n), ("RUNNING", 2));
+        assert_eq!(
+            (status.as_str(), n),
+            ("RUNNING", MIGRATIONS.last().unwrap().0)
+        );
         db.conn
             .execute(
                 "UPDATE workloads SET status = 'COMPLETED' WHERE workload_id = 'w1'",

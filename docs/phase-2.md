@@ -10,7 +10,7 @@ This page collects every P2 and P3 item, and for each one: what it is, what alre
 |---|---|---|---|
 | [Network block volumes with fencing](#network-block-volumes-with-fencing) | FR-STO-10 … 15, §7.3 | P2 | Host volumes, the scheduler's filters, the agent's mount path |
 | [Native containerd driver](#native-containerd-driver) | FR-AGE-10 | P2 | The `ContainerRuntime` trait |
-| [Per-node mutual TLS](#per-node-mutual-tls) | FR-SEC-02, decision 6 | P2 | Server TLS and the join token |
+| [Per-node mutual TLS](#per-node-mutual-tls) | FR-SEC-02, decision 6 | P2 | **Built** ([security.md](components/security.md#node-certificates)) |
 | [Secret references](#secret-references) | FR-SEC-04 | P2 | `[env]`, the agent's start path |
 | [Application health checks](#application-health-checks) | §1.4 | P2 | `WorkloadStatus`, rollouts' `min_healthy_time` |
 | [Dynamic ports and load balancer registration](#dynamic-ports-and-load-balancer-registration) | FR-NET-03 | P2 | Static host ports, the scheduler's port filter |
@@ -92,7 +92,7 @@ target = "/data"
 
 ## Per-node Mutual TLS
 
-*FR-SEC-02, open decision 6.* Today agents verify the controller's certificate and authenticate with a shared join token. Phase 2 gives each node its own client certificate.
+*FR-SEC-02, open decision 6.* **Built**, as sketched below; see [security.md](components/security.md#node-certificates). The answers to the questions: the CA lives in the controller's database and is backed up with it; certificates last 30 days and renew at two thirds; `[node_certificates] mode` (`off`, `issue`, `require`) is the migration window. The CSR travels on the open stream (`CertificateRequest`) rather than in `Register`, so enrolment and renewal are one path.
 
 **Design sketch**
 

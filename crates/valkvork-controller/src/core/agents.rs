@@ -2,35 +2,51 @@
 //! CommandResult (FR-CON-09) and node health (FR-CON-02).
 
 use super::Core;
+use crate::db::NodeCertRecord;
 use crate::model::{AgentSender, Node, NodeEntry};
 use pb::WorkloadState;
 use std::collections::HashSet;
 use std::time::{Duration, Instant};
+use valkvork_common::config::NodeCertificateMode;
 use valkvork_common::models::{
     now_ms, DesiredState, EventKind, NodeStatus, SubjectType, WorkloadStatus,
 };
+use valkvork_common::node_cert::CertInfo;
 use valkvork_common::tls::tokens_equal;
+use valkvork_common::ValkvorkError;
 use valkvork_proto::v1 as pb;
 
 const CONTROLLER: &str = "controller";
 
 impl Core {
-    pub(crate) fn on_register(&mut self, r: pb::Register, conn_id: u64, tx: AgentSender) {
+    pub(crate) fn on_register(
+        &mut self,
+        r: pb::Register,
+        conn_id: u64,
+        tx: AgentSender,
+        client_cert: Option<CertInfo>,
+    ) {
+        let issues = self.issues_certificates();
         let ack = |accepted: bool, reason: &str, interval: u32| pb::ControllerMessage {
             msg: Some(pb::controller_message::Msg::RegisterAck(pb::RegisterAck {
                 accepted,
                 reject_reason: reason.to_string(),
                 heartbeat_interval_ms: interval,
+                issues_certificates: accepted && issues,
             })),
         };
         let interval = self.cfg.heartbeat_interval_ms;
 
-        // FR-SEC-01: unauthenticated Register calls are rejected.
-        if !tokens_equal(&r.join_token, &self.join_token) {
-            tracing::warn!(node = %r.node_id, "rejected Register: invalid join token");
-            let _ = tx.try_send(Ok(ack(false, "invalid join token", interval)));
-            return;
-        }
+        // FR-SEC-01 / FR-SEC-02: unauthenticated Register calls are rejected.
+        let auth = match self.authenticate(&r, client_cert.as_ref()) {
+            Ok(how) => how,
+            Err(reason) => {
+                tracing::warn!(node = %r.node_id, reason, "rejected Register");
+                let _ = tx.try_send(Ok(ack(false, reason, interval)));
+                return;
+            }
+        };
+        tracing::debug!(node = %r.node_id, auth, "Register authenticated");
         if r.node_id.is_empty()
             || r.allocatable_cpu_millicores == 0
             || r.allocatable_memory_bytes == 0
@@ -101,6 +117,103 @@ impl Core {
         self.reconcile_inventory(&node_id, &r.inventory);
         self.resend_for_node(&node_id);
         self.reconcile();
+    }
+
+    fn issues_certificates(&self) -> bool {
+        self.node_ca.is_some() && self.cfg.node_certificates.mode != NodeCertificateMode::Off
+    }
+
+    /// How a Register proves who it is (FR-SEC-01, FR-SEC-02). A client
+    /// certificate counts only if its name is the node id and its serial is
+    /// one the controller issued to that node and has not revoked. Anything
+    /// else falls back to the join token, which in `require` mode only
+    /// enrols a node that holds no certificate yet.
+    fn authenticate(
+        &self,
+        r: &pb::Register,
+        cert: Option<&CertInfo>,
+    ) -> Result<&'static str, &'static str> {
+        let mode = self.cfg.node_certificates.mode;
+        let record = self.node_certs.get(&r.node_id);
+        if let (Some(c), true) = (cert, self.issues_certificates()) {
+            let issued = record.is_some_and(|rec| {
+                rec.serial == c.serial || rec.prev_serial.as_deref() == Some(c.serial.as_str())
+            });
+            if c.common_name == r.node_id && issued {
+                return Ok("certificate");
+            }
+        }
+        if !tokens_equal(&r.join_token, &self.join_token) {
+            return Err("invalid join token");
+        }
+        if mode == NodeCertificateMode::Require && record.is_some() {
+            return Err("this node was issued a client certificate; connect with it");
+        }
+        Ok("join token")
+    }
+
+    /// FR-SEC-02: sign the agent's CSR and send the certificate back.
+    fn on_certificate_request(&mut self, node_id: &str, req: pb::CertificateRequest) {
+        let Some(tx) = self
+            .nodes
+            .get(node_id)
+            .and_then(|e| e.conn.as_ref().map(|(_, tx)| tx.clone()))
+        else {
+            return;
+        };
+        let reply = match self.issue_certificate(node_id, &req.csr_pem) {
+            Ok(pem) => pb::NodeCertificate {
+                certificate_pem: pem,
+                error: String::new(),
+            },
+            Err(e) => {
+                tracing::warn!(node = node_id, error = %e, "certificate request refused");
+                pb::NodeCertificate {
+                    certificate_pem: String::new(),
+                    error: e.to_string(),
+                }
+            }
+        };
+        self.direct.push((
+            tx,
+            pb::ControllerMessage {
+                msg: Some(pb::controller_message::Msg::NodeCertificate(reply)),
+            },
+        ));
+    }
+
+    fn issue_certificate(&mut self, node_id: &str, csr_pem: &str) -> Result<String, ValkvorkError> {
+        if !self.issues_certificates() {
+            return Err(ValkvorkError::FailedPrecondition(
+                "this controller does not issue node certificates".into(),
+            ));
+        }
+        let ca = self.node_ca.clone().expect("checked above");
+        let lifetime = Duration::from_secs(
+            u64::from(self.cfg.node_certificates.lifetime_days.max(1)) * 86_400,
+        );
+        let issued = ca.sign(csr_pem, node_id, lifetime)?;
+        let rec = NodeCertRecord {
+            serial: issued.serial,
+            prev_serial: self.node_certs.get(node_id).map(|r| r.serial.clone()),
+            not_after: issued.not_after_ms,
+        };
+        self.db.save_node_cert(node_id, &rec)?;
+        self.node_certs.insert(node_id.to_string(), rec);
+        let host = self
+            .nodes
+            .get(node_id)
+            .map(|e| e.node.hostname.clone())
+            .unwrap_or_else(|| node_id.to_string());
+        let days = self.cfg.node_certificates.lifetime_days.max(1);
+        self.event(
+            EventKind::Node,
+            SubjectType::Node,
+            node_id,
+            format!("{host} was issued a client certificate, valid for {days} days"),
+            CONTROLLER,
+        );
+        Ok(issued.cert_pem)
     }
 
     /// FR-CON-03: compare the agent's inventory with the workload table.
@@ -270,6 +383,9 @@ impl Core {
             }
             pb::agent_message::Msg::Heartbeat(hb) => self.on_heartbeat(node_id, hb),
             pb::agent_message::Msg::CommandResult(res) => self.on_command_result(node_id, res),
+            pb::agent_message::Msg::CertificateRequest(req) => {
+                self.on_certificate_request(node_id, req)
+            }
         }
     }
 

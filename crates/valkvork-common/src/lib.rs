@@ -3,6 +3,7 @@
 pub mod config;
 pub mod errors;
 pub mod models;
+pub mod node_cert;
 pub mod tls;
 pub mod units;
 pub mod validation;
