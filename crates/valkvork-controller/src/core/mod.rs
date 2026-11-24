@@ -20,14 +20,16 @@ mod reconcile;
 #[cfg(test)]
 mod tests;
 
-use crate::db::{Batch, Db, NewEvent, NewScalingEvent};
+use crate::db::{Batch, Db, NewEvent, NewScalingEvent, NodeCertRecord};
 use crate::model::{AgentSender, CpuSamples, NodeEntry, Service, ServiceRuntime, Workload};
 use crate::scheduler::{NodeCapacity, Snapshot};
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::{broadcast, mpsc, oneshot};
 use valkvork_common::config::ControllerConfig;
 use valkvork_common::models::{now_ms, DesiredState, EventKind, SubjectType, WorkloadStatus};
+use valkvork_common::node_cert::{CertInfo, NodeCa};
 use valkvork_common::ValkvorkError;
 use valkvork_proto::v1 as pb;
 
@@ -40,6 +42,9 @@ pub enum CoreMsg {
         register: pb::Register,
         conn_id: u64,
         tx: AgentSender,
+        /// The TLS client certificate the agent presented, already verified
+        /// against the node CA by the TLS layer (FR-SEC-02).
+        client_cert: Option<CertInfo>,
     },
     AgentMsg {
         node_id: String,
@@ -108,6 +113,9 @@ pub struct Core {
     pub(crate) series: observe::Series,
     pub(crate) db: Db,
     pub(crate) join_token: String,
+    /// Signs node certificates; `None` without TLS (FR-SEC-02).
+    pub(crate) node_ca: Option<Arc<NodeCa>>,
+    pub(crate) node_certs: HashMap<String, NodeCertRecord>,
     pub(crate) grace_until: Instant,
     pub(crate) grace_logged: bool,
 
@@ -170,6 +178,7 @@ impl Core {
             .into_iter()
             .map(|w| (w.workload_id.clone(), w))
             .collect();
+        let node_certs = db.load_node_certs()?;
         let assigned_at = workloads
             .values()
             .filter(|w| w.status == WorkloadStatus::Assigned)
@@ -190,6 +199,8 @@ impl Core {
             change_seq: 0,
             metrics: Default::default(),
             series: Default::default(),
+            node_ca: None,
+            node_certs,
             db,
             join_token,
             grace_until,
@@ -219,6 +230,24 @@ impl Core {
             command_seq: 0,
             discovery: Default::default(),
         })
+    }
+
+    /// Load the node CA, creating it on first use, and start issuing node
+    /// certificates (FR-SEC-02). Returns the CA certificate the agent
+    /// listener trusts for client certificates.
+    pub fn enable_node_certificates(&mut self) -> Result<String, ValkvorkError> {
+        let ca = match self.db.load_node_ca()? {
+            Some((cert, key)) => NodeCa::from_pem(&cert, &key)?,
+            None => {
+                let ca = NodeCa::generate()?;
+                self.db.save_node_ca(ca.cert_pem(), &ca.key_pem())?;
+                tracing::info!("created the node CA");
+                ca
+            }
+        };
+        let pem = ca.cert_pem().to_string();
+        self.node_ca = Some(Arc::new(ca));
+        Ok(pem)
     }
 
     pub fn spawn(
@@ -278,7 +307,8 @@ impl Core {
                 register,
                 conn_id,
                 tx,
-            } => self.on_register(register, conn_id, tx),
+                client_cert,
+            } => self.on_register(register, conn_id, tx, client_cert),
             CoreMsg::AgentMsg {
                 node_id,
                 conn_id,
@@ -446,6 +476,7 @@ impl Core {
     /// delete its row in the next commit.
     pub(crate) fn remove_node_entry(&mut self, node_id: &str) {
         self.nodes.remove(node_id);
+        self.node_certs.remove(node_id);
         self.dirty_nodes.remove(node_id);
         self.heartbeats.retain(|(id, _)| id != node_id);
         self.outstanding.retain(|_, o| o.node_id != node_id);

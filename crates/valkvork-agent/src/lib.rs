@@ -6,11 +6,13 @@
 //!   per-container telemetry (FR-AGE-03).
 //! * [`connection`]: the outbound stream to the controller with backoff
 //!   (FR-ARC-01, FR-AGE-05).
+//! * [`certs`]: the node's client certificate (FR-SEC-02).
 //! * [`identity`]: node id, hostname, address and capacity (FR-AGE-02).
 //! * [`secrets`]: resolution of workloads' secret references (FR-SEC-04).
 //! * [`health`]: health-check probes.
 //! * [`discovery`]: DNS for services on the node, from the controller's endpoints.
 
+pub mod certs;
 pub mod connection;
 pub mod discovery;
 pub mod health;

@@ -43,6 +43,11 @@ cooldown_seconds            = 180
 [ui]
 enabled             = true
 session_ttl_seconds = 43200          # 12 h
+
+# Per-node client certificates on the agent listener (FR-SEC-02). Needs TLS.
+[node_certificates]
+mode          = "issue"   # off | issue | require; see security.md#node-certificates
+lifetime_days = 30        # agents renew at two thirds of it
 ```
 
 Keep `recovery_grace_period_seconds` above the agents' maximum reconnect delay (18 s), and `node_unhealthy_timeout_seconds` at several heartbeat intervals.

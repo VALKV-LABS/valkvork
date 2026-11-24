@@ -58,6 +58,9 @@ pub struct ControllerConfig {
 
     /// Prometheus `/metrics` listener (NFR-07). Unset disables it.
     pub metrics_listen_addr: Option<SocketAddr>,
+
+    /// Per-node client certificates on the agent listener (FR-SEC-02).
+    pub node_certificates: NodeCertificatesConfig,
 }
 
 impl Default for ControllerConfig {
@@ -82,6 +85,7 @@ impl Default for ControllerConfig {
             autoscaler: AutoscalerConfig::default(),
             ui: UiConfig::default(),
             metrics_listen_addr: Some("0.0.0.0:9400".parse().unwrap()),
+            node_certificates: NodeCertificatesConfig::default(),
         }
     }
 }
@@ -105,6 +109,37 @@ impl ControllerConfig {
             self.admin_token.as_deref(),
             self.admin_token_file.as_deref(),
         )
+    }
+}
+
+/// How agents authenticate on the agent listener (FR-SEC-02).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum NodeCertificateMode {
+    /// Join token only; no certificates are issued.
+    Off,
+    /// Certificates are issued and accepted; the join token still works for
+    /// every node. The migration mode, and the default.
+    Issue,
+    /// A node that holds a certificate must present it. The join token only
+    /// enrols nodes the controller has issued nothing to.
+    Require,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct NodeCertificatesConfig {
+    pub mode: NodeCertificateMode,
+    /// Lifetime of a node certificate; agents renew at two thirds of it.
+    pub lifetime_days: u32,
+}
+
+impl Default for NodeCertificatesConfig {
+    fn default() -> Self {
+        Self {
+            mode: NodeCertificateMode::Issue,
+            lifetime_days: 30,
+        }
     }
 }
 

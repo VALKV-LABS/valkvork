@@ -20,6 +20,10 @@ sha2 = "0.10"
 hex = "0.4"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+# Per-node certificates (FR-SEC-02): the controller's node CA and the agent's CSR.
+rcgen = { version = "0.13", default-features = false, features = ["crypto", "pem", "ring", "x509-parser"] }
+x509-parser = { version = "0.16", features = ["verify"] }
+time = "0.3"
 
 [dev-dependencies]
 tempfile = "3.8"

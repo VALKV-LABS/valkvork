@@ -44,6 +44,13 @@ impl pb::agent_service_server::AgentService for AgentApi {
         request: Request<Streaming<pb::AgentMessage>>,
     ) -> Result<Response<Self::ConnectStream>, Status> {
         let peer = request.remote_addr();
+        // FR-SEC-02: rustls has already checked the chain to the node CA and
+        // the validity period; the core checks the name and serial.
+        let client_cert = request.peer_certs().and_then(|certs| {
+            certs
+                .first()
+                .and_then(|c| valkvork_common::node_cert::parse_der(c.get_ref()).ok())
+        });
         let mut inbound = request.into_inner();
 
         // FR-AGE-02: the first message on every stream MUST be Register.
@@ -65,6 +72,7 @@ impl pb::agent_service_server::AgentService for AgentApi {
                 register,
                 conn_id,
                 tx,
+                client_cert,
             })
             .await
             .map_err(Status::from)?;

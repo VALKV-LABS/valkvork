@@ -115,6 +115,7 @@ fn register_full(
         register,
         conn_id: conn,
         tx,
+        client_cert: None,
     });
     c.finish().unwrap();
     Agent {
@@ -1510,4 +1511,169 @@ fn no_endpoints_during_grace() {
     c.grace_until = Instant::now();
     c.finish().unwrap();
     assert_eq!(endpoint_msgs(&mut a).len(), 1);
+}
+
+// ============================================================================
+// Per-node client certificates (FR-SEC-02)
+// ============================================================================
+
+mod node_certificates {
+    use super::*;
+    use valkvork_common::config::NodeCertificateMode;
+    use valkvork_common::node_cert::{new_key_and_csr, parse_pem};
+
+    fn core_with(mode: NodeCertificateMode) -> Core {
+        let mut cfg = cfg();
+        cfg.node_certificates.mode = mode;
+        let mut c = Core::new(cfg, Db::open_in_memory().unwrap(), TOKEN.into()).unwrap();
+        c.enable_node_certificates().unwrap();
+        c
+    }
+
+    /// Register with an optional client certificate; returns the agent and
+    /// its RegisterAck.
+    fn connect(
+        c: &mut Core,
+        id: &str,
+        token: &str,
+        cert: Option<CertInfo>,
+    ) -> (Agent, pb::RegisterAck) {
+        let (tx, rx) = mpsc::channel(1024);
+        let conn = CONN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let register = pb::Register {
+            node_id: id.into(),
+            join_token: token.into(),
+            hostname: format!("host-{id}"),
+            ip_address: "10.0.0.1".into(),
+            node_class: "general".into(),
+            agent_version: "0.1.0".into(),
+            allocatable_cpu_millicores: 2000,
+            allocatable_memory_bytes: 4 << 30,
+            runtime: "docker/27.3.1".into(),
+            features: features_for(id),
+            ..Default::default()
+        };
+        c.handle(CoreMsg::AgentConnected {
+            register,
+            conn_id: conn,
+            tx,
+            client_cert: cert,
+        });
+        c.finish().unwrap();
+        let mut a = Agent {
+            id: id.into(),
+            conn,
+            rx,
+        };
+        let ack = match a.take().into_iter().next() {
+            Some(pb::controller_message::Msg::RegisterAck(ack)) => ack,
+            other => panic!("expected RegisterAck, got {other:?}"),
+        };
+        (a, ack)
+    }
+
+    fn request_cert(c: &mut Core, a: &mut Agent) -> pb::NodeCertificate {
+        let (_key, csr) = new_key_and_csr(&a.id).unwrap();
+        c.handle(CoreMsg::AgentMsg {
+            node_id: a.id.clone(),
+            conn_id: a.conn,
+            msg: pb::agent_message::Msg::CertificateRequest(pb::CertificateRequest {
+                csr_pem: csr,
+            }),
+        });
+        c.finish().unwrap();
+        a.take()
+            .into_iter()
+            .find_map(|m| match m {
+                pb::controller_message::Msg::NodeCertificate(n) => Some(n),
+                _ => None,
+            })
+            .expect("a NodeCertificate answer")
+    }
+
+    fn enrol(c: &mut Core, id: &str) -> CertInfo {
+        let (mut a, ack) = connect(c, id, TOKEN, None);
+        assert!(ack.accepted && ack.issues_certificates);
+        let n = request_cert(c, &mut a);
+        assert!(n.error.is_empty(), "{}", n.error);
+        parse_pem(&n.certificate_pem).unwrap()
+    }
+
+    #[test]
+    fn issue_mode_enrols_with_the_token_and_accepts_the_certificate() {
+        let mut c = core_with(NodeCertificateMode::Issue);
+        let cert = enrol(&mut c, "a");
+        assert_eq!(cert.common_name, "a");
+        assert_eq!(c.db.load_node_certs().unwrap()["a"].serial, cert.serial);
+
+        // The certificate alone is enough: no token.
+        let (_a, ack) = connect(&mut c, "a", "", Some(cert.clone()));
+        assert!(ack.accepted);
+        // The token alone still works in issue mode.
+        let (_a, ack) = connect(&mut c, "a", TOKEN, None);
+        assert!(ack.accepted);
+        // Another node's certificate is not this node's.
+        let (_b, ack) = connect(&mut c, "b", "", Some(cert));
+        assert!(!ack.accepted);
+    }
+
+    #[test]
+    fn require_mode_needs_the_certificate_once_one_was_issued() {
+        let mut c = core_with(NodeCertificateMode::Require);
+        let first = enrol(&mut c, "a");
+        let (_a, ack) = connect(&mut c, "a", TOKEN, None);
+        assert!(
+            !ack.accepted,
+            "the token no longer stands in for the certificate"
+        );
+        assert!(ack.reject_reason.contains("certificate"));
+        let (mut a, ack) = connect(&mut c, "a", "", Some(first.clone()));
+        assert!(ack.accepted);
+
+        // Renewal: the new and the previous serial work, an older one not.
+        let second = parse_pem(&request_cert(&mut c, &mut a).certificate_pem).unwrap();
+        assert!(connect(&mut c, "a", "", Some(second.clone())).1.accepted);
+        assert!(connect(&mut c, "a", "", Some(first.clone())).1.accepted);
+        let (mut a, _) = connect(&mut c, "a", "", Some(second.clone()));
+        let _third = request_cert(&mut c, &mut a);
+        assert!(!connect(&mut c, "a", "", Some(first)).1.accepted);
+        assert!(connect(&mut c, "a", "", Some(second)).1.accepted);
+    }
+
+    #[test]
+    fn removing_a_node_revokes_its_certificate() {
+        let mut c = core_with(NodeCertificateMode::Require);
+        let cert = enrol(&mut c, "a");
+        c.nodes.get_mut("a").unwrap().last_seen = Instant::now() - Duration::from_secs(11);
+        c.check_health();
+        c.finish().unwrap();
+        c.remove_node_for_test("a").unwrap();
+        assert!(c.db.load_node_certs().unwrap().is_empty());
+
+        let (_a, ack) = connect(&mut c, "a", "", Some(cert));
+        assert!(!ack.accepted, "a removed node's certificate is refused");
+        // It can enrol again as a new node with the join token.
+        assert!(connect(&mut c, "a", TOKEN, None).1.accepted);
+    }
+
+    #[test]
+    fn off_mode_issues_nothing() {
+        let mut c = core_with(NodeCertificateMode::Off);
+        let (mut a, ack) = connect(&mut c, "a", TOKEN, None);
+        assert!(ack.accepted && !ack.issues_certificates);
+        assert!(!request_cert(&mut c, &mut a).error.is_empty());
+    }
+
+    #[test]
+    fn the_node_ca_survives_a_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v.db");
+        let mut c = Core::new(cfg(), Db::open(&path).unwrap(), TOKEN.into()).unwrap();
+        let ca = c.enable_node_certificates().unwrap();
+        let cert = enrol(&mut c, "a");
+        drop(c);
+        let mut c = Core::new(cfg(), Db::open(&path).unwrap(), TOKEN.into()).unwrap();
+        assert_eq!(c.enable_node_certificates().unwrap(), ca);
+        assert!(connect(&mut c, "a", "", Some(cert)).1.accepted);
+    }
 }
