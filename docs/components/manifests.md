@@ -140,6 +140,18 @@ Health checks of type `exec` run with the same restrictions. A workload with `[s
 
 Validation (`INVALID_SECURITY_SPEC`) rejects an unknown capability, `ALL` in `cap_add`, a capability in both lists, and a `tmpfs` path that is relative, repeated, under `/alloc` or a volume's `target`. See `examples/hardened.toml`.
 
+### Kernel Parameters
+
+`[sysctls]` sets kernel parameters of the container's own network namespace (Docker's `--sysctl`, `HostConfig.Sysctls`), one `"name" = "value"` line each:
+
+```toml
+[sysctls]
+"net.ipv4.tcp_retries2"   = "6"   # an open connection to a peer that went silent fails in about 25 s, not 15 minutes
+"net.ipv4.tcp_syn_retries" = "3"  # a new connection to one fails in about 15 s, not 2 minutes
+```
+
+Only `net.*` names: those are per container, so they change nothing for the node or its other containers; other kernel parameters are the node's, and set in its image. A value is a number or a word, or a few separated by single spaces (`"4096 87380 6291456"`); at most 32 per service. A workload with `[sysctls]` needs an agent with the `sysctls` feature (an older agent would start it without them, so the scheduler places it only where they apply). A change is a replacing change. Validation: `INVALID_SYSCTL_SPEC`.
+
 ### Logging
 
 `[logging]` sets the container's Docker log driver (`HostConfig.LogConfig`): `driver` is any driver the node's Docker has (`local`, `json-file`, `journald`, `awslogs`, `fluentd`, a plugin, or `none`), and `options` its `--log-opt` settings, as strings. Unset, the node's daemon default applies.
@@ -233,6 +245,7 @@ Validation runs before any database write. A failure writes nothing, returns gRP
 | VE-09 | `check.type` is `tcp`, `http` or `exec`; `check.port` names a `[[ports]]` entry, for `tcp` and `http` only; `path` only for `http`, starting with `/`; `command` only for `exec`, and not empty; `failures` 1–1000 | `INVALID_CHECK_SPEC` |
 | VE-10 | `[security]`: capabilities are Linux capability names, `ALL` only in `cap_drop`, none in both lists; `tmpfs` paths absolute, unique, not `/alloc` or a volume `target`, options not empty after a `:` | `INVALID_SECURITY_SPEC` |
 | VE-11 | `[logging]`: `driver` is a driver or plugin name, option names are plain, values reference only `${node.NAME}`, `${service.id}` and `${workload.id}`; no options for `none`. A network driver without `mode = "non-blocking"` is a **warning** | `INVALID_LOGGING_SPEC` |
+| VE-12 | `[sysctls]`: names `net.*`, values a number or a word (or a few, single spaces), at most 32 | `INVALID_SYSCTL_SPEC` |
 | VE-08 | Each secret's name is an environment variable name not also in `[env]`, and its reference is `ssm:<parameter name>` or `file:<absolute path>`. Every `${secret:NAME}` in an `[env]` value is closed and names a `[secrets]` key | `INVALID_SECRET_REF` |
 | VW-01 | **Warning** at apply or plan: no current healthy node of the class could fit one replica, or none has the host volumes | `UNSATISFIABLE_NOW` |
 

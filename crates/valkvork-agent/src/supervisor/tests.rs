@@ -1151,6 +1151,7 @@ async fn security_and_logging() {
         ]
         .into(),
     });
+    cmd.sysctls = [("net.ipv4.tcp_retries2".to_string(), "6".to_string())].into();
     let service = cmd.service_id.clone();
     s.start(cmd).await.unwrap();
     settle().await;
@@ -1166,6 +1167,7 @@ async fn security_and_logging() {
                 ("/tmp".into(), String::new()),
                 ("/run".into(), "size=16m,mode=1777".into()),
             ],
+            sysctls: [("net.ipv4.tcp_retries2".to_string(), "6".to_string())].into(),
         }
     );
     let log = spec.log.unwrap();

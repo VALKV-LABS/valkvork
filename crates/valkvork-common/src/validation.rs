@@ -47,6 +47,8 @@ struct RawManifest {
     security: Option<RawSecurity>,
     #[serde(default)]
     logging: Option<RawLogging>,
+    #[serde(default)]
+    sysctls: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -569,6 +571,7 @@ fn canonicalise(raw: RawManifest, out: &mut Vec<ValidationError>) -> Option<Serv
         .map(|r| canonical_security(r, &tmpfs_targets, out, &mut ok))
         .filter(|s| !s.is_default());
     let logging = raw.logging.map(|l| canonical_logging(l, out, &mut ok));
+    let sysctls = canonical_sysctls(raw.sysctls, out, &mut ok);
 
     let spec = ServiceSpec {
         id: raw.service.id,
@@ -613,6 +616,7 @@ fn canonicalise(raw: RawManifest, out: &mut Vec<ValidationError>) -> Option<Serv
         check,
         security,
         logging,
+        sysctls,
     };
     ok.then_some(spec)
 }
@@ -761,6 +765,50 @@ fn canonical_security(
         cap_add,
         tmpfs,
     }
+}
+
+/// The most `[sysctls]` one service may set.
+const MAX_SYSCTLS: usize = 32;
+
+/// `[sysctls]`: kernel parameters of the container's own network namespace
+/// (`net.*`, which Docker sets per container); a value is a number, a word or
+/// a few of them (`"4096 87380 6291456"`).
+fn canonical_sysctls(
+    raw: BTreeMap<String, String>,
+    out: &mut Vec<ValidationError>,
+    ok: &mut bool,
+) -> BTreeMap<String, String> {
+    static NAME: OnceLock<Regex> = OnceLock::new();
+    static VALUE: OnceLock<Regex> = OnceLock::new();
+    let name_re = NAME.get_or_init(|| Regex::new(r"^net(\.[a-z0-9_\-]+)+$").unwrap());
+    let value_re =
+        VALUE.get_or_init(|| Regex::new(r"^[A-Za-z0-9_.:\-]+( [A-Za-z0-9_.:\-]+)*$").unwrap());
+    let mut bad = |field: &str, msg: String| {
+        out.push(ValidationError::new(
+            Code::InvalidSysctlSpec,
+            &format!("sysctls.{field}"),
+            &msg,
+        ));
+        *ok = false;
+    };
+    if raw.len() > MAX_SYSCTLS {
+        bad("", format!("{} sysctls; at most {MAX_SYSCTLS}", raw.len()));
+    }
+    for (name, value) in &raw {
+        if !name_re.is_match(name) {
+            bad(
+                name,
+                format!("{name:?}: only the container's network namespace can be set, a net.* name, e.g. \"net.ipv4.tcp_retries2\""),
+            );
+        }
+        if value.len() > 128 || !value_re.is_match(value) {
+            bad(
+                name,
+                format!("{value:?}: a number or a word, or a few separated by single spaces"),
+            );
+        }
+    }
+    raw
 }
 
 /// Log drivers that send over the network: with Docker's default `blocking`
@@ -1669,6 +1717,47 @@ target_cpu_percent = 75
         );
         let typo = format!("{VALID}\n[security]\nreadonly_root = true\n");
         assert_eq!(err_code(&typo).0, Code::UnknownField);
+    }
+
+    #[test]
+    fn sysctls() {
+        let m = format!(
+            "{VALID}\n[sysctls]\n\"net.ipv4.tcp_retries2\" = \"6\"\n\"net.ipv4.tcp_rmem\" = \"4096 87380 6291456\"\n"
+        );
+        let p = parse_manifest_str(&m).unwrap();
+        assert_eq!(p.spec.sysctls["net.ipv4.tcp_retries2"], "6");
+        assert_eq!(p.spec.sysctls["net.ipv4.tcp_rmem"], "4096 87380 6291456");
+        assert!(p.spec.required_features().contains(&"sysctls"));
+
+        // None is the same spec, and hash, as before the field existed.
+        let none = parse_manifest_str(VALID).unwrap().spec;
+        assert!(none.sysctls.is_empty() && !none.required_features().contains(&"sysctls"));
+        assert!(!serde_json::to_string(&none).unwrap().contains("sysctls"));
+
+        for (line, field) in [
+            ("\"kernel.shmmax\" = \"1\"", "sysctls.kernel.shmmax"),
+            ("\"vm.swappiness\" = \"1\"", "sysctls.vm.swappiness"),
+            ("\"net\" = \"1\"", "sysctls.net"),
+            (
+                "\"net.ipv4.tcp_retries2\" = \"\"",
+                "sysctls.net.ipv4.tcp_retries2",
+            ),
+            (
+                "\"net.ipv4.tcp_retries2\" = \"6; reboot\"",
+                "sysctls.net.ipv4.tcp_retries2",
+            ),
+            (
+                "\"net.ipv4.tcp_retries2\" = \"6  7\"",
+                "sysctls.net.ipv4.tcp_retries2",
+            ),
+        ] {
+            let m = format!("{VALID}\n[sysctls]\n{line}\n");
+            assert_eq!(
+                err_code(&m),
+                (Code::InvalidSysctlSpec, field.into()),
+                "{line}"
+            );
+        }
     }
 
     #[test]

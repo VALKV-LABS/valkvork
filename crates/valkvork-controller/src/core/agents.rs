@@ -213,11 +213,9 @@ impl Core {
             .collect();
         for (wid, status) in missing {
             match status {
-                WorkloadStatus::Assigned => {
-                    // The start was lost (agent restart or partition): re-send.
-                    if !self.outstanding.contains_key(&wid) {
-                        self.queue_start(&wid);
-                    }
+                // The start was lost (agent restart or partition): re-send.
+                WorkloadStatus::Assigned if !self.outstanding.contains_key(&wid) => {
+                    self.queue_start(&wid);
                 }
                 WorkloadStatus::Running => self.fail_workload(&wid, "CONTAINER_MISSING"),
                 WorkloadStatus::Stopping | WorkloadStatus::Lost => {

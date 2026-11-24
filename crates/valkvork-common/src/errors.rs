@@ -74,6 +74,7 @@ pub enum ValidationErrorCode {
     InvalidCheckSpec,
     InvalidSecuritySpec,
     InvalidLoggingSpec,
+    InvalidSysctlSpec,
     UnsatisfiableNow,
 }
 
@@ -91,6 +92,7 @@ impl std::fmt::Display for ValidationErrorCode {
             ValidationErrorCode::InvalidCheckSpec => "INVALID_CHECK_SPEC",
             ValidationErrorCode::InvalidSecuritySpec => "INVALID_SECURITY_SPEC",
             ValidationErrorCode::InvalidLoggingSpec => "INVALID_LOGGING_SPEC",
+            ValidationErrorCode::InvalidSysctlSpec => "INVALID_SYSCTL_SPEC",
             ValidationErrorCode::UnsatisfiableNow => "UNSATISFIABLE_NOW",
         })
     }
