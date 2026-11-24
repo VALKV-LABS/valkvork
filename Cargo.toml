@@ -6,4 +6,5 @@ members = [
     "crates/valkvork-controller",
     "crates/valkvork-agent",
     "crates/valkvork-cli",
+    "crates/valkvork-loadtest",
 ]

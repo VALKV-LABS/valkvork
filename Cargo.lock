@@ -2486,6 +2486,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "valkvork-loadtest"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "http",
+ "http-body",
+ "hyper",
+ "serde_json",
+ "tokio",
+ "tokio-stream",
+ "tonic",
+ "tower",
+ "uuid",
+ "valkvork-common",
+ "valkvork-proto",
+]
+
+[[package]]
 name = "valkvork-proto"
 version = "0.1.0"
 dependencies = [
