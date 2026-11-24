@@ -107,6 +107,8 @@ pub struct ContainerDetails {
     pub state: RunState,
     pub exit_code: i64,
     pub oom_killed: bool,
+    /// Its address on the default bridge network, while it runs.
+    pub ip_address: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -447,11 +449,19 @@ impl ContainerRuntime for DockerRuntime {
             .await
             .map_err(map_err)?;
         let st = r.state.unwrap_or_default();
+        let ip_address = r.network_settings.and_then(|n| {
+            n.networks
+                .and_then(|mut nets| nets.remove("bridge"))
+                .and_then(|b| b.ip_address)
+                .or(n.ip_address)
+                .filter(|ip| !ip.is_empty())
+        });
         Ok(ContainerDetails {
             id: r.id.unwrap_or_default(),
             state: run_state(st.status.map(|s| s.to_string()).as_deref()),
             exit_code: st.exit_code.unwrap_or(0),
             oom_killed: st.oom_killed.unwrap_or(false),
+            ip_address,
         })
     }
 

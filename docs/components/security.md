@@ -23,7 +23,7 @@ What each process runs as, what it can touch, and why. "Golden image" means the 
 |---|---|---|---|---|
 | `valkvork-controller` | Unprivileged `valkvork` user (uid 65532 in the image) | None | Listens on 50051, 50052, 9400. Makes no outbound connections | Its SQLite directory only |
 | `valkvork-agent` | **root** | All (root) | One outbound connection to the controller. Listens on 127.0.0.1:9401 only | `data_dir` (node id, alloc dirs, failure markers). Through Docker: anything a container can be told to do |
-| Workload containers | The image's `USER` (often root inside the container) | Docker's default set | Docker bridge network, host ports bound on all addresses | Their own filesystem, `/alloc`, their host volumes |
+| Workload containers | The image's `USER` (often root inside the container) | Docker's default set | Docker bridge network, host ports bound on the node's address; no instance metadata service unless the manifest allows it | Their own filesystem, `/alloc`, their host volumes |
 | `valkvork` CLI | The operator | None | One outbound connection to the admin API | Nothing |
 | Docker Engine (`dockerd`, `containerd`) | root | All | Unix socket only (must not listen on TCP) | Its data root |
 
@@ -93,7 +93,7 @@ The agent creates containers with:
 | Devices | None |
 | CPU, memory | `NanoCpus` from `resources.cpu`; `Memory = MemorySwap` from `resources.memory`, so no swap |
 | Disk | `/alloc` plus the writable layer, limited by polling (`resources.disk`) |
-| Network | Docker's default bridge; each `host_port` is published on all host addresses |
+| Network | Docker's default bridge; each `host_port` is published on the node's address (agent.toml `default_host_ip`) unless the manifest sets `host_ip`. The metadata service is rejected unless `[security] instance_metadata = true` (see [Instance Metadata](#instance-metadata)) |
 | Mounts | `/alloc` (read-write) and declared host volumes (read-only if either side says so); never the Docker socket |
 | Restart policy | `no`: the agent restarts containers itself |
 | User namespaces | Not configured: root inside a container is uid 0 on the host, confined by namespaces, capabilities and seccomp |
@@ -175,7 +175,21 @@ The Docker socket gives root on the host (FR-SEC-06). Only the agent uses it; do
 - **The controller never sees a value.** It stores and sends only references (`ssm:…`, `file:…`). The database, the API, the CLI, the UI and events show the reference.
 - **The agent resolves them at container start.** For `ssm:` it runs the AWS CLI with the node's instance role. `file:` references are allowed only inside agent.toml `secrets.file_dirs`, and are off by default, because the agent runs as root. Values are never logged, written to disk by Valkvork, or reported back. Errors name the reference and the cause.
 - **On the node, values are ordinary environment variables.** Root can read them with `docker inspect`, and the workload's processes and their children can read them. Delivery as files on an in-memory filesystem, which avoids both, is planned.
-- **Containers share the node's role.** A container can reach the instance metadata service and use the node's role, so any workload on a node can read every parameter that role may read. On a node that also runs the controller, that includes the controller's own secrets. Run only trusted workloads there, and give each node group's role only the prefixes its workloads need.
+- **Containers that may reach the metadata service share the node's role.** By default the agent blocks containers from the instance metadata service (see [Instance Metadata](#instance-metadata)). A workload with `[security] instance_metadata = true` can still use the node's role, and so read every parameter that role may read; on a node that also runs the controller, that includes the controller's own secrets. Give each node group's role only the prefixes its workloads need.
+
+## Instance Metadata
+
+Without a rule, every container on a node can reach the cloud metadata service at 169.254.169.254 and get the node's instance-role credentials. With agent.toml `[instance_metadata] block = true` (the default), the agent keeps an iptables chain, `VALKVORK-IMDS`, jumped to from the top of Docker's `DOCKER-USER` chain:
+
+```
+-A VALKVORK-IMDS -s <container address>/32 -d 169.254.169.254/32 -j RETURN   # one per allowed container
+-A VALKVORK-IMDS -i docker0 -d 169.254.169.254/32 -j REJECT
+```
+
+- **Who is allowed.** Running containers labelled `valkvork.instance_metadata=true`, which the agent sets for manifests with `[security] instance_metadata = true`. Everything else on the bridge gets "connection refused" at once, so SDKs fall through their credential chain quickly instead of timing out.
+- **How it stays right.** The agent rewrites the whole chain with `iptables-restore --noflush` (atomic) from what Docker reports: after each start, before each stop (leaving the stopping container out, so its address is not let through once Docker reuses it), after a container dies, and every 10 s. It re-adds the jump if a Docker or firewall restart removed it. A chain left by an earlier run is kept until the agent's first sync.
+- **Requirements.** iptables on the node, using the same backend as Docker (`iptables` is iptables-nft on Ubuntu 22.04), and Docker managing iptables (so `DOCKER-USER` exists). Without them the agent refuses to start; set `block = false` to run without the rule (the agent then logs a warning). `make dev-up` sets it off, since macOS has no iptables for the Docker VM.
+- **Limits.** It filters the default bridge only, which is the only network Valkvork uses. The agent itself, dockerd (ECR pulls, the `awslogs` driver) and `ssm:` secret resolution run on the host and are not affected. IPv6 metadata (`fd00:ec2::254`) is not filtered; it is off unless the instance enables it and Docker has IPv6. On AWS, IMDSv2 with a hop limit of 1 blocks the bridge too, but for every container; this rule lets chosen workloads through.
 
 ## Network
 

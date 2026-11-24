@@ -36,7 +36,7 @@ name           = "http"
 container_port = 80
 host_port      = 8080          # static host port: one replica per node
 # host_ip      = "advertise"   # bind address: an IP, or "advertise" for the node's address.
-                               # Unset: every address (0.0.0.0)
+                               # Unset: the agent's default_host_ip ("advertise" unless changed)
 
 [[volumes]]
 type      = "host"             # "host" (a node's directory) or "ephemeral" (the workload's own)
@@ -87,20 +87,20 @@ options = { awslogs-group = "/valkv/dev", awslogs-stream = "${service.id}-${node
 |---|---|
 | `service.kill_timeout` | `"10s"` |
 | `service.entrypoint`, `service.command` | the image's `ENTRYPOINT` and `CMD` |
-| `ports.host_ip` | every address (`0.0.0.0`) |
+| `ports.host_ip` | the agent's `default_host_ip`: `"advertise"`, the node's address, unless agent.toml changes it |
 | `resources.disk` | `"1GiB"` |
 | `constraints.required_class` | none: any node |
 | `check.path`, `check.interval`, `check.timeout`, `check.failures`, `check.grace` | `"/"` (http), `"10s"`, `"2s"`, `3`, `"0s"` |
 | `update.max_parallel`, `update.min_healthy_time` | `1`, `"10s"` |
 | `restart.attempts`, `restart.interval`, `restart.delay` | `3`, `"5m"`, `"5s"` |
-| `security.*` | Docker's defaults: writable root, its default capabilities, no `no-new-privileges`, no tmpfs |
+| `security.*` | Docker's defaults: writable root, its default capabilities, no `no-new-privileges`, no tmpfs. `instance_metadata = false`: no access to the metadata service where the agent blocks it |
 | `logging` | the node's Docker default (the golden image sets `local`, 50 MB × 3) |
 
 Durations are `<n>s`, `<n>m`, `<n>h`, or a bare number of seconds. Sizes are an integer with an IEC unit, or a bare number of bytes. `examples/` has ready-to-apply manifests.
 
 `command` and `entrypoint` follow Docker Compose: `command` replaces the image's default arguments (`CMD`) and keeps its `ENTRYPOINT`, which is what most images, such as `postgres`, expect. Set `entrypoint` only to replace the program itself.
 
-`host_ip = "advertise"` publishes the port on the address the agent reports to the controller (agent.toml `advertise_ip`, or the address it reaches the controller from). Use it on instances with public IPs, so a port is reachable on the private network only. `host_ip = "127.0.0.1"` keeps a port on the node itself. A port's host address does not change the scheduler's view: a `host_port` is still taken on the node whatever address it binds.
+`host_ip = "advertise"` publishes the port on the address the agent reports to the controller (agent.toml `advertise_ip`, or the address it reaches the controller from), so on instances with public IPs a port is reachable on the private network only. It is the default: a port without `host_ip` uses agent.toml `default_host_ip`, which is `"advertise"` unless the node changes it. `host_ip = "0.0.0.0"` publishes on every address, including `127.0.0.1` and a public IP. `host_ip = "127.0.0.1"` keeps a port on the node itself. A port's host address does not change the scheduler's view: a `host_port` is still taken on the node whatever address it binds.
 
 ### Health Checks
 
@@ -135,8 +135,9 @@ An ephemeral volume counts against `[resources] disk` together with `/alloc`, an
 | `no_new_privileges` | `SecurityOpt: no-new-privileges:true` | setuid binaries and file capabilities can't raise the process's privileges |
 | `cap_drop`, `cap_add` | `CapDrop`, `CapAdd` | Capability names as in capabilities(7), with or without `CAP_`, any case; stored upper case without the prefix. `ALL` only in `cap_drop`. `cap_drop = ["ALL"]` with a short `cap_add` is the usual form |
 | `tmpfs` | `Tmpfs` | An absolute path, optionally followed by `:` and mount options (`size=64m,mode=1777`). Memory in a tmpfs counts against the container's `memory` limit |
+| `instance_metadata` | (agent iptables rule) | `true` lets the container reach the cloud metadata service, 169.254.169.254, and so use the node's instance role. Agents block it by default (agent.toml `[instance_metadata] block`); see [security.md](security.md#instance-metadata). Set it only for workloads that call AWS with the node's role |
 
-Health checks of type `exec` run with the same restrictions. A workload with `[security]` needs an agent with the `security` feature; with every setting off, the block is the same as leaving it out (no new hash).
+Health checks of type `exec` run with the same restrictions. A workload with hardening settings needs an agent with the `security` feature; `instance_metadata` alone does not, since an agent without it does not block the service either. With every setting off, the block is the same as leaving it out (no new hash).
 
 Validation (`INVALID_SECURITY_SPEC`) rejects an unknown capability, `ALL` in `cap_add`, a capability in both lists, and a `tmpfs` path that is relative, repeated, under `/alloc` or a volume's `target`. See `examples/hardened.toml`.
 

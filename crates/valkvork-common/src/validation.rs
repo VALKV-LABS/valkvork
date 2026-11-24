@@ -59,6 +59,7 @@ struct RawSecurity {
     cap_drop: Vec<String>,
     cap_add: Vec<String>,
     tmpfs: Vec<String>,
+    instance_metadata: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -764,6 +765,7 @@ fn canonical_security(
         cap_drop,
         cap_add,
         tmpfs,
+        instance_metadata: r.instance_metadata,
     }
 }
 
@@ -1681,6 +1683,13 @@ target_cpu_percent = 75
         assert_eq!(s.cap_add, ["CHOWN", "NET_BIND_SERVICE"]);
         assert_eq!(s.tmpfs, ["/tmp", "/run:size=16m,mode=1777"]);
         assert!(p.spec.required_features().contains(&"security"));
+
+        // instance_metadata alone needs no hardening feature from the agent.
+        let im = format!("{VALID}\n[security]\ninstance_metadata = true\n");
+        let p = parse_manifest_str(&im).unwrap();
+        assert!(p.spec.security.as_ref().unwrap().instance_metadata);
+        assert!(!p.spec.required_features().contains(&"security"));
+        assert_ne!(p.spec, parse_manifest_str(VALID).unwrap().spec);
 
         // Every setting off is the same spec, and hash, as no [security].
         let off = format!("{VALID}\n[security]\nread_only_root = false\ncap_drop = []\n");

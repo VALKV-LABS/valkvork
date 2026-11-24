@@ -144,6 +144,7 @@ message ContainerSecurity {
   repeated string cap_drop = 3;        // "ALL" drops every capability
   repeated string cap_add = 4;
   repeated string tmpfs = 5;           // "/tmp" or "/tmp:size=64m,mode=1777"
+  bool instance_metadata = 6;          // may reach 169.254.169.254 where the agent blocks it
 }
 
 // The container's log driver. Option values may contain ${node.NAME},
