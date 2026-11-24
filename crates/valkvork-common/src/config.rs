@@ -216,6 +216,37 @@ pub struct AgentConfig {
     pub secrets: SecretsConfig,
     /// Service discovery: DNS for `<service>.<domain>` on the node.
     pub discovery: DiscoveryConfig,
+    /// Where a port is published when its manifest sets no `host_ip`:
+    /// `"advertise"` (the node's address, the default), `"0.0.0.0"` (every
+    /// address, as before this setting), or an IP.
+    pub default_host_ip: String,
+    /// Containers' access to the cloud instance metadata service.
+    pub instance_metadata: InstanceMetadataConfig,
+}
+
+/// agent.toml `[instance_metadata]`. With `block`, the agent drops traffic
+/// from the Docker bridge to 169.254.169.254, except from containers whose
+/// manifest sets `[security] instance_metadata = true`, so a workload cannot
+/// use the node's role unless it asks to.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct InstanceMetadataConfig {
+    pub block: bool,
+    /// The iptables command; it must drive the same backend as Docker's
+    /// (`iptables` on Ubuntu, which is iptables-nft).
+    pub iptables: String,
+    /// The bridge interface whose traffic is filtered.
+    pub bridge: String,
+}
+
+impl Default for InstanceMetadataConfig {
+    fn default() -> Self {
+        Self {
+            block: true,
+            iptables: "iptables".to_string(),
+            bridge: "docker0".to_string(),
+        }
+    }
 }
 
 impl Default for AgentConfig {
@@ -236,6 +267,8 @@ impl Default for AgentConfig {
             host_volumes: BTreeMap::new(),
             secrets: SecretsConfig::default(),
             discovery: DiscoveryConfig::default(),
+            default_host_ip: "advertise".to_string(),
+            instance_metadata: InstanceMetadataConfig::default(),
         }
     }
 }
@@ -290,6 +323,27 @@ impl AgentConfig {
                     )));
                 }
             }
+        }
+        if self.default_host_ip != "advertise"
+            && self.default_host_ip.parse::<std::net::IpAddr>().is_err()
+        {
+            return Err(ValkvorkError::Config(format!(
+                "default_host_ip {:?} must be \"advertise\" or an IP address such as \"0.0.0.0\"",
+                self.default_host_ip
+            )));
+        }
+        let im = &self.instance_metadata;
+        if im.block
+            && (im.iptables.trim().is_empty()
+                || im.bridge.is_empty()
+                || !im
+                    .bridge
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || "-_.".contains(c)))
+        {
+            return Err(ValkvorkError::Config(
+                "instance_metadata: iptables and bridge must be set".into(),
+            ));
         }
         if let Some(addr) = self.metrics_listen_addr {
             if !addr.ip().is_loopback() {

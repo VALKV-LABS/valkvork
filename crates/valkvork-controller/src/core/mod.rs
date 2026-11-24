@@ -531,6 +531,7 @@ impl Core {
                         cap_drop: x.cap_drop.clone(),
                         cap_add: x.cap_add.clone(),
                         tmpfs: x.tmpfs.clone(),
+                        instance_metadata: x.instance_metadata,
                     }),
                     sysctls: s
                         .sysctls

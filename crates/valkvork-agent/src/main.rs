@@ -105,6 +105,19 @@ async fn run(args: Args) -> Result<(), ValkvorkError> {
     let protected_paths = rt.data_root().await.into_iter().collect();
     let endpoints = valkvork_agent::discovery::Endpoints::load(&cfg.data_dir);
     let dns = start_discovery(&cfg, &rt, &endpoints).await?;
+    let metadata = if cfg.instance_metadata.block {
+        let im = &cfg.instance_metadata;
+        let g = valkvork_agent::metadata::MetadataGuard::install(&im.iptables, &im.bridge)
+            .await
+            .map_err(ValkvorkError::Config)?;
+        tracing::info!(bridge = %im.bridge, "containers are blocked from the instance metadata service unless their manifest allows it");
+        Some(Arc::new(g))
+    } else {
+        tracing::warn!(
+            "[instance_metadata] block is off: every container can use the node's cloud role"
+        );
+        None
+    };
     let supervisor = Supervisor::new(
         rt,
         SupervisorConfig {
@@ -114,6 +127,12 @@ async fn run(args: Args) -> Result<(), ValkvorkError> {
             protected_paths,
             host_volumes: cfg.host_volumes.clone(),
             advertise_ip: node.ip_address.clone(),
+            // "0.0.0.0" keeps Docker's own default: every address.
+            default_host_ip: match cfg.default_host_ip.as_str() {
+                "0.0.0.0" => String::new(),
+                other => other.to_string(),
+            },
+            metadata,
             node_id: node.node_id.clone(),
             node_class: cfg.node_class.clone(),
             hostname: node.hostname.clone(),

@@ -896,6 +896,9 @@ pub fn spec_to_toml(s: &valkvork_common::models::ServiceSpec) -> String {
             toml_list(&x.cap_add),
             toml_list(&x.tmpfs)
         );
+        if x.instance_metadata {
+            o.push_str("instance_metadata = true\n");
+        }
     }
     if let Some(l) = &s.logging {
         let _ = writeln!(o, "\n[logging]\ndriver = {:?}", l.driver);

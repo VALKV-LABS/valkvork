@@ -9,6 +9,7 @@
 //! restart-on-failure, which the policy delegates to it (FR-AGE-05).
 
 use crate::health::{CheckKind, Probe};
+use crate::metadata::LABEL_INSTANCE_METADATA;
 use crate::runtime::{
     BindMount, ContainerRuntime, ContainerSpec, PublishedPort, RunState, RuntimeEvent,
     LABEL_WORKLOAD,
@@ -163,6 +164,12 @@ pub struct SupervisorConfig {
     /// The address reported to the controller; ports with
     /// `host_ip = "advertise"` are published on it.
     pub advertise_ip: String,
+    /// The bind address of ports whose manifest sets no `host_ip`:
+    /// "advertise", an IP, or empty for every address.
+    pub default_host_ip: String,
+    /// Blocks containers from the instance metadata service; None when
+    /// agent.toml `[instance_metadata] block` is off.
+    pub metadata: Option<Arc<crate::metadata::MetadataGuard>>,
     /// This node's id, class and hostname, for `${node.NAME}` in [env].
     pub node_id: String,
     pub node_class: String,
@@ -365,7 +372,7 @@ impl Supervisor {
         for wid in created {
             // Agent died between create and start: finish the start.
             if let Some(cid) = self.container_of(&wid) {
-                let ok = self.rt.start(&cid).await.is_ok();
+                let ok = self.start_container(&cid).await.is_ok();
                 let mut map = self.workloads.lock().unwrap();
                 if let Some(l) = map.get_mut(&wid) {
                     if ok {
@@ -630,7 +637,7 @@ impl Supervisor {
         env.push(("VALKVORK_SERVICE_ID".into(), cmd.service_id.clone()));
         let mut ports = Vec::with_capacity(cmd.ports.len());
         for p in &cmd.ports {
-            let host_ip = match p.host_ip.as_str() {
+            let host_ip = match self.host_ip_of(&p.host_ip) {
                 "" => None,
                 "advertise" if self.cfg.advertise_ip.is_empty() => {
                     return Err((
@@ -656,6 +663,9 @@ impl Supervisor {
         };
         if let Some(p) = &probe {
             labels.insert(LABEL_CHECK.to_string(), p.to_label());
+        }
+        if cmd.security.as_ref().is_some_and(|s| s.instance_metadata) {
+            labels.insert(LABEL_INSTANCE_METADATA.to_string(), "true".to_string());
         }
         let mut security = cmd
             .security
@@ -733,11 +743,65 @@ impl Supervisor {
         if self.is_stopping(wid) {
             return Ok(cid);
         }
-        self.rt
-            .start(&cid)
+        self.start_container(&cid)
             .await
             .map_err(|e| ("START_FAILED".to_string(), e.to_string()))?;
         Ok(cid)
+    }
+
+    /// The bind address for a port's manifest `host_ip`: its own, or
+    /// agent.toml's `default_host_ip` when it sets none.
+    fn host_ip_of<'a>(&'a self, manifest: &'a str) -> &'a str {
+        if manifest.is_empty() {
+            &self.cfg.default_host_ip
+        } else {
+            manifest
+        }
+    }
+
+    /// Start a container, then let it through to the metadata service if
+    /// it may reach it (it has an address only once started).
+    async fn start_container(&self, cid: &str) -> Result<(), RuntimeError> {
+        self.rt.start(cid).await?;
+        self.sync_metadata(None).await;
+        Ok(())
+    }
+
+    /// Rewrite the metadata service rules from the running containers
+    /// labelled for it, leaving out `exclude` (a container about to stop, so
+    /// its address is not let through once Docker gives it to another).
+    pub async fn sync_metadata(&self, exclude: Option<&str>) {
+        let Some(g) = &self.cfg.metadata else { return };
+        let mut last = g.lock.lock().await;
+        let list = match self.rt.list_by_label(LABEL_WORKLOAD).await {
+            Ok(l) => l,
+            Err(e) => {
+                tracing::warn!(error = %e, "metadata rules: cannot list containers; unchanged");
+                return;
+            }
+        };
+        let mut allowed = Vec::new();
+        for c in list {
+            let opted_in =
+                c.labels.get(LABEL_INSTANCE_METADATA).map(String::as_str) == Some("true");
+            if !opted_in || c.state != RunState::Running || Some(c.id.as_str()) == exclude {
+                continue;
+            }
+            if let Ok(Some(ip)) = self.rt.inspect(&c.id).await.map(|d| d.ip_address) {
+                allowed.push(ip);
+            }
+        }
+        allowed.sort();
+        allowed.dedup();
+        match g.apply(&allowed).await {
+            Ok(()) => {
+                if last.as_ref() != Some(&allowed) {
+                    tracing::info!(allowed = ?allowed, "instance metadata rules updated");
+                    *last = Some(allowed);
+                }
+            }
+            Err(e) => tracing::error!(error = %e, "cannot update the instance metadata rules"),
+        }
     }
 
     /// Apply each host volume's `owner` and `mode` from agent.toml, creating
@@ -854,6 +918,7 @@ impl Supervisor {
                 .then(|| l.service_id.clone())
         });
         let id = container_id.unwrap_or_else(|| format!("vk-{wid}"));
+        self.sync_metadata(Some(&id)).await;
         if let Err(e) = self.rt.stop(&id, timeout).await {
             tracing::warn!(workload = wid, error = %e, "stop failed; removing forcibly");
         }
@@ -965,7 +1030,7 @@ impl Supervisor {
                 }
                 return;
             };
-            let result = me.rt.start(&cid).await;
+            let result = me.start_container(&cid).await;
             let mut map = me.workloads.lock().unwrap();
             let Some(l) = map.get_mut(&wid) else { return };
             if l.state != WorkloadState::Restarting || l.stopping {
@@ -1030,6 +1095,7 @@ impl Supervisor {
                         if ours {
                             self.handle_exit(&workload_id, exit_code as i32);
                         }
+                        self.sync_metadata(None).await;
                     }
                     Err(e) => {
                         tracing::warn!(error = %e, "runtime event stream failed");
@@ -1043,6 +1109,7 @@ impl Supervisor {
 
     /// Safety net for missed events: compare RUNNING entries with reality.
     async fn resync(self: &Arc<Self>) {
+        self.sync_metadata(None).await;
         let Ok(list) = self.rt.list_by_label(LABEL_WORKLOAD).await else {
             return;
         };
@@ -1154,6 +1221,7 @@ impl Supervisor {
                     over.then(|| (l.container_id.clone(), l.kill_timeout))
                 };
                 if let Some((Some(cid), timeout)) = exceeded {
+                    self.sync_metadata(Some(&cid)).await;
                     let _ = self.rt.stop(&cid, timeout).await;
                 }
             }
@@ -1225,7 +1293,7 @@ impl Supervisor {
                     c.port_name
                 ))
             })?;
-        let ip: std::net::IpAddr = match port.host_ip.as_str() {
+        let ip: std::net::IpAddr = match self.host_ip_of(&port.host_ip) {
             "" | "0.0.0.0" => std::net::Ipv4Addr::LOCALHOST.into(),
             "::" => std::net::Ipv6Addr::LOCALHOST.into(),
             "advertise" => self

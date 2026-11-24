@@ -108,10 +108,16 @@ data_dir            = "$DEV/data"
 docker_socket       = "$sock"
 registry_auth_file  = "$DEV/registry-auth.json"
 metrics_listen_addr = "127.0.0.1:$AGENT_METRICS_PORT"
+# Ports bind every address in the Docker VM, as before default_host_ip.
+default_host_ip     = "0.0.0.0"
 
 [reserved]
 cpu    = 0.5
 memory = "512MiB"
+
+# This host has no iptables for the Docker VM's bridge: no metadata rules.
+[instance_metadata]
+block = false
 
 # Manifests' [secrets] may use file: references to files in .dev/secrets/.
 [secrets]
@@ -321,6 +327,10 @@ data_dir            = "$dir/data"
 docker_socket       = "$sock"
 registry_auth_file  = "$DEV/registry-auth.json"
 metrics_listen_addr = "127.0.0.1:$mport"
+default_host_ip     = "0.0.0.0"
+
+[instance_metadata]
+block = false
 
 [reserved]
 cpu    = 0.25

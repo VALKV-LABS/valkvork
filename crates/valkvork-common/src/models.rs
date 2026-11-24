@@ -310,11 +310,26 @@ pub struct SecuritySpec {
     /// Writable in-memory mounts: `"/tmp"` or `"/tmp:size=64m,mode=1777"`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tmpfs: Vec<String>,
+    /// The container may reach the instance metadata service, and so use
+    /// the node's cloud role. Agents that block it (agent.toml
+    /// `[instance_metadata] block`) let only these containers through.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub instance_metadata: bool,
 }
 
 impl SecuritySpec {
     pub fn is_default(&self) -> bool {
         *self == SecuritySpec::default()
+    }
+
+    /// Whether the agent must apply hardening settings (the `security`
+    /// feature). `instance_metadata` alone needs nothing: an agent that does
+    /// not know it does not block the metadata service either.
+    pub fn needs_hardening(&self) -> bool {
+        SecuritySpec {
+            instance_metadata: false,
+            ..self.clone()
+        } != SecuritySpec::default()
     }
 }
 
@@ -478,7 +493,7 @@ impl ServiceSpec {
         if self.volumes.iter().any(|v| v.kind == "ephemeral") {
             f.push("ephemeral_volumes");
         }
-        if self.security.is_some() {
+        if self.security.as_ref().is_some_and(|s| s.needs_hardening()) {
             f.push("security");
         }
         if self.logging.is_some() {
