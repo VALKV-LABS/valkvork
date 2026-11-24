@@ -532,6 +532,7 @@ impl Core {
                         cap_add: x.cap_add.clone(),
                         tmpfs: x.tmpfs.clone(),
                         instance_metadata: x.instance_metadata,
+                        pids_limit: x.pids_limit.unwrap_or(0),
                     }),
                     sysctls: s
                         .sysctls

@@ -237,6 +237,7 @@ fn supervisor_with_secrets(rt: Arc<Fake>, dir: &Path) -> Arc<Supervisor> {
             advertise_ip: "10.0.0.5".into(),
             default_host_ip: String::new(),
             metadata: None,
+            default_pids_limit: 0,
             node_id: "node-1".into(),
             node_class: "app".into(),
             hostname: "host-1".into(),
@@ -264,6 +265,7 @@ fn supervisor(rt: Arc<Fake>, dir: &Path) -> Arc<Supervisor> {
             advertise_ip: "10.0.0.5".into(),
             default_host_ip: String::new(),
             metadata: None,
+            default_pids_limit: 0,
             node_id: "node-1".into(),
             node_class: "app".into(),
             hostname: "host-1".into(),
@@ -462,6 +464,7 @@ async fn forbidden_host_volume_is_refused() {
             advertise_ip: "10.0.0.5".into(),
             default_host_ip: String::new(),
             metadata: None,
+            default_pids_limit: 0,
             node_id: "node-1".into(),
             node_class: "app".into(),
             hostname: "host-1".into(),
@@ -560,6 +563,7 @@ fn supervisor_with(dir: &Path, vols: Vec<(&str, HostVolume)>) -> Arc<Supervisor>
             advertise_ip: "10.0.0.5".into(),
             default_host_ip: String::new(),
             metadata: None,
+            default_pids_limit: 0,
             node_id: "node-1".into(),
             node_class: "app".into(),
             hostname: "host-1".into(),
@@ -688,6 +692,7 @@ async fn default_bind_address_and_metadata_label() {
             advertise_ip: "10.0.0.5".into(),
             default_host_ip: "advertise".into(),
             metadata: None,
+            default_pids_limit: 0,
             node_id: "node-1".into(),
             node_class: "app".into(),
             hostname: "host-1".into(),
@@ -1184,6 +1189,7 @@ async fn containers_use_the_discovery_dns() {
         advertise_ip: "10.0.0.5".into(),
         default_host_ip: String::new(),
         metadata: None,
+        default_pids_limit: 4096,
         node_id: "node-1".into(),
         node_class: "app".into(),
         hostname: "host-1".into(),
@@ -1200,6 +1206,8 @@ async fn containers_use_the_discovery_dns() {
     s.start(start_cmd("w1", 3)).await.unwrap();
     settle().await;
     assert_eq!(rt.last_created().dns, ["172.17.0.1"]);
+    // No [security] pids_limit: the agent's default_pids_limit.
+    assert_eq!(rt.last_created().security.pids_limit, Some(4096));
     // Endpoints from the controller reach the store.
     s.update_endpoints(pb::Endpoints {
         version: 1,
@@ -1235,6 +1243,7 @@ async fn security_and_logging() {
         cap_add: vec!["NET_BIND_SERVICE".into()],
         tmpfs: vec!["/tmp".into(), "/run:size=16m,mode=1777".into()],
         instance_metadata: false,
+        pids_limit: 256,
     });
     cmd.logging = Some(pb::LogConfig {
         driver: "awslogs".into(),
@@ -1264,6 +1273,7 @@ async fn security_and_logging() {
                 ("/run".into(), "size=16m,mode=1777".into()),
             ],
             sysctls: [("net.ipv4.tcp_retries2".to_string(), "6".to_string())].into(),
+            pids_limit: Some(256),
         }
     );
     let log = spec.log.unwrap();

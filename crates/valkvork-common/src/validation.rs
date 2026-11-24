@@ -60,6 +60,7 @@ struct RawSecurity {
     cap_add: Vec<String>,
     tmpfs: Vec<String>,
     instance_metadata: bool,
+    pids_limit: Option<i64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -759,6 +760,17 @@ fn canonical_security(
             format!("{path}:{opts}")
         });
     }
+    let pids_limit = r.pids_limit.and_then(|n| {
+        if (MIN_PIDS_LIMIT..=MAX_PIDS_LIMIT).contains(&n) {
+            Some(n as u32)
+        } else {
+            bad(
+                "pids_limit",
+                format!("{n}: between {MIN_PIDS_LIMIT} and {MAX_PIDS_LIMIT} processes and threads"),
+            );
+            None
+        }
+    });
     SecuritySpec {
         read_only_root: r.read_only_root,
         no_new_privileges: r.no_new_privileges,
@@ -766,8 +778,14 @@ fn canonical_security(
         cap_add,
         tmpfs,
         instance_metadata: r.instance_metadata,
+        pids_limit,
     }
 }
+
+/// `[security] pids_limit` bounds. Below 16 even a shell and its pipeline
+/// fail; the top is the kernel's default `pid_max` on 64-bit hosts.
+const MIN_PIDS_LIMIT: i64 = 16;
+const MAX_PIDS_LIMIT: i64 = 4_194_304;
 
 /// The most `[sysctls]` one service may set.
 const MAX_SYSCTLS: usize = 32;
@@ -1671,6 +1689,24 @@ target_cpu_percent = 75
         assert_eq!(err_code(&bad), (Code::InvalidResourceSpec, "env.X".into()));
     }
 
+    /// Every manifest in examples/ is valid.
+    #[test]
+    fn examples_parse() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples");
+        let mut n = 0;
+        for e in std::fs::read_dir(&dir).unwrap() {
+            let path = e.unwrap().path();
+            if path.extension().is_some_and(|x| x == "toml") {
+                let text = std::fs::read_to_string(&path).unwrap();
+                if let Err(e) = parse_manifest_str(&text) {
+                    panic!("{}: {e:?}", path.display());
+                }
+                n += 1;
+            }
+        }
+        assert!(n >= 5, "found only {n} examples in {}", dir.display());
+    }
+
     #[test]
     fn security() {
         let m = format!(
@@ -1683,6 +1719,26 @@ target_cpu_percent = 75
         assert_eq!(s.cap_add, ["CHOWN", "NET_BIND_SERVICE"]);
         assert_eq!(s.tmpfs, ["/tmp", "/run:size=16m,mode=1777"]);
         assert!(p.spec.required_features().contains(&"security"));
+
+        // pids_limit needs its own agent feature, not `security`.
+        let pl = format!("{VALID}\n[security]\npids_limit = 512\n");
+        let p = parse_manifest_str(&pl).unwrap();
+        assert_eq!(p.spec.security.as_ref().unwrap().pids_limit, Some(512));
+        let f = p.spec.required_features();
+        assert!(f.contains(&"pids_limit") && !f.contains(&"security"));
+        for bad in [
+            "pids_limit = 8",
+            "pids_limit = 0",
+            "pids_limit = -1",
+            "pids_limit = 5000000",
+        ] {
+            let m = format!("{VALID}\n[security]\n{bad}\n");
+            assert_eq!(
+                err_code(&m),
+                (Code::InvalidSecuritySpec, "security.pids_limit".into()),
+                "{bad}"
+            );
+        }
 
         // instance_metadata alone needs no hardening feature from the agent.
         let im = format!("{VALID}\n[security]\ninstance_metadata = true\n");

@@ -133,6 +133,7 @@ async fn run(args: Args) -> Result<(), ValkvorkError> {
                 other => other.to_string(),
             },
             metadata,
+            default_pids_limit: cfg.default_pids_limit,
             node_id: node.node_id.clone(),
             node_class: cfg.node_class.clone(),
             hostname: node.hostname.clone(),

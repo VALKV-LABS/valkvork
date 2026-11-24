@@ -170,6 +170,8 @@ pub struct SupervisorConfig {
     /// Blocks containers from the instance metadata service; None when
     /// agent.toml `[instance_metadata] block` is off.
     pub metadata: Option<Arc<crate::metadata::MetadataGuard>>,
+    /// `PidsLimit` for containers whose manifest sets none; 0: no limit.
+    pub default_pids_limit: u32,
     /// This node's id, class and hostname, for `${node.NAME}` in [env].
     pub node_id: String,
     pub node_class: String,
@@ -684,8 +686,12 @@ impl Supervisor {
                     })
                     .collect(),
                 sysctls: HashMap::new(),
+                pids_limit: (x.pids_limit > 0).then_some(x.pids_limit),
             })
             .unwrap_or_default();
+        if security.pids_limit.is_none() && self.cfg.default_pids_limit > 0 {
+            security.pids_limit = Some(self.cfg.default_pids_limit);
+        }
         security.sysctls = cmd
             .sysctls
             .iter()

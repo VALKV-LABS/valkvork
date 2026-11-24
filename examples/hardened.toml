@@ -12,6 +12,8 @@
 #   - tmpfs: in-memory writable paths, for an image that writes outside its
 #     volumes (here nginx's pid file and temp files in /tmp). Options follow
 #     a colon; the memory counts against [resources] memory.
+#   - pids_limit: at most this many processes and threads; without it the
+#     agent's default_pids_limit (4096) applies.
 #   - instance_metadata (not set here, so false): the container can't reach
 #     the cloud metadata service, 169.254.169.254, on agents that block it
 #     (the default). Set it to true only for a workload that calls AWS with
@@ -52,3 +54,4 @@ no_new_privileges = true
 cap_drop          = ["ALL"]
 cap_add           = []
 tmpfs             = ["/tmp:size=16m"]
+pids_limit        = 256
