@@ -137,6 +137,10 @@ Each agent reports, in `Register`:
 | **3. EBS and fencing** | The EC2 client (SigV4, IMDSv2 credentials), the `aws-ebs` driver, fencing; IAM for the controller's role in valkv-platform-infra; verified on a dev cell: create, move after a node is stopped, force-detach from a partitioned node | Yes |
 | **4. Operations** | `valkvork volume list/delete`, the UI's Volumes page, `iops`/`throughput`, I/O limits (FR-STO-15), metrics, docs | No |
 
+## Verified
+
+On AWS on 2026-11-25 (cell `aws-us-west-1-valkvork`, this code baked into the golden image): agents reported `us-west-1a` and their real instance ids from IMDSv2; with the `local` driver, a block volume was created in the node's zone, attached to its instance, mounted read-write, and kept its data across a stop-first update. Moving a volume between nodes and fencing need real disks (stage 3) and are covered by unit tests until then.
+
 ## Open Questions
 
 - **Delete with the service.** A `[[volumes]] delete_with_service = true` for scratch data, later, if wanted.
