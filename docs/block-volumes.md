@@ -1,6 +1,6 @@
 # Block Volumes (Design)
 
-*Spec §7.3, FR-STO-10 … FR-STO-15. Status: design; built in the stages at the end.*
+*Spec §7.3, FR-STO-10 … FR-STO-15. Status: stage 1 built (topology and the model); stages 2 to 4 to come.*
 
 Host volumes are directories that never leave their node, so a stateful service is pinned to one VM: if it dies, the service waits for it (see [placement-and-storage.md](placement-and-storage.md)). Block volumes are cloud disks (AWS EBS first) that Valkvork creates, attaches to whichever node runs the workload, and moves to another node when that one fails, without ever letting two nodes write to the same disk.
 

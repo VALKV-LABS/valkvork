@@ -26,6 +26,11 @@ pub struct NodeCapacity {
     pub per_service: HashMap<String, u32>,
     /// Host volume name -> workloads using it, as (single-writer, all).
     pub volume_users: HashMap<String, (u32, u32)>,
+    /// Availability zone; empty off a cloud.
+    pub zone: String,
+    pub max_block_volumes: u32,
+    /// Block volumes attached here, or to be by placements in this pass.
+    pub block_volumes: HashSet<String>,
 }
 
 impl NodeCapacity {
@@ -52,6 +57,9 @@ impl NodeCapacity {
             used_ports: HashSet::new(),
             per_service: HashMap::new(),
             volume_users: HashMap::new(),
+            zone: String::new(),
+            max_block_volumes: 0,
+            block_volumes: HashSet::new(),
         }
     }
 
@@ -71,6 +79,12 @@ impl NodeCapacity {
 #[derive(Debug, Clone, Default)]
 pub struct Snapshot {
     pub nodes: BTreeMap<String, NodeCapacity>,
+    /// Block volume name -> the zone it is in, or will be created in by a
+    /// placement in this pass.
+    pub block_zones: HashMap<String, String>,
+    /// Block volume name -> live workloads using it, on any node: block
+    /// volumes are single-writer cluster-wide.
+    pub block_users: HashMap<String, u32>,
 }
 
 /// Why a placement failed, rendered into `status_reason`.
@@ -90,6 +104,10 @@ struct Rejections {
     volume_busy_count: usize,
     feature: Option<&'static str>,
     feature_count: usize,
+    no_zone: usize,
+    zone: Option<(String, String)>,
+    zone_count: usize,
+    block_slots: usize,
 }
 
 impl NodeCapacity {
@@ -98,11 +116,29 @@ impl NodeCapacity {
         self.features = features.iter().cloned().collect();
         self
     }
+
+    /// The zone and block-volume slots the node's agent reported.
+    pub fn with_topology(mut self, zone: &str, max_block_volumes: u32) -> Self {
+        self.zone = zone.to_string();
+        self.max_block_volumes = max_block_volumes;
+        self
+    }
 }
 
 impl Snapshot {
     /// Record a reservation (a placed or already-running workload).
     pub fn reserve(&mut self, node_id: &str, spec: &ServiceSpec, holds_resources: bool) {
+        for v in spec.volumes.iter().filter(|v| v.is_block()) {
+            *self.block_users.entry(v.source.clone()).or_default() += 1;
+            if let Some(n) = self.nodes.get_mut(node_id) {
+                n.block_volumes.insert(v.source.clone());
+                if !n.zone.is_empty() {
+                    self.block_zones
+                        .entry(v.source.clone())
+                        .or_insert_with(|| n.zone.clone());
+                }
+            }
+        }
         if let Some(n) = self.nodes.get_mut(node_id) {
             if holds_resources {
                 n.alloc_cpu += spec.cpu_millicores as u64;
@@ -129,6 +165,22 @@ impl Snapshot {
         let mut rej = Rejections::default();
         let mut best: Option<(f64, u32, &str)> = None;
         let needs = spec.required_features();
+        let blocks: Vec<&str> = spec
+            .volumes
+            .iter()
+            .filter(|v| v.is_block())
+            .map(|v| v.source.as_str())
+            .collect();
+        // Single-writer cluster-wide: a block volume another live workload
+        // uses rules out every node.
+        if let Some(v) = blocks
+            .iter()
+            .find(|v| self.block_users.get(**v).copied().unwrap_or(0) > 0)
+        {
+            return Err(format!(
+                "NO_NODE: block volume {v} is in use by another workload"
+            ));
+        }
 
         for n in self.nodes.values() {
             rej.total += 1;
@@ -190,6 +242,30 @@ impl Snapshot {
                 rej.volume_busy = Some(v.source.clone());
                 rej.volume_busy_count += 1;
                 continue;
+            }
+            if !blocks.is_empty() {
+                if n.zone.is_empty() {
+                    rej.no_zone += 1;
+                    continue;
+                }
+                if let Some((v, z)) = blocks.iter().find_map(|v| {
+                    self.block_zones
+                        .get(*v)
+                        .filter(|z| **z != n.zone)
+                        .map(|z| (*v, z))
+                }) {
+                    rej.zone = Some((v.to_string(), z.clone()));
+                    rej.zone_count += 1;
+                    continue;
+                }
+                let new = blocks
+                    .iter()
+                    .filter(|v| !n.block_volumes.contains(**v))
+                    .count();
+                if n.block_volumes.len() + new > n.max_block_volumes as usize {
+                    rej.block_slots += 1;
+                    continue;
+                }
             }
             let score = (
                 n.ratio_with(cpu, mem),
@@ -253,6 +329,21 @@ fn reason(spec: &ServiceSpec, r: &Rejections) -> String {
                 "single-writer host volume {v} in use on {}",
                 r.volume_busy_count
             ));
+        }
+        if let Some((v, z)) = &r.zone {
+            parts.push(format!(
+                "block volume {v} is in zone {z}, not that of {}",
+                r.zone_count
+            ));
+        }
+        if r.no_zone > 0 {
+            parts.push(format!(
+                "no zone reported (block volumes need one) by {}",
+                r.no_zone
+            ));
+        }
+        if r.block_slots > 0 {
+            parts.push(format!("no free block volume slot on {}", r.block_slots));
         }
         format!("{}{class}", parts.join(", "))
     };
@@ -379,6 +470,8 @@ mod tests {
             target: "/d".into(),
             read_only: false,
             shared: false,
+            size_bytes: None,
+            class: None,
         });
         assert!(s.place(&v).unwrap_err().contains("pgdata"));
         s.nodes
@@ -431,6 +524,8 @@ mod tests {
             target: "/c".into(),
             read_only: false,
             shared: false,
+            size_bytes: None,
+            class: None,
         });
         assert_eq!(s.place(&v).unwrap(), "a");
         s.reserve("a", &v, true);
@@ -439,5 +534,119 @@ mod tests {
             "a",
             "a second replica on the same node"
         );
+    }
+
+    fn block(name: &str) -> VolumeSpec {
+        VolumeSpec {
+            kind: "block".into(),
+            source: name.into(),
+            target: "/data".into(),
+            read_only: false,
+            shared: false,
+            size_bytes: Some(10 << 30),
+            class: Some("gp3".into()),
+        }
+    }
+
+    /// Nodes in zones, able to take block volumes.
+    fn zoned(nodes: &[(&str, &str, u32)]) -> Snapshot {
+        let mut s = Snapshot::default();
+        let mut f = all_features();
+        f.push("block_volumes".into());
+        for (id, zone, max) in nodes {
+            s.nodes.insert(
+                id.to_string(),
+                NodeCapacity::new(
+                    id,
+                    "general",
+                    NodeStatus::Healthy,
+                    false,
+                    4000,
+                    8 << 30,
+                    &[],
+                )
+                .with_features(&f)
+                .with_topology(zone, *max),
+            );
+        }
+        s
+    }
+
+    #[test]
+    fn block_volume_needs_the_feature_and_a_zone() {
+        let mut v = spec(100, 64);
+        v.volumes.push(block("db"));
+        let s = snap(&[("a", "general", 1000, 1024)]);
+        assert!(s
+            .place(&v)
+            .unwrap_err()
+            .contains("agent lacks block_volumes"));
+        let s = zoned(&[("a", "", 20)]);
+        assert!(s.place(&v).unwrap_err().contains("no zone reported"));
+    }
+
+    #[test]
+    fn block_volume_stays_in_its_zone() {
+        let mut v = spec(100, 64);
+        v.volumes.push(block("db"));
+        let mut s = zoned(&[("a", "z1", 20), ("b", "z2", 20)]);
+        s.block_zones.insert("db".into(), "z2".into());
+        assert_eq!(s.place(&v).unwrap(), "b");
+        s.nodes.get_mut("b").unwrap().healthy = false;
+        let e = s.place(&v).unwrap_err();
+        assert!(e.contains("block volume db is in zone z2"), "{e}");
+    }
+
+    #[test]
+    fn a_new_block_volume_takes_the_zone_of_its_first_placement() {
+        let mut v = spec(100, 64);
+        v.volumes.push(block("db"));
+        let mut s = zoned(&[("a", "z1", 20), ("b", "z2", 20)]);
+        let first = s.place(&v).unwrap();
+        s.reserve(&first, &v, true);
+        assert_eq!(s.block_zones["db"], s.nodes[&first].zone);
+    }
+
+    #[test]
+    fn block_volume_is_single_writer_across_nodes() {
+        let mut v = spec(100, 64);
+        v.volumes.push(block("db"));
+        let mut s = zoned(&[("a", "z1", 20), ("b", "z1", 20)]);
+        let first = s.place(&v).unwrap();
+        s.reserve(&first, &v, true);
+        let e = s.place(&v).unwrap_err();
+        assert!(
+            e.contains("block volume db is in use by another workload"),
+            "{e}"
+        );
+        // Another service with another volume still places.
+        let mut w = spec(100, 64);
+        w.id = "other".into();
+        w.volumes.push(block("cache"));
+        assert!(s.place(&w).is_ok());
+    }
+
+    #[test]
+    fn block_volume_slots_are_counted_per_node() {
+        let mut v = spec(100, 64);
+        v.volumes.push(block("db"));
+        let mut s = zoned(&[("a", "z1", 1), ("b", "z1", 1)]);
+        // a holds another volume (attached, unused): no slot left there.
+        s.nodes
+            .get_mut("a")
+            .unwrap()
+            .block_volumes
+            .insert("old".into());
+        assert_eq!(s.place(&v).unwrap(), "b");
+        s.nodes
+            .get_mut("b")
+            .unwrap()
+            .block_volumes
+            .insert("other".into());
+        let e = s.place(&v).unwrap_err();
+        assert!(e.contains("no free block volume slot on 2"), "{e}");
+        // A volume already attached to a node needs no new slot there.
+        s.nodes.get_mut("a").unwrap().block_volumes = ["db".to_string()].into();
+        assert_eq!(s.place(&v).unwrap(), "a");
     }
 }

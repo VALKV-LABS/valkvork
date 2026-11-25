@@ -63,6 +63,11 @@ message Register {
   repeated WorkloadStatus inventory = 10; // every Valkvork container on the host
   string runtime = 11;                  // driver/version, e.g. "docker/27.3.1"
   repeated string features = 12;        // manifest features this agent supports (AGENT_FEATURES)
+  // Block volumes (docs/block-volumes.md): where the node is and how many
+  // more disks it can take. Empty off a cloud, unless agent.toml sets them.
+  string zone = 13;                     // e.g. "us-west-1a"
+  string instance_id = 14;              // e.g. "i-0ba574f883faac8a7"
+  uint32 max_block_volumes = 15;        // attachment slots for block volumes
 }
 
 message RegisterAck {

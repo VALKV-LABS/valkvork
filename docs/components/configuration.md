@@ -67,6 +67,8 @@ docker_socket       = "/var/run/docker.sock"
 registry_auth_file  = "/etc/valkvork/registry-auth.json"   # optional, Docker config.json format
 # advertise_ip      = "10.0.1.23"            # default: the local address routed to the controller
 metrics_listen_addr = "127.0.0.1:9401"       # must be loopback; omit to disable
+# zone              = "us-west-1a"           # default: the EC2 metadata service's; reported for block volumes
+# instance_id       = "i-0123456789abcdef0"  # default: the EC2 metadata service's
 default_pids_limit  = 4096                   # processes and threads per container, unless the manifest
                                              # sets [security] pids_limit; 0 for no limit
 default_host_ip     = "advertise"            # ports whose manifest sets no host_ip: "advertise" (the
@@ -91,6 +93,9 @@ domain      = "svc.valkvork.internal"
 # listen_ip = "172.17.0.1" # default: the Docker bridge gateway (this node and its containers only)
 # upstream  = ["10.12.0.2:53"]   # resolvers for other names; default: /etc/resolv.conf's nameservers
 ttl_seconds = 5
+
+[block_volumes]            # cloud disks on this node (docs/block-volumes.md)
+max = 20                   # attachment slots; Nitro allows ~28 attachments including network interfaces and root
 
 [instance_metadata]        # containers' access to 169.254.169.254; see security.md#instance-metadata
 block    = true            # reject it from the Docker bridge, except for manifests with

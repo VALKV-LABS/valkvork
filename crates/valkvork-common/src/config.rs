@@ -225,6 +225,28 @@ pub struct AgentConfig {
     /// The most processes and threads a container may have when its
     /// manifest sets no `[security] pids_limit`; 0 for no limit.
     pub default_pids_limit: u32,
+    /// The node's availability zone; unset: from the EC2 metadata service.
+    pub zone: Option<String>,
+    /// The node's cloud instance id; unset: from the EC2 metadata service.
+    pub instance_id: Option<String>,
+    /// Cloud block volumes on this node (docs/block-volumes.md).
+    pub block_volumes: BlockVolumesConfig,
+}
+
+/// agent.toml `[block_volumes]`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct BlockVolumesConfig {
+    /// Block volumes this node may have attached at once. Nitro instances
+    /// allow about 28 attachments, network interfaces and the root disk
+    /// included.
+    pub max: u32,
+}
+
+impl Default for BlockVolumesConfig {
+    fn default() -> Self {
+        Self { max: 20 }
+    }
 }
 
 /// agent.toml `[instance_metadata]`. With `block`, the agent drops traffic
@@ -273,6 +295,9 @@ impl Default for AgentConfig {
             default_host_ip: "advertise".to_string(),
             instance_metadata: InstanceMetadataConfig::default(),
             default_pids_limit: 4096,
+            zone: None,
+            instance_id: None,
+            block_volumes: BlockVolumesConfig::default(),
         }
     }
 }
@@ -335,6 +360,20 @@ impl AgentConfig {
                 "default_host_ip {:?} must be \"advertise\" or an IP address such as \"0.0.0.0\"",
                 self.default_host_ip
             )));
+        }
+        for (key, v) in [("zone", &self.zone), ("instance_id", &self.instance_id)] {
+            if let Some(v) = v {
+                if !crate::models::is_cloud_name(v) {
+                    return Err(ValkvorkError::Config(format!(
+                        "{key} {v:?}: letters, digits and '-' only"
+                    )));
+                }
+            }
+        }
+        if self.block_volumes.max > 128 {
+            return Err(ValkvorkError::Config(
+                "block_volumes.max is at most 128".into(),
+            ));
         }
         let im = &self.instance_metadata;
         if im.block

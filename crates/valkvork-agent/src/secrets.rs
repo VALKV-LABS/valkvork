@@ -15,7 +15,7 @@ use tokio::sync::OnceCell;
 use valkvork_common::config::SecretsConfig;
 
 /// The EC2 instance metadata service.
-const IMDS: &str = "169.254.169.254:80";
+pub(crate) const IMDS: &str = "169.254.169.254:80";
 
 pub struct SecretResolver {
     cfg: SecretsConfig,
@@ -235,6 +235,32 @@ async fn imds_region(addr: &str) -> Option<String> {
                 .chars()
                 .all(|c| c.is_ascii_alphanumeric() || c == '-');
         valid.then_some(region)
+    };
+    tokio::time::timeout(Duration::from_secs(2), attempt)
+        .await
+        .ok()
+        .flatten()
+}
+
+/// One metadata path through IMDSv2 (`/latest/meta-data/<path>`), trimmed,
+/// or None off EC2 or after 2 s.
+pub(crate) async fn imds_get(addr: &str, path: &str) -> Option<String> {
+    let attempt = async {
+        let token = http(
+            addr,
+            "PUT",
+            "/latest/api/token",
+            "X-aws-ec2-metadata-token-ttl-seconds: 60",
+        )
+        .await?;
+        let v = http(
+            addr,
+            "GET",
+            &format!("/latest/meta-data/{path}"),
+            &format!("X-aws-ec2-metadata-token: {token}"),
+        )
+        .await?;
+        Some(v.trim().to_string())
     };
     tokio::time::timeout(Duration::from_secs(2), attempt)
         .await

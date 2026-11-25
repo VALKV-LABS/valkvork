@@ -79,7 +79,12 @@ async fn run(args: Args) -> Result<(), ValkvorkError> {
     let reserved_mem = parse_size(&cfg.reserved.memory)
         .map_err(|e| ValkvorkError::Config(e.to_string()))?
         .as_u64();
+    let (zone, instance_id) =
+        identity::topology(cfg.zone.as_deref(), cfg.instance_id.as_deref()).await;
     let node = NodeInfo {
+        zone,
+        instance_id,
+        max_block_volumes: cfg.block_volumes.max,
         node_id: node_id.clone(),
         hostname: identity::hostname(),
         ip_address: cfg

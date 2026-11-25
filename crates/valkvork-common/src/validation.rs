@@ -160,8 +160,18 @@ struct RawPort {
 struct RawVolume {
     #[serde(rename = "type")]
     kind: String,
+    /// host: the agent.toml name; ephemeral: the directory's name; not for
+    /// block volumes, which have `name`.
+    #[serde(default)]
     source: String,
     target: String,
+    /// Block volumes: the cluster-wide name, size and EBS class.
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    size: Option<String>,
+    #[serde(default)]
+    class: Option<String>,
     #[serde(default)]
     read_only: bool,
     /// Defaults to true for writable volumes (only one live workload uses
@@ -397,8 +407,112 @@ fn canonicalise(mut raw: RawManifest, out: &mut Vec<ValidationError>) -> Option<
         }
     };
 
+    // Block volumes: name, size and class; always single-writer. The other
+    // types take none of those.
+    let mut block_names = HashSet::new();
+    let mut block_specs: Vec<Option<(u64, String)>> = Vec::with_capacity(raw.volumes.len());
+    for (i, v) in raw.volumes.iter().enumerate() {
+        let mut bad = |field: &str, msg: String| {
+            out.push(ValidationError::new(
+                Code::InvalidVolumeSpec,
+                &format!("volumes[{i}].{field}"),
+                &msg,
+            ));
+        };
+        if v.kind != "block" {
+            for (set, field) in [
+                (v.name.is_some(), "name"),
+                (v.size.is_some(), "size"),
+                (v.class.is_some(), "class"),
+            ] {
+                if set {
+                    bad(
+                        field,
+                        format!(
+                            "{field} is for type = \"block\" volumes; a {} volume has source",
+                            v.kind
+                        ),
+                    );
+                    ok = false;
+                }
+            }
+            block_specs.push(None);
+            continue;
+        }
+        let name = v.name.clone().unwrap_or_default();
+        if !is_block_volume_name(&name) {
+            bad("name", "a block volume needs a name: lowercase letters, digits and -, up to 63, starting with a letter or digit".into());
+            ok = false;
+        } else if !block_names.insert(name.clone()) {
+            bad("name", format!("block volume {name} is listed twice"));
+            ok = false;
+        }
+        if !v.source.is_empty() {
+            bad(
+                "source",
+                "a block volume is named by name, not source".into(),
+            );
+            ok = false;
+        }
+        if v.read_only || v.single_writer == Some(false) {
+            bad(
+                if v.read_only {
+                    "read_only"
+                } else {
+                    "single_writer"
+                },
+                "a block volume is always single-writer: one live workload uses it at a time"
+                    .into(),
+            );
+            ok = false;
+        }
+        let class = v.class.clone().unwrap_or_else(|| "gp3".into());
+        let min_gib = match class.as_str() {
+            "gp3" | "gp2" => 1,
+            "st1" | "sc1" => 125,
+            _ => {
+                bad(
+                    "class",
+                    format!("{class:?}: use gp3 (the default), gp2, st1 or sc1"),
+                );
+                ok = false;
+                1
+            }
+        };
+        let size = match v.size.as_deref().map(crate::units::parse_size) {
+            None => {
+                bad(
+                    "size",
+                    "a block volume needs a size, e.g. \"100GiB\"".into(),
+                );
+                ok = false;
+                0
+            }
+            Some(Err(e)) => {
+                bad("size", e.to_string());
+                ok = false;
+                0
+            }
+            Some(Ok(b)) => {
+                let (b, gib) = (b.0, 1u64 << 30);
+                if b % gib != 0 || b < min_gib * gib || b > 16384 * gib {
+                    bad(
+                        "size",
+                        format!("whole GiB, {min_gib}GiB to 16TiB for {class}"),
+                    );
+                    ok = false;
+                }
+                b
+            }
+        };
+        block_specs.push(Some((size, class)));
+    }
+
     // VE-07: sharing rules only apply to writable host volumes.
     for (i, v) in raw.volumes.iter().enumerate() {
+        if v.kind == "block" {
+            continue;
+        }
         if v.kind == "ephemeral" {
             for (set, field, why) in [
                 (
@@ -674,12 +788,19 @@ fn canonicalise(mut raw: RawManifest, out: &mut Vec<ValidationError>) -> Option<
         volumes: raw
             .volumes
             .into_iter()
-            .map(|v| VolumeSpec {
+            .zip(block_specs)
+            .map(|(v, block)| VolumeSpec {
+                source: if v.kind == "block" {
+                    v.name.unwrap_or_default()
+                } else {
+                    v.source
+                },
                 kind: v.kind,
-                source: v.source,
                 target: v.target,
                 read_only: v.read_only,
                 shared: v.single_writer == Some(false),
+                size_bytes: block.as_ref().map(|b| b.0),
+                class: block.map(|b| b.1),
             })
             .collect(),
         autoscale,
@@ -691,6 +812,16 @@ fn canonicalise(mut raw: RawManifest, out: &mut Vec<ValidationError>) -> Option<
         sysctls,
     };
     ok.then_some(spec)
+}
+
+/// A block volume's name: cluster-wide, used in cloud tags and as a
+/// directory name on nodes.
+pub fn is_block_volume_name(s: &str) -> bool {
+    !s.is_empty()
+        && s.len() <= 63
+        && s.bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+        && !s.starts_with('-')
 }
 
 /// Linux capabilities, without the `CAP_` prefix (capabilities(7)).
@@ -1200,12 +1331,12 @@ fn validate_service_spec_into(spec: &ServiceSpec, out: &mut Vec<ValidationError>
     // VE-07
     let mut targets = HashSet::new();
     for (i, v) in spec.volumes.iter().enumerate() {
-        if v.kind != "host" && v.kind != "ephemeral" {
+        if v.kind != "host" && v.kind != "ephemeral" && v.kind != "block" {
             out.push(ValidationError::new(
                 Code::InvalidVolumeSpec,
                 &format!("volumes[{i}].type"),
                 &format!(
-                    "unknown volume type {:?}; use \"host\" or \"ephemeral\"",
+                    "unknown volume type {:?}; use \"host\", \"ephemeral\" or \"block\"",
                     v.kind
                 ),
             ));
@@ -1677,6 +1808,79 @@ target_cpu_percent = 75
             (Code::InvalidResourceSpec, "service.type".into())
         );
         assert!(!parse_manifest_str(VALID).unwrap().spec.is_batch());
+    }
+
+    #[test]
+    fn block_volumes() {
+        let m = format!(
+            "{VALID}\n[[volumes]]\ntype = \"block\"\nname = \"orders-db\"\nsize = \"100GiB\"\ntarget = \"/data\"\n"
+        );
+        let p = parse_manifest_str(&m).unwrap();
+        let v = &p.spec.volumes[0];
+        assert!(v.is_block() && v.single_writer());
+        assert_eq!(v.source, "orders-db");
+        assert_eq!(v.size_bytes, Some(100 << 30));
+        assert_eq!(v.class.as_deref(), Some("gp3"));
+        assert!(p.spec.stop_first());
+        assert!(p.spec.required_features().contains(&"block_volumes"));
+
+        // Host and ephemeral volumes are unchanged (no new fields, same hash).
+        let host = format!(
+            "{VALID}\n[[volumes]]\ntype = \"host\"\nsource = \"pgdata\"\ntarget = \"/d\"\n"
+        );
+        let json = parse_manifest_str(&host).unwrap().spec.canonical_json();
+        assert!(!json.contains("\"size_bytes\"") && !json.contains("\"class\""));
+
+        let block = |extra: &str| {
+            format!("{VALID}\n[[volumes]]\ntype = \"block\"\ntarget = \"/data\"\n{extra}\n")
+        };
+        for (extra, field) in [
+            ("size = \"10GiB\"", "volumes[0].name"),
+            ("name = \"Orders\"\nsize = \"10GiB\"", "volumes[0].name"),
+            ("name = \"db\"", "volumes[0].size"),
+            ("name = \"db\"\nsize = \"1500MiB\"", "volumes[0].size"),
+            ("name = \"db\"\nsize = \"20TiB\"", "volumes[0].size"),
+            (
+                "name = \"db\"\nsize = \"10GiB\"\nclass = \"st1\"",
+                "volumes[0].size",
+            ),
+            (
+                "name = \"db\"\nsize = \"10GiB\"\nclass = \"io2\"",
+                "volumes[0].class",
+            ),
+            (
+                "name = \"db\"\nsize = \"10GiB\"\nsource = \"x\"",
+                "volumes[0].source",
+            ),
+            (
+                "name = \"db\"\nsize = \"10GiB\"\nread_only = true",
+                "volumes[0].read_only",
+            ),
+            (
+                "name = \"db\"\nsize = \"10GiB\"\nsingle_writer = false",
+                "volumes[0].single_writer",
+            ),
+        ] {
+            assert_eq!(
+                err_code(&block(extra)),
+                (Code::InvalidVolumeSpec, field.into()),
+                "{extra}"
+            );
+        }
+        let twice = format!(
+            "{VALID}\n[[volumes]]\ntype = \"block\"\nname = \"db\"\nsize = \"10GiB\"\ntarget = \"/a\"\n\n[[volumes]]\ntype = \"block\"\nname = \"db\"\nsize = \"10GiB\"\ntarget = \"/b\"\n"
+        );
+        assert_eq!(
+            err_code(&twice),
+            (Code::InvalidVolumeSpec, "volumes[1].name".into())
+        );
+        let host_with_size = format!(
+            "{VALID}\n[[volumes]]\ntype = \"host\"\nsource = \"pgdata\"\nsize = \"1GiB\"\ntarget = \"/d\"\n"
+        );
+        assert_eq!(
+            err_code(&host_with_size),
+            (Code::InvalidVolumeSpec, "volumes[0].size".into())
+        );
     }
 
     #[test]

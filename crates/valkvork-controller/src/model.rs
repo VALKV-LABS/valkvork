@@ -21,9 +21,79 @@ pub struct Node {
     pub allocatable_cpu_millicores: u32,
     pub allocatable_memory_bytes: u64,
     pub host_volumes: Vec<String>,
+    /// Availability zone and cloud instance id from `Register`; empty off a
+    /// cloud.
+    pub zone: String,
+    pub instance_id: String,
+    pub max_block_volumes: u32,
     pub status: NodeStatus,
     pub draining: bool,
     pub last_heartbeat_at: i64,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+/// A block volume's lifecycle (docs/block-volumes.md, "Volume states").
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VolumeState {
+    Creating,
+    Available,
+    Attaching,
+    Attached,
+    Detaching,
+    Fencing,
+    Deleting,
+    Failed,
+}
+
+impl VolumeState {
+    pub const ALL: [VolumeState; 8] = [
+        Self::Creating,
+        Self::Available,
+        Self::Attaching,
+        Self::Attached,
+        Self::Detaching,
+        Self::Fencing,
+        Self::Deleting,
+        Self::Failed,
+    ];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Creating => "CREATING",
+            Self::Available => "AVAILABLE",
+            Self::Attaching => "ATTACHING",
+            Self::Attached => "ATTACHED",
+            Self::Detaching => "DETACHING",
+            Self::Fencing => "FENCING",
+            Self::Deleting => "DELETING",
+            Self::Failed => "FAILED",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|v| v.as_str() == s)
+    }
+}
+
+/// A block volume the controller manages: a row of `volumes`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Volume {
+    pub name: String,
+    pub size_bytes: u64,
+    pub class: String,
+    /// `aws-ebs` or `local`.
+    pub driver: String,
+    /// The cloud's id (`vol-…`) once created.
+    pub cloud_id: Option<String>,
+    /// Fixed at creation: the zone of the first placement's node.
+    pub zone: Option<String>,
+    pub state: VolumeState,
+    /// The node it is attached to, or attaching to, detaching or being fenced from.
+    pub node_id: Option<String>,
+    pub error: Option<String>,
+    /// The service whose placement created it.
+    pub created_by: String,
     pub created_at: i64,
     pub updated_at: i64,
 }

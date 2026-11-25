@@ -153,12 +153,12 @@ So, for a single-writer volume:
 
 Per-container files that need no sharing, such as logs read while the container runs, belong in `/alloc`, which is private to each workload, or on stdout. A shared volume is for files that must outlive the workload.
 
-### What Cloud Volumes Would Add (Not Built)
+### Cloud Block Volumes (Being Built)
 
 The spec's phase 2 (§7.3) describes network block volumes declared inline:
 
 ```toml
-[[volumes]]          # NOT SUPPORTED YET: fails validation
+[[volumes]]          # validated, but no agent runs it yet
 type   = "block"
 name   = "orders-db"
 size   = "100GiB"
@@ -166,7 +166,7 @@ class  = "gp3"
 target = "/data"
 ```
 
-It would create the volume on first placement, attach and mount it as part of the workload's start, and, before attaching it to a new node after a failure, **fence** the old node: confirm through the cloud API that the old instance is stopped or terminated, or force-detach the volume. The availability zone would become a placement constraint. None of that exists today: such a manifest fails validation, with `UNKNOWN_FIELD at volumes.name`.
+It would create the volume on first placement, attach and mount it as part of the workload's start, and, before attaching it to a new node after a failure, **fence** the old node: confirm through the cloud API that the old instance is stopped or terminated, or force-detach the volume. The availability zone would become a placement constraint. The design and its stages are in [block-volumes.md](block-volumes.md). Stage 1 is built: such a manifest validates, agents report their zone and instance id, and the scheduler applies the zone, attachment-slot and cluster-wide single-writer rules. No agent supports `block_volumes` yet, so its workload stays PENDING with `NO_NODE: agent lacks block_volumes`.
 
 ## Try It Locally
 

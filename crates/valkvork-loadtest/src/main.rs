@@ -235,6 +235,9 @@ async fn agent_session(
             host_volumes: vec![],
             inventory: a.statuses(),
             runtime: "loadtest/1".into(),
+            zone: format!("load-zone-{}", a.i % 3),
+            instance_id: format!("i-load{:04}", a.i),
+            max_block_volumes: 20,
             features: valkvork_common::models::AGENT_FEATURES
                 .iter()
                 .map(|f| f.to_string())

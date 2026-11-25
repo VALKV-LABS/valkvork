@@ -39,7 +39,8 @@ host_port      = 8080          # static host port: one replica per node
                                # Unset: the agent's default_host_ip ("advertise" unless changed)
 
 [[volumes]]
-type      = "host"             # "host" (a node's directory) or "ephemeral" (the workload's own)
+type      = "host"             # "host" (a node's directory), "ephemeral" (the workload's own)
+                               # or "block" (a cloud disk: name, size, class; see block-volumes.md)
 source    = "pgdata"           # a [host_volumes.<name>] entry in agent.toml
 target    = "/var/lib/postgresql/data"
 read_only = false
