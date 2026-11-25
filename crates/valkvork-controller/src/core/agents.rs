@@ -93,6 +93,7 @@ impl Core {
                 cpu_usage_percent: 0.0,
                 used_memory_bytes: 0,
                 features: r.features.clone(),
+                block_in_use: r.block_volumes.iter().cloned().collect(),
             },
         );
         self.touch_node(&node_id);
@@ -397,6 +398,7 @@ impl Core {
 
     fn on_heartbeat(&mut self, node_id: &str, hb: pb::Heartbeat) {
         if let Some(e) = self.nodes.get_mut(node_id) {
+            e.block_in_use = hb.block_volumes.iter().cloned().collect();
             e.cpu_usage_percent = hb.node_cpu_usage_percent;
             e.used_memory_bytes = hb.node_used_memory_bytes;
         }

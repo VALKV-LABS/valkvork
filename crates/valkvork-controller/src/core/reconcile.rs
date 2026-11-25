@@ -37,6 +37,7 @@ impl Core {
             }
         }
         self.schedule_pending();
+        self.start_volume_waiters();
     }
 
     fn reconcile_delete(&mut self, service_id: &str) {

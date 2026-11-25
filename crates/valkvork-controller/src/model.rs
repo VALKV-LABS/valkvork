@@ -111,6 +111,9 @@ pub struct NodeEntry {
     pub used_memory_bytes: u64,
     /// From the agent's last Register; empty until it registers.
     pub features: Vec<String>,
+    /// Block volumes a container on the node still uses, from Register and
+    /// heartbeats: one in here is not detached.
+    pub block_in_use: std::collections::HashSet<String>,
 }
 
 #[derive(Debug, Clone)]

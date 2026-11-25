@@ -1,6 +1,6 @@
 # Block Volumes (Design)
 
-*Spec §7.3, FR-STO-10 … FR-STO-15. Status: stage 1 built (topology and the model); stages 2 to 4 to come.*
+*Spec §7.3, FR-STO-10 … FR-STO-15. Status: stages 1 and 2 built (the model, the volume manager and the `local` driver); stage 3 (EBS and fencing on AWS) and 4 to come.*
 
 Host volumes are directories that never leave their node, so a stateful service is pinned to one VM: if it dies, the service waits for it (see [placement-and-storage.md](placement-and-storage.md)). Block volumes are cloud disks (AWS EBS first) that Valkvork creates, attaches to whichever node runs the workload, and moves to another node when that one fails, without ever letting two nodes write to the same disk.
 
@@ -93,7 +93,8 @@ Drivers:
 2. The **core** sees an ASSIGNED workload whose volumes are not `ATTACHED` to its node and asks the manager to create and/or attach them. No `StartWorkload` is sent yet; the start timeout covers the wait.
 3. When every volume is `ATTACHED` to the node, the core sends `StartWorkload`, which carries each block volume: name, cloud id, target.
 4. The **agent** finds the device by its id (on Nitro, `/dev/disk/by-id/nvme-Amazon_Elastic_Block_Store_vol…`), runs `mkfs.ext4` only if `blkid` finds no filesystem, mounts it at `<data_dir>/block/<name>` (`noatime`), and bind-mounts that into the container. On stop it unmounts after the container is gone and reports the volume released.
-5. **Atomic bind** (FR-STO-12): if create, attach or mount fails, the workload FAILS with `VOLUME_ATTACH_FAILED: <cause>`; a volume created for this placement is deleted again, and one attached for it is detached. The service's backoff then applies.
+5. **Atomic bind** (FR-STO-12): if create, attach or mount fails, the workload FAILS with `VOLUME_ATTACH_FAILED: <cause>` and the service's backoff applies. A failed create leaves no row (drivers find a half-created volume by name on the retry). A failed attach leaves the volume AVAILABLE, unattached, recorded with its error, and the next placement reuses it: the table keeps it, so nothing is orphaned, and a volume that may already hold data is never deleted automatically.
+6. A failed detach or fence leaves the volume ATTACHED to its old node, so nothing else attaches it, and is tried again after 10 s (`VOLUME_RETRY`).
 
 The volume **stays attached** after the workload stops: a restart, or a stop-first update on the same node, takes seconds. It is detached only when a workload on another node needs it, or when it is deleted.
 
@@ -135,6 +136,10 @@ Each agent reports, in `Register`:
 | **2. Volume manager and agent mount** | The state machine, intents and results, start gating, rollback (`VOLUME_ATTACH_FAILED`), resume after a controller restart; `StartWorkload` with block volumes; the agent's device lookup, `mkfs`, mount, unmount and release reports; `make e2e` with the `local` driver | No |
 | **3. EBS and fencing** | The EC2 client (SigV4, IMDSv2 credentials), the `aws-ebs` driver, fencing; IAM for the controller's role in valkv-platform-infra; verified on a dev cell: create, move after a node is stopped, force-detach from a partitioned node | Yes |
 | **4. Operations** | `valkvork volume list/delete`, the UI's Volumes page, `iops`/`throughput`, I/O limits (FR-STO-15), metrics, docs | No |
+
+## Verified
+
+On AWS on 2026-11-25 (cell `aws-us-west-1-valkvork`, this code baked into the golden image): agents reported `us-west-1a` and their real instance ids from IMDSv2; with the `local` driver, a block volume was created in the node's zone, attached to its instance, mounted read-write, and kept its data across a stop-first update. Moving a volume between nodes and fencing need real disks (stage 3) and are covered by unit tests until then.
 
 ## Open Questions
 

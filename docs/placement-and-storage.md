@@ -158,7 +158,7 @@ Per-container files that need no sharing, such as logs read while the container 
 The spec's phase 2 (§7.3) describes network block volumes declared inline:
 
 ```toml
-[[volumes]]          # validated, but no agent runs it yet
+[[volumes]]          # local driver now; EBS in stage 3
 type   = "block"
 name   = "orders-db"
 size   = "100GiB"
@@ -166,7 +166,7 @@ class  = "gp3"
 target = "/data"
 ```
 
-It would create the volume on first placement, attach and mount it as part of the workload's start, and, before attaching it to a new node after a failure, **fence** the old node: confirm through the cloud API that the old instance is stopped or terminated, or force-detach the volume. The availability zone would become a placement constraint. The design and its stages are in [block-volumes.md](block-volumes.md). Stage 1 is built: such a manifest validates, agents report their zone and instance id, and the scheduler applies the zone, attachment-slot and cluster-wide single-writer rules. No agent supports `block_volumes` yet, so its workload stays PENDING with `NO_NODE: agent lacks block_volumes`.
+It would create the volume on first placement, attach and mount it as part of the workload's start, and, before attaching it to a new node after a failure, **fence** the old node: confirm through the cloud API that the old instance is stopped or terminated, or force-detach the volume. The availability zone would become a placement constraint. The design and its stages are in [block-volumes.md](block-volumes.md). Stages 1 and 2 are built: the manifest, the zone, attachment-slot and cluster-wide single-writer rules, and the controller's volume manager, which creates, attaches, detaches and fences volumes before a workload starts, with the `local` driver (directories, for development and `make e2e`). Agents run them with agent.toml `[block_volumes] enabled = true`. Real EBS volumes come with stage 3.
 
 ## Try It Locally
 

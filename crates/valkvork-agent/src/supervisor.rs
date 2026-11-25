@@ -35,6 +35,9 @@ const LABEL_DISK: &str = "valkvork.disk_bytes";
 const LABEL_CHECK: &str = "valkvork.check";
 /// "1" on a batch workload's container, so adoption knows exit 0 is success.
 const LABEL_BATCH: &str = "valkvork.batch";
+/// The block volumes a container uses, comma-separated: reported as in use
+/// until the container is gone, also after an agent restart.
+const LABEL_BLOCK_VOLUMES: &str = "valkvork.block_volumes";
 
 /// How long a FAILED workload's container is kept for its logs, at most.
 /// A service's next FAILED container replaces it sooner.
@@ -93,6 +96,8 @@ struct Local {
     unhealthy_stop: bool,
     /// A batch workload: exit 0 is COMPLETED, not a crash.
     batch: bool,
+    /// Block volumes the container uses (docs/block-volumes.md).
+    block_volumes: Vec<String>,
 }
 
 impl Local {
@@ -132,6 +137,7 @@ impl Local {
             check_gen: 0,
             unhealthy_stop: false,
             batch: false,
+            block_volumes: Vec::new(),
         }
     }
 
@@ -340,6 +346,11 @@ impl Supervisor {
                 l.container_id = Some(c.id.clone());
                 l.check = c.labels.get(LABEL_CHECK).and_then(|v| Probe::from_label(v));
                 l.batch = label(LABEL_BATCH) == "1";
+                l.block_volumes = label(LABEL_BLOCK_VOLUMES)
+                    .split(',')
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_string)
+                    .collect();
                 match c.state {
                     RunState::Running | RunState::Restarting | RunState::Paused => {
                         l.state = WorkloadState::Running;
@@ -443,6 +454,7 @@ impl Supervisor {
                 cmd.disk_bytes,
             );
             l.batch = cmd.batch;
+            l.block_volumes = block_names(&cmd);
             map.insert(cmd.workload_id.clone(), l);
         }
         let _ = std::fs::remove_file(self.failed_marker(&cmd.workload_id));
@@ -623,6 +635,33 @@ impl Supervisor {
             read_only: false,
         }];
         for v in &cmd.volumes {
+            if v.r#type == "block" {
+                // Attached to this node by the controller before the start.
+                // The local driver's volume is a directory; real devices
+                // (EBS) arrive in stage 3.
+                if v.local_path.is_empty() {
+                    return Err((
+                        "VOLUME_ATTACH_FAILED".to_string(),
+                        format!(
+                            "block volume {}: this agent mounts only local-driver volumes",
+                            v.source
+                        ),
+                    ));
+                }
+                let dir = PathBuf::from(&v.local_path);
+                if !dir.is_dir() || self.forbidden(&dir) {
+                    return Err((
+                        "VOLUME_ATTACH_FAILED".to_string(),
+                        format!("block volume {}: {} is not usable", v.source, dir.display()),
+                    ));
+                }
+                mounts.push(BindMount {
+                    source: dir,
+                    target: v.target.clone(),
+                    read_only: false,
+                });
+                continue;
+            }
             if v.r#type == "ephemeral" {
                 let dir = self.volumes_dir(wid).join(&v.source);
                 std::fs::create_dir_all(&dir)
@@ -806,6 +845,10 @@ impl Supervisor {
         }
         if let Some(l) = secret_label {
             labels.insert(crate::secret_files::LABEL_SECRET_FILES.to_string(), l);
+        }
+        let blocks = block_names(cmd);
+        if !blocks.is_empty() {
+            labels.insert(LABEL_BLOCK_VOLUMES.to_string(), blocks.join(","));
         }
         if cmd.security.as_ref().is_some_and(|s| s.instance_metadata) {
             labels.insert(LABEL_INSTANCE_METADATA.to_string(), "true".to_string());
@@ -1581,6 +1624,19 @@ impl Supervisor {
         }
     }
 
+    /// Block volumes a workload on this node still uses: every one the
+    /// agent still tracks, until its container is gone.
+    pub fn block_volumes_in_use(&self) -> Vec<String> {
+        let map = self.workloads.lock().unwrap();
+        let mut names: Vec<String> = map
+            .values()
+            .flat_map(|l| l.block_volumes.iter().cloned())
+            .collect();
+        names.sort();
+        names.dedup();
+        names
+    }
+
     pub fn report(&self) -> Vec<pb::WorkloadStatus> {
         let now = Instant::now();
         let mut map = self.workloads.lock().unwrap();
@@ -1650,3 +1706,11 @@ fn parse_policy(s: &str) -> Policy {
 
 #[cfg(test)]
 mod tests;
+
+fn block_names(cmd: &pb::StartWorkload) -> Vec<String> {
+    cmd.volumes
+        .iter()
+        .filter(|v| v.r#type == "block")
+        .map(|v| v.source.clone())
+        .collect()
+}

@@ -11,7 +11,7 @@
 # directory; folders shared from macOS cannot be chowned). Each run uses a new
 # run-<time> directory there. It uses ports 50061, 50062, 9410, 9411, 15432
 # and 18080 on the Docker host, and port 53 on the Docker bridge's gateway and the service ids global-pg, bad-secret,
-# web-check, exec-check, pg-init, pg-fail, cache-demo, imds-on, imds-off and secret-file, so do not run it next
+# web-check, exec-check, pg-init, pg-fail, cache-demo, imds-on, imds-off, secret-file and block-demo, so do not run it next
 # to a dev cluster with those services. It needs NET_ADMIN on the Docker host: the agent manages
 # its VALKVORK-IMDS iptables chain there.
 set -eu
@@ -22,7 +22,7 @@ pass() { echo "PASS: $*"; }
 
 # Remove this test's containers however it ends.
 cleanup() {
-  for svc in global-pg bad-secret web-check exec-check pg-init pg-fail cache-demo imds-on imds-off secret-file; do
+  for svc in global-pg bad-secret web-check exec-check pg-init pg-fail cache-demo imds-on imds-off secret-file block-demo; do
     for c in $(docker ps -aq --filter "label=valkvork.service_id=$svc"); do
       docker stop "$c" >/dev/null 2>&1 || true
       docker rm "$c" >/dev/null 2>&1 || true
@@ -64,6 +64,10 @@ tls_key_file        = "$W/tls/server.key"
 join_token_file     = "$W/join-token"
 admin_token_file    = "$W/admin-token"
 recovery_grace_period_seconds = 0
+
+[block_volumes]
+driver     = "local"
+local_root = "$W/blockvols"
 EOF
 cat > "$W/agent.toml" <<EOF
 controller_endpoint = "https://localhost:50061"
@@ -75,6 +79,8 @@ docker_socket       = "/var/run/docker.sock"
 registry_auth_file  = "$W/none.json"
 advertise_ip        = "$IP"
 metrics_listen_addr = "127.0.0.1:9411"
+zone                = "local-a"
+instance_id         = "i-e2e"
 
 [reserved]
 cpu    = 0.25
@@ -88,6 +94,9 @@ files_tmpfs     = false
 refresh_seconds = 5
 
 [discovery]
+enabled = true
+
+[block_volumes]
 enabled = true
 
 [host_volumes.pgdata]
@@ -433,6 +442,59 @@ for _ in $(seq 30); do [ -z "$(docker ps -aq --filter label=valkvork.service_id=
 sleep 1
 [ -z "$(ls "$W/data/volumes" 2>/dev/null)" ] || fail "ephemeral volume directories left behind: $(ls "$W/data/volumes")"
 pass "ephemeral volumes are deleted with their workloads"
+
+# ── block volumes (local driver): created, attached, kept across updates ──
+BV="$W/blockvols/volumes/vol-local-e2e-data"
+bv_manifest() {
+  cat > "$W/bv.toml" <<EOF
+[service]
+id           = "block-demo"
+image        = "docker.io/library/alpine:3.20"
+replicas     = 1
+kill_timeout = "2s"
+command      = ["sh", "-c", "echo run-\$REV >> /data/runs; exec sleep 3600"]
+
+[resources]
+cpu    = 0.1
+memory = "32MiB"
+
+[env]
+REV = "$1"
+
+[[volumes]]
+type   = "block"
+name   = "e2e-data"
+size   = "1GiB"
+target = "/data"
+EOF
+  vk apply -f "$W/bv.toml" >/dev/null
+}
+bv_running() {
+  for _ in $(seq 60); do vk workloads 2>/dev/null | grep -q "block-demo.*RUNNING" && return 0; sleep 1; done
+  tail -20 "$W/agent.log"; vk events | head -10; fail "block-demo did not run ($1)"
+}
+bv_manifest 1
+bv_running "first start"
+for _ in $(seq 10); do [ -f "$BV/data/runs" ] && break; sleep 1; done
+[ "$(cat "$BV/data/runs" 2>/dev/null)" = "run-1" ] || fail "the volume holds: $(cat "$BV/data/runs" 2>/dev/null)"
+grep -q '"attached_to":"i-e2e"' "$BV/meta.json" || fail "not attached to i-e2e: $(cat "$BV/meta.json")"
+vk events | grep -q "creating block volume e2e-data" || fail "no event for the volume's creation"
+pass "block volume: created in local-a, attached to i-e2e, mounted at /data"
+bv_manifest 2
+for _ in $(seq 60); do [ "$(wc -l < "$BV/data/runs")" -ge 2 ] && break; sleep 1; done
+bv_running "after the update"
+[ "$(cat "$BV/data/runs" | tr '\n' ' ')" = "run-1 run-2 " ] || fail "after a replacing update: $(cat "$BV/data/runs")"
+pass "block volume: a stop-first update keeps its data"
+vk delete service block-demo >/dev/null
+for _ in $(seq 30); do [ -z "$(docker ps -aq --filter label=valkvork.service_id=block-demo)" ] && break; sleep 1; done
+[ -d "$BV/data" ] || fail "the volume went with its service"
+bv_manifest 3
+bv_running "re-applied"
+for _ in $(seq 20); do [ "$(wc -l < "$BV/data/runs")" -ge 3 ] && break; sleep 1; done
+[ "$(cat "$BV/data/runs" | tr '\n' ' ')" = "run-1 run-2 run-3 " ] || fail "after delete and re-apply: $(cat "$BV/data/runs")"
+pass "block volume: outlives its service; a new one finds the data"
+vk delete service block-demo >/dev/null
+for _ in $(seq 30); do [ -z "$(docker ps -aq --filter label=valkvork.service_id=block-demo)" ] && break; sleep 1; done
 
 # ── secrets as files: /run/secrets, not in docker inspect, rotated in place ─
 printf 'k3y-%s\n' "$(head -c 6 /dev/urandom | od -An -tx1 | tr -d ' \n')" > "$W/secrets/api_key"

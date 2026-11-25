@@ -71,6 +71,7 @@ fn features_for(id: &str) -> Vec<String> {
         valkvork_common::models::AGENT_FEATURES
             .iter()
             .map(|f| f.to_string())
+            .chain(["block_volumes".to_string()])
             .collect()
     }
 }
@@ -112,6 +113,7 @@ fn register_full(
         zone: "zone-a".into(),
         instance_id: format!("i-{id}"),
         max_block_volumes: 20,
+        block_volumes: vec![],
         features: features_for(id),
     };
     c.handle(CoreMsg::AgentConnected {
@@ -1785,7 +1787,7 @@ fn nodes_keep_their_topology_and_volumes_survive_a_restart() {
 #[test]
 fn block_volume_workloads_wait_for_an_agent_that_supports_them() {
     let mut c = core();
-    let _a = register(&mut c, "a");
+    let _a = register(&mut c, "old-a");
     apply(
         &mut c,
         &manifest(
@@ -1799,4 +1801,296 @@ fn block_volume_workloads_wait_for_an_agent_that_supports_them() {
     assert_eq!(w.len(), 1);
     let why = w[0].status_reason.clone().unwrap_or_default();
     assert!(why.contains("agent lacks block_volumes"), "{why}");
+}
+
+// ============================================================================
+// Block volumes, stage 2: the volume manager's protocol, start gating, fencing
+// ============================================================================
+
+mod block_volumes {
+    use super::*;
+    use crate::model::VolumeState;
+    use crate::volumes::{LocalDriver, VolumeIntent, VolumeOp, VolumeOutcome};
+    use std::sync::Arc;
+    use tokio::sync::mpsc::UnboundedReceiver;
+
+    const DB: &str = "\n[[volumes]]\ntype = \"block\"\nname = \"orders-db\"\nsize = \"10GiB\"\ntarget = \"/data\"\n";
+
+    struct Rig {
+        c: Core,
+        intents: UnboundedReceiver<VolumeIntent>,
+        _dir: tempfile::TempDir,
+    }
+
+    fn rig() -> Rig {
+        let dir = tempfile::tempdir().unwrap();
+        let mut c = core();
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        c.enable_volumes(Arc::new(LocalDriver::new(dir.path()).unwrap()), tx);
+        Rig {
+            c,
+            intents: rx,
+            _dir: dir,
+        }
+    }
+
+    impl Rig {
+        fn intent(&mut self) -> VolumeIntent {
+            self.intents.try_recv().expect("an intent")
+        }
+        fn no_intent(&mut self) {
+            assert!(self.intents.try_recv().is_err(), "no intent expected");
+        }
+        fn result(&mut self, r: crate::volumes::VolumeReply) {
+            self.c.handle(CoreMsg::VolumeResult {
+                name: "orders-db".into(),
+                result: r,
+            });
+            self.c.finish().unwrap();
+        }
+        fn volume(&self) -> crate::model::Volume {
+            self.c.volumes["orders-db"].clone()
+        }
+        /// Create, then attach to `node`, as the manager would.
+        fn create_and_attach(&mut self, node: &str) {
+            assert!(matches!(self.intent().op, VolumeOp::Create { .. }));
+            self.result(Ok(VolumeOutcome::Created {
+                cloud_id: "vol-1".into(),
+                zone: "zone-a".into(),
+            }));
+            match self.intent().op {
+                VolumeOp::Attach {
+                    cloud_id,
+                    instance_id,
+                } => {
+                    assert_eq!(
+                        (cloud_id.as_str(), instance_id),
+                        ("vol-1", format!("i-{node}"))
+                    );
+                }
+                op => panic!("expected attach, got {op:?}"),
+            }
+            self.result(Ok(VolumeOutcome::Attached));
+        }
+    }
+
+    fn starts(msgs: &[pb::controller_message::Msg]) -> Vec<pb::StartWorkload> {
+        msgs.iter()
+            .filter_map(|m| match m {
+                pb::controller_message::Msg::StartWorkload(s) => Some(s.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn the_start_waits_until_the_volume_is_created_and_attached() {
+        let mut r = rig();
+        let mut a = register(&mut r.c, "a");
+        apply(&mut r.c, &manifest("orders", "postgres:16", 1, DB));
+        assert!(
+            starts(&a.take()).is_empty(),
+            "no start before the volume is attached"
+        );
+        assert_eq!(r.volume().state, VolumeState::Creating);
+        assert_eq!(r.volume().zone.as_deref(), Some("zone-a"));
+        r.create_and_attach("a");
+        assert_eq!(r.volume().state, VolumeState::Attached);
+        assert_eq!(r.volume().node_id.as_deref(), Some("a"));
+        let s = starts(&a.take());
+        assert_eq!(s.len(), 1);
+        let m = s[0].volumes.iter().find(|v| v.r#type == "block").unwrap();
+        assert_eq!(
+            (m.source.as_str(), m.cloud_id.as_str()),
+            ("orders-db", "vol-1")
+        );
+        assert!(m.local_path.ends_with("vol-1/data"), "{}", m.local_path);
+        // Persisted.
+        assert_eq!(
+            r.c.db.load_volumes().unwrap()[0].state,
+            VolumeState::Attached
+        );
+    }
+
+    #[test]
+    fn a_failed_node_is_fenced_before_the_volume_moves() {
+        let mut r = rig();
+        let mut a = register(&mut r.c, "a");
+        apply(&mut r.c, &manifest("orders", "postgres:16", 1, DB));
+        r.create_and_attach("a");
+        a.take();
+        run_all(&mut r.c, &a);
+        let mut b = register(&mut r.c, "b");
+
+        // a goes silent: its workload is LOST and replaced on b.
+        r.c.nodes.get_mut("a").unwrap().last_seen = Instant::now() - Duration::from_secs(11);
+        r.c.check_health();
+        r.c.reconcile();
+        r.c.finish().unwrap();
+        match r.intent().op {
+            VolumeOp::Fence {
+                cloud_id,
+                instance_id,
+            } => {
+                assert_eq!((cloud_id.as_str(), instance_id.as_str()), ("vol-1", "i-a"));
+            }
+            op => panic!("expected fence, got {op:?}"),
+        }
+        assert_eq!(r.volume().state, VolumeState::Fencing);
+        assert!(
+            starts(&b.take()).is_empty(),
+            "never started before the fence"
+        );
+
+        // A failed fence keeps it on a, and nothing attaches to b.
+        r.result(Err("ec2 unavailable".into()));
+        assert_eq!(r.volume().state, VolumeState::Attached);
+        assert_eq!(r.volume().node_id.as_deref(), Some("a"));
+        // Not at once: after VOLUME_RETRY, the next pass tries again.
+        r.c.reconcile();
+        r.c.finish().unwrap();
+        r.no_intent();
+        r.c.volume_retry_at
+            .insert("orders-db".into(), Instant::now());
+        r.c.reconcile();
+        r.c.finish().unwrap();
+        assert!(matches!(r.intent().op, VolumeOp::Fence { .. }));
+        r.result(Ok(VolumeOutcome::Detached));
+        assert!(
+            matches!(r.intent().op, VolumeOp::Attach { instance_id, .. } if instance_id == "i-b")
+        );
+        r.result(Ok(VolumeOutcome::Attached));
+        assert_eq!(starts(&b.take()).len(), 1);
+        assert_eq!(r.volume().node_id.as_deref(), Some("b"));
+    }
+
+    #[test]
+    fn a_healthy_node_keeps_the_volume_until_it_has_unmounted_it() {
+        let mut r = rig();
+        let mut a = register(&mut r.c, "a");
+        apply(&mut r.c, &manifest("orders", "postgres:16", 1, DB));
+        r.create_and_attach("a");
+        a.take();
+        run_all(&mut r.c, &a);
+        let mut b = register(&mut r.c, "b");
+        let old = r.c.workloads.keys().next().unwrap().clone();
+
+        // Drain a: stop-first, so the old workload stops, then the new one
+        // is placed on b; a still reports the volume in use.
+        r.c.set_draining_for_test("a", true);
+        r.c.reconcile();
+        r.c.finish().unwrap();
+        let hb = |c: &mut Core, a: &Agent, in_use: Vec<String>| {
+            c.handle(CoreMsg::AgentMsg {
+                node_id: a.id.clone(),
+                conn_id: a.conn,
+                msg: pb::agent_message::Msg::Heartbeat(pb::Heartbeat {
+                    seq: 1,
+                    block_volumes: in_use,
+                    ..Default::default()
+                }),
+            });
+            c.finish().unwrap();
+        };
+        hb(&mut r.c, &a, vec!["orders-db".into()]);
+        assert_eq!(r.c.workloads[&old].status, WorkloadStatus::Stopped);
+        r.c.reconcile();
+        r.c.finish().unwrap();
+        r.no_intent();
+        assert_eq!(r.volume().node_id.as_deref(), Some("a"));
+        // Unmounted: a normal detach, then attach to b and start there.
+        hb(&mut r.c, &a, vec![]);
+        r.c.reconcile();
+        r.c.finish().unwrap();
+        assert!(
+            matches!(r.intent().op, VolumeOp::Detach { instance_id, .. } if instance_id == "i-a")
+        );
+        r.result(Ok(VolumeOutcome::Detached));
+        assert!(
+            matches!(r.intent().op, VolumeOp::Attach { instance_id, .. } if instance_id == "i-b")
+        );
+        r.result(Ok(VolumeOutcome::Attached));
+        assert_eq!(starts(&b.take()).len(), 1);
+    }
+
+    #[test]
+    fn a_failed_attach_fails_the_workload_and_frees_the_volume() {
+        let mut r = rig();
+        let _a = register(&mut r.c, "a");
+        apply(&mut r.c, &manifest("orders", "postgres:16", 1, DB));
+        assert!(matches!(r.intent().op, VolumeOp::Create { .. }));
+        r.result(Ok(VolumeOutcome::Created {
+            cloud_id: "vol-1".into(),
+            zone: "zone-a".into(),
+        }));
+        r.intent();
+        r.result(Err("VolumeLimitExceeded".into()));
+        let w = r.c.workloads.values().next().unwrap();
+        assert_eq!(w.status, WorkloadStatus::Failed);
+        let why = w.status_reason.clone().unwrap();
+        assert!(
+            why.starts_with(
+                "VOLUME_ATTACH_FAILED: attaching block volume orders-db: VolumeLimitExceeded"
+            ),
+            "{why}"
+        );
+        let v = r.volume();
+        assert_eq!((v.state, v.node_id.clone()), (VolumeState::Available, None));
+    }
+
+    #[test]
+    fn a_failed_create_leaves_no_volume() {
+        let mut r = rig();
+        let _a = register(&mut r.c, "a");
+        apply(&mut r.c, &manifest("orders", "postgres:16", 1, DB));
+        r.intent();
+        r.result(Err("quota".into()));
+        assert!(r.c.volumes.is_empty());
+        assert!(r.c.db.load_volumes().unwrap().is_empty());
+        let w = r.c.workloads.values().next().unwrap();
+        assert_eq!(w.status, WorkloadStatus::Failed);
+        assert!(w
+            .status_reason
+            .as_deref()
+            .unwrap()
+            .contains("creating block volume orders-db: quota"));
+    }
+
+    #[test]
+    fn without_a_driver_the_workload_fails_with_the_reason() {
+        let mut c = core();
+        let _a = register(&mut c, "a");
+        apply(&mut c, &manifest("orders", "postgres:16", 1, DB));
+        let w = c.workloads.values().next().unwrap();
+        assert_eq!(w.status, WorkloadStatus::Failed);
+        assert!(w
+            .status_reason
+            .as_deref()
+            .unwrap()
+            .contains("no [block_volumes] driver"));
+    }
+
+    #[test]
+    fn a_restart_resumes_an_unfinished_operation() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v.db");
+        let mut c = Core::new(cfg(), Db::open(&path).unwrap(), TOKEN.into()).unwrap();
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        c.enable_volumes(
+            Arc::new(LocalDriver::new(dir.path().join("vols")).unwrap()),
+            tx,
+        );
+        register(&mut c, "a");
+        apply(&mut c, &manifest("orders", "postgres:16", 1, DB));
+        drop(c);
+        let mut c = Core::new(cfg(), Db::open(&path).unwrap(), TOKEN.into()).unwrap();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        c.enable_volumes(
+            Arc::new(LocalDriver::new(dir.path().join("vols")).unwrap()),
+            tx,
+        );
+        let i = rx.try_recv().expect("the create is sent again");
+        assert_eq!(i.name, "orders-db");
+        assert!(matches!(i.op, VolumeOp::Create { ref zone, .. } if zone == "zone-a"));
+    }
 }

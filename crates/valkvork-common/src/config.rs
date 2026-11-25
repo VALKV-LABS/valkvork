@@ -61,6 +61,21 @@ pub struct ControllerConfig {
 
     /// Per-node client certificates on the agent listener (FR-SEC-02).
     pub node_certificates: NodeCertificatesConfig,
+
+    /// Cloud block volumes (docs/block-volumes.md).
+    pub block_volumes: ControllerBlockVolumesConfig,
+}
+
+/// controller.toml `[block_volumes]`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ControllerBlockVolumesConfig {
+    /// `""` (none: workloads with block volumes fail), or `local`
+    /// (directories under `local_root`, for development and tests).
+    pub driver: String,
+    /// The `local` driver's directory; agents bind-mount volumes from it,
+    /// so it must be the same path on every node (a shared or local disk).
+    pub local_root: Option<PathBuf>,
 }
 
 impl Default for ControllerConfig {
@@ -86,6 +101,7 @@ impl Default for ControllerConfig {
             ui: UiConfig::default(),
             metrics_listen_addr: Some("0.0.0.0:9400".parse().unwrap()),
             node_certificates: NodeCertificatesConfig::default(),
+            block_volumes: ControllerBlockVolumesConfig::default(),
         }
     }
 }
@@ -237,6 +253,8 @@ pub struct AgentConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct BlockVolumesConfig {
+    /// Run workloads with block volumes (the `block_volumes` agent feature).
+    pub enabled: bool,
     /// Block volumes this node may have attached at once. Nitro instances
     /// allow about 28 attachments, network interfaces and the root disk
     /// included.
@@ -245,7 +263,10 @@ pub struct BlockVolumesConfig {
 
 impl Default for BlockVolumesConfig {
     fn default() -> Self {
-        Self { max: 20 }
+        Self {
+            enabled: false,
+            max: 20,
+        }
     }
 }
 

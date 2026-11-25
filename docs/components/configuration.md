@@ -48,6 +48,12 @@ session_ttl_seconds = 43200          # 12 h
 [node_certificates]
 mode          = "issue"   # off | issue | require; see security.md#node-certificates
 lifetime_days = 30        # agents renew at two thirds of it
+
+# Cloud block volumes (docs/block-volumes.md). Unset driver: workloads with
+# block volumes fail with VOLUME_ATTACH_FAILED.
+[block_volumes]
+driver     = "local"                       # "local" (development and tests); "aws-ebs" in stage 3
+local_root = "/var/lib/valkvork/blockvols" # local: volumes are directories here, the same path on every node
 ```
 
 Keep `recovery_grace_period_seconds` above the agents' maximum reconnect delay (18 s), and `node_unhealthy_timeout_seconds` at several heartbeat intervals.
@@ -95,7 +101,8 @@ domain      = "svc.valkvork.internal"
 ttl_seconds = 5
 
 [block_volumes]            # cloud disks on this node (docs/block-volumes.md)
-max = 20                   # attachment slots; Nitro allows ~28 attachments including network interfaces and root
+enabled = false            # true: run workloads with block volumes (the block_volumes feature)
+max     = 20               # attachment slots; Nitro allows ~28 attachments including network interfaces and root
 
 [instance_metadata]        # containers' access to 169.254.169.254; see security.md#instance-metadata
 block    = true            # reject it from the Docker bridge, except for manifests with
