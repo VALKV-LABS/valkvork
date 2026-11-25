@@ -26,6 +26,9 @@ pub struct NodeInfo {
     pub allocatable_cpu_millicores: u32,
     pub allocatable_memory_bytes: u64,
     pub runtime: String,
+    pub zone: String,
+    pub instance_id: String,
+    pub max_block_volumes: u32,
 }
 
 /// 1 s, doubling, capped at 15 s, ±20 % jitter (FR-AGE-05).
@@ -163,6 +166,9 @@ impl Session<'_> {
                 .iter()
                 .map(|f| f.to_string())
                 .collect(),
+            zone: node.zone.clone(),
+            instance_id: node.instance_id.clone(),
+            max_block_volumes: node.max_block_volumes,
         };
         let inventory = register.inventory.len();
         tx.send(pb::AgentMessage {

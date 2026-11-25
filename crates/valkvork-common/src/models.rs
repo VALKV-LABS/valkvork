@@ -194,9 +194,20 @@ pub struct VolumeSpec {
     /// stored before the setting existed keep their canonical JSON and hash.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub shared: bool,
+    /// Block volumes: the size and EBS class it is created with. Omitted
+    /// for other volumes (stable hashes). A block volume's name is `source`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub size_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub class: Option<String>,
 }
 
 impl VolumeSpec {
+    /// A cloud block volume (docs/block-volumes.md), named by `source`.
+    pub fn is_block(&self) -> bool {
+        self.kind == "block"
+    }
+
     /// A directory the node declares (`[host_volumes.<name>]`): the
     /// scheduler places the workload only where it exists.
     pub fn is_host(&self) -> bool {
@@ -207,7 +218,7 @@ impl VolumeSpec {
     /// host volumes are single-writer unless declared `single_writer = false`.
     /// An ephemeral volume belongs to one workload, so never.
     pub fn single_writer(&self) -> bool {
-        self.is_host() && !self.read_only && !self.shared
+        (self.is_host() && !self.read_only && !self.shared) || self.is_block()
     }
 }
 
@@ -422,6 +433,11 @@ pub const AGENT_FEATURES: &[&str] = &[
     "service_discovery",
 ];
 
+/// A zone or instance id as clouds name them: `us-west-1a`, `i-0123abcd`.
+pub fn is_cloud_name(s: &str) -> bool {
+    !s.is_empty() && s.len() <= 64 && s.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+}
+
 /// What `${node.NAME}` in an [env] value can name, substituted by the agent
 /// with its own node's value at container start.
 pub const NODE_VALUES: &[&str] = &["advertise_ip", "class", "hostname", "id"];
@@ -540,6 +556,9 @@ impl ServiceSpec {
         }
         if !self.secret_files.is_empty() {
             f.push("secret_files");
+        }
+        if self.volumes.iter().any(|v| v.is_block()) {
+            f.push("block_volumes");
         }
         if self.env.values().any(|v| v.contains("${secret:")) {
             f.push("secret_values");
@@ -729,6 +748,8 @@ mod tests {
             target: "/d".into(),
             read_only: false,
             shared: false,
+            size_bytes: None,
+            class: None,
         });
         let json = a.canonical_json();
         assert!(!json.contains("shared"));

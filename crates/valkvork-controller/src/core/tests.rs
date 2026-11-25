@@ -109,6 +109,9 @@ fn register_full(
         host_volumes,
         inventory,
         runtime: "docker/27.3.1".into(),
+        zone: "zone-a".into(),
+        instance_id: format!("i-{id}"),
+        max_block_volumes: 20,
         features: features_for(id),
     };
     c.handle(CoreMsg::AgentConnected {
@@ -1735,4 +1738,65 @@ fn accepted_stop_is_not_resent_while_the_container_stops() {
     assert_eq!(c.workloads[&wid].status, WorkloadStatus::Stopped);
     c.reconcile();
     assert!(c.acked_stops.is_empty());
+}
+
+// ============================================================================
+// Block volumes, stage 1: topology and the model (docs/block-volumes.md)
+// ============================================================================
+
+#[test]
+fn nodes_keep_their_topology_and_volumes_survive_a_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("v.db");
+    let mut c = Core::new(cfg(), Db::open(&path).unwrap(), TOKEN.into()).unwrap();
+    register(&mut c, "a");
+    let now = now_ms();
+    let vol = crate::model::Volume {
+        name: "orders-db".into(),
+        size_bytes: 100 << 30,
+        class: "gp3".into(),
+        driver: "local".into(),
+        cloud_id: Some("vol-local-orders-db".into()),
+        zone: Some("zone-a".into()),
+        state: crate::model::VolumeState::Attached,
+        node_id: Some("a".into()),
+        error: None,
+        created_by: "orders".into(),
+        created_at: now,
+        updated_at: now,
+    };
+    c.db.save_volume(&vol).unwrap();
+    drop(c);
+    let c = Core::new(cfg(), Db::open(&path).unwrap(), TOKEN.into()).unwrap();
+    let n = &c.nodes["a"].node;
+    assert_eq!(
+        (n.zone.as_str(), n.instance_id.as_str(), n.max_block_volumes),
+        ("zone-a", "i-a", 20)
+    );
+    assert_eq!(c.volumes["orders-db"], vol);
+    // The snapshot gives the volume its zone and the node's slot.
+    let snap = c.snapshot();
+    assert_eq!(snap.block_zones["orders-db"], "zone-a");
+    assert!(snap.nodes["a"].block_volumes.contains("orders-db"));
+}
+
+/// No agent advertises block_volumes yet (stage 1), so such a workload stays
+/// PENDING with a reason that says why.
+#[test]
+fn block_volume_workloads_wait_for_an_agent_that_supports_them() {
+    let mut c = core();
+    let _a = register(&mut c, "a");
+    apply(
+        &mut c,
+        &manifest(
+            "orders",
+            "postgres:16",
+            1,
+            "\n[[volumes]]\ntype = \"block\"\nname = \"orders-db\"\nsize = \"10GiB\"\ntarget = \"/data\"\n",
+        ),
+    );
+    let w = by_status(&c, "orders", WorkloadStatus::Pending);
+    assert_eq!(w.len(), 1);
+    let why = w[0].status_reason.clone().unwrap_or_default();
+    assert!(why.contains("agent lacks block_volumes"), "{why}");
 }

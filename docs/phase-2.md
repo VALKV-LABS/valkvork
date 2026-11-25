@@ -8,7 +8,7 @@ This page collects every P2 and P3 item, and for each one: what it is, what alre
 
 | Item | Spec | Phase | Builds on |
 |---|---|---|---|
-| [Network block volumes with fencing](#network-block-volumes-with-fencing) | FR-STO-10 … 15, §7.3 | P2 | Host volumes, the scheduler's filters, the agent's mount path |
+| [Network block volumes with fencing](#network-block-volumes-with-fencing) | FR-STO-10 … 15, §7.3 | P2 | **Designed** ([block-volumes.md](block-volumes.md)), being built |
 | [Native containerd driver](#native-containerd-driver) | FR-AGE-10 | P2 | The `ContainerRuntime` trait |
 | [Per-node mutual TLS](#per-node-mutual-tls) | FR-SEC-02, decision 6 | P2 | **Built** ([security.md](components/security.md#node-certificates)) |
 | [Secret references](#secret-references) | FR-SEC-04 | P2 | `[env]`, the agent's start path |
@@ -41,7 +41,7 @@ The [platform workloads plan](platform-workloads.md) takes precedence. It schedu
 
 ## Network Block Volumes with Fencing
 
-*FR-STO-10 … FR-STO-15, spec §7.3.* Today the only volumes are host directories that never move (see [placement-and-storage.md](placement-and-storage.md)). Phase 2 adds cloud block volumes, declared inline and provisioned during scheduling:
+*FR-STO-10 … FR-STO-15, spec §7.3.* **The design is [block-volumes.md](block-volumes.md)**, which settles the questions below; this section is the original sketch. Today the only volumes are host directories that never move (see [placement-and-storage.md](placement-and-storage.md)). Phase 2 adds cloud block volumes, declared inline and provisioned during scheduling:
 
 ```toml
 [[volumes]]

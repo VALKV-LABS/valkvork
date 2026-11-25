@@ -91,6 +91,7 @@ Every key, the validation rules and how changes roll out: [docs/components/manif
 | [spec.md](spec.md) | The product and technical specification; requirement IDs such as `FR-CON-03` refer to it |
 | [platform-workloads.md](docs/platform-workloads.md) | **Current plan:** the features to run the Valkv platform's services, built and verified on AWS one stage at a time |
 | [NEXT_STEPS.md](NEXT_STEPS.md) | MVP work not built yet |
+| [block-volumes.md](docs/block-volumes.md) | Design of cloud block volumes (EBS): manifest, controller volume manager, fencing, stages |
 | [phase-2.md](docs/phase-2.md) | Phase 2 and 3 roadmap: block volumes, containerd, mTLS, secrets, health checks, dynamic ports, batch jobs, RBAC, … |
 
 ## Development

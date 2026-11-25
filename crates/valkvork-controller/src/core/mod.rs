@@ -21,7 +21,7 @@ mod reconcile;
 mod tests;
 
 use crate::db::{Batch, Db, NewEvent, NewScalingEvent, NodeCertRecord};
-use crate::model::{AgentSender, CpuSamples, NodeEntry, Service, ServiceRuntime, Workload};
+use crate::model::{AgentSender, CpuSamples, NodeEntry, Service, ServiceRuntime, Volume, Workload};
 use crate::scheduler::{NodeCapacity, Snapshot};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
@@ -127,6 +127,8 @@ pub struct Core {
     pub(crate) services: BTreeMap<String, Service>,
     pub(crate) svc_rt: HashMap<String, ServiceRuntime>,
     pub(crate) workloads: HashMap<String, Workload>,
+    /// Block volumes by name (docs/block-volumes.md).
+    pub(crate) volumes: BTreeMap<String, Volume>,
     /// When each ASSIGNED workload was bound (start timeout, FR-CON-09).
     pub(crate) assigned_at: HashMap<String, Instant>,
     /// Outstanding commands keyed by workload id.
@@ -187,6 +189,11 @@ impl Core {
             .map(|w| (w.workload_id.clone(), w))
             .collect();
         let node_certs = db.load_node_certs()?;
+        let volumes = db
+            .load_volumes()?
+            .into_iter()
+            .map(|v| (v.name.clone(), v))
+            .collect();
         let assigned_at = workloads
             .values()
             .filter(|w| w.status == WorkloadStatus::Assigned)
@@ -209,6 +216,7 @@ impl Core {
             series: Default::default(),
             node_ca: None,
             node_certs,
+            volumes,
             db,
             join_token,
             grace_until,
@@ -765,8 +773,19 @@ impl Core {
                     n.allocatable_memory_bytes,
                     &n.host_volumes,
                 )
-                .with_features(&e.features),
+                .with_features(&e.features)
+                .with_topology(&n.zone, n.max_block_volumes),
             );
+        }
+        // Block volumes hold a node's attachment slot while attached there,
+        // in use or not, and keep the zone they were created in.
+        for v in self.volumes.values() {
+            if let Some(z) = &v.zone {
+                snap.block_zones.insert(v.name.clone(), z.clone());
+            }
+            if let Some(n) = v.node_id.as_ref().and_then(|id| snap.nodes.get_mut(id)) {
+                n.block_volumes.insert(v.name.clone());
+            }
         }
         for w in self.workloads.values() {
             let Some(node_id) = &w.node_id else { continue };

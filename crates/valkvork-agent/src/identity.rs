@@ -54,6 +54,35 @@ pub fn hostname() -> String {
         .unwrap_or_else(|| "unknown".to_string())
 }
 
+/// The node's zone and instance id: agent.toml's, else the EC2 metadata
+/// service's, else empty (off a cloud). Anything not a plain cloud name is
+/// dropped.
+pub async fn topology(zone: Option<&str>, instance_id: Option<&str>) -> (String, String) {
+    topology_from(crate::secrets::IMDS, zone, instance_id).await
+}
+
+pub(crate) async fn topology_from(
+    imds: &str,
+    zone: Option<&str>,
+    instance_id: Option<&str>,
+) -> (String, String) {
+    let get = |set: Option<&str>, path: &'static str| {
+        let set = set.map(str::to_string);
+        async move {
+            match set {
+                Some(v) => Some(v),
+                None => crate::secrets::imds_get(imds, path).await,
+            }
+            .filter(|v| valkvork_common::models::is_cloud_name(v))
+            .unwrap_or_default()
+        }
+    };
+    tokio::join!(
+        get(zone, "placement/availability-zone"),
+        get(instance_id, "instance-id")
+    )
+}
+
 /// The local address used to reach the controller. A UDP "connect" picks the
 /// route without sending any packet.
 pub fn local_ip_towards(endpoint: &str) -> Option<String> {
@@ -78,6 +107,47 @@ mod tests {
         assert_ne!(
             node_id_from_machine_id("abc"),
             node_id_from_machine_id("abd")
+        );
+    }
+
+    #[tokio::test]
+    async fn topology_from_config_or_metadata() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = l.local_addr().unwrap().to_string();
+        tokio::spawn(async move {
+            while let Ok((mut s, _)) = l.accept().await {
+                let mut buf = [0u8; 1024];
+                let n = s.read(&mut buf).await.unwrap_or(0);
+                let req = String::from_utf8_lossy(&buf[..n]).to_string();
+                let body = if req.starts_with("PUT /latest/api/token") {
+                    "tok"
+                } else if req.starts_with("GET /latest/meta-data/placement/availability-zone") {
+                    "us-west-1b\n"
+                } else if req.starts_with("GET /latest/meta-data/instance-id") {
+                    "i-0abc123"
+                } else {
+                    ""
+                };
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = s.write_all(resp.as_bytes()).await;
+            }
+        });
+        assert_eq!(
+            topology_from(&addr, None, None).await,
+            ("us-west-1b".to_string(), "i-0abc123".to_string())
+        );
+        assert_eq!(
+            topology_from(&addr, Some("local"), Some("bad id!")).await,
+            ("local".to_string(), String::new())
+        );
+        // Off EC2: empty, quickly.
+        assert_eq!(
+            topology_from("127.0.0.1:9", None, None).await,
+            (String::new(), String::new())
         );
     }
 

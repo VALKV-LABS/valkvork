@@ -4,7 +4,7 @@
 //! one writer. Admin queries that need history (events) use a separate
 //! read-only connection ([`EventReader`]).
 
-use crate::model::{Node, Service, Workload};
+use crate::model::{Node, Service, Volume, VolumeState, Workload};
 use rusqlite::{params, Connection, OpenFlags, Row};
 use std::path::Path;
 use valkvork_common::models::{now_ms, EventKind, ServiceSpec, SubjectType};
@@ -152,6 +152,32 @@ CREATE TABLE node_certs (
     prev_serial  TEXT,
     not_after    INTEGER NOT NULL,
     issued_at    INTEGER NOT NULL
+);
+"#,
+    ),
+    (
+        4,
+        // Block volumes (docs/block-volumes.md): where each node is, and the
+        // volumes the controller created. A volume outlives its service and
+        // its nodes, so neither is a foreign key.
+        r#"
+ALTER TABLE nodes ADD COLUMN zone TEXT NOT NULL DEFAULT '';
+ALTER TABLE nodes ADD COLUMN instance_id TEXT NOT NULL DEFAULT '';
+ALTER TABLE nodes ADD COLUMN max_block_volumes INTEGER NOT NULL DEFAULT 0;
+CREATE TABLE volumes (
+    name         TEXT PRIMARY KEY,
+    size_bytes   INTEGER NOT NULL CHECK (size_bytes > 0),
+    class        TEXT NOT NULL,
+    driver       TEXT NOT NULL,
+    cloud_id     TEXT,
+    zone         TEXT,
+    state        TEXT NOT NULL CHECK (state IN ('CREATING', 'AVAILABLE', 'ATTACHING', 'ATTACHED',
+                                                'DETACHING', 'FENCING', 'DELETING', 'FAILED')),
+    node_id      TEXT,
+    error        TEXT,
+    created_by   TEXT NOT NULL,
+    created_at   INTEGER NOT NULL,
+    updated_at   INTEGER NOT NULL
 );
 "#,
     ),
@@ -366,6 +392,75 @@ impl Db {
     }
 
     // ------------------------------------------------------------------
+    // Block volumes (docs/block-volumes.md)
+    // ------------------------------------------------------------------
+
+    pub fn load_volumes(&self) -> Result<Vec<Volume>, ValkvorkError> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT name, size_bytes, class, driver, cloud_id, zone, state, node_id, error,
+                        created_by, created_at, updated_at FROM volumes ORDER BY name",
+            )
+            .map_err(db_err)?;
+        let rows = stmt
+            .query_map([], |r| {
+                let state: String = r.get(6)?;
+                Ok(Volume {
+                    name: r.get(0)?,
+                    size_bytes: r.get::<_, i64>(1)? as u64,
+                    class: r.get(2)?,
+                    driver: r.get(3)?,
+                    cloud_id: r.get(4)?,
+                    zone: r.get(5)?,
+                    state: VolumeState::parse(&state).ok_or_else(|| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            6,
+                            rusqlite::types::Type::Text,
+                            format!("unknown volume state {state:?}").into(),
+                        )
+                    })?,
+                    node_id: r.get(7)?,
+                    error: r.get(8)?,
+                    created_by: r.get(9)?,
+                    created_at: r.get(10)?,
+                    updated_at: r.get(11)?,
+                })
+            })
+            .map_err(db_err)?;
+        rows.collect::<Result<_, _>>().map_err(db_err)
+    }
+
+    /// Insert or replace one volume row.
+    pub fn save_volume(&self, v: &Volume) -> Result<(), ValkvorkError> {
+        self.conn
+            .execute(
+                "INSERT INTO volumes (name, size_bytes, class, driver, cloud_id, zone, state, node_id,
+                     error, created_by, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+                 ON CONFLICT(name) DO UPDATE SET cloud_id = excluded.cloud_id, zone = excluded.zone,
+                     state = excluded.state, node_id = excluded.node_id, error = excluded.error,
+                     updated_at = excluded.updated_at",
+                params![
+                    v.name,
+                    v.size_bytes as i64,
+                    v.class,
+                    v.driver,
+                    v.cloud_id,
+                    v.zone,
+                    v.state.as_str(),
+                    v.node_id,
+                    v.error,
+                    v.created_by,
+                    v.created_at,
+                    v.updated_at
+                ],
+            )
+            .map_err(db_err)?;
+        Ok(())
+    }
+
+    // ------------------------------------------------------------------
     // Startup load (FR-CON-04)
     // ------------------------------------------------------------------
 
@@ -375,7 +470,8 @@ impl Db {
             .prepare(
                 "SELECT node_id, hostname, ip_address, node_class, agent_version, runtime,
                         allocatable_cpu_millicores, allocatable_memory_bytes, host_volumes,
-                        status, draining, last_heartbeat_at, created_at, updated_at FROM nodes",
+                        status, draining, last_heartbeat_at, created_at, updated_at,
+                        zone, instance_id, max_block_volumes FROM nodes",
             )
             .map_err(db_err)?;
         let rows = stmt
@@ -395,6 +491,9 @@ impl Db {
                     last_heartbeat_at: r.get(11)?,
                     created_at: r.get(12)?,
                     updated_at: r.get(13)?,
+                    zone: r.get(14)?,
+                    instance_id: r.get(15)?,
+                    max_block_volumes: r.get(16)?,
                 })
             })
             .map_err(db_err)?;
@@ -483,8 +582,8 @@ impl Db {
             tx.prepare_cached(
                 "INSERT INTO nodes (node_id, hostname, ip_address, node_class, agent_version, runtime,
                     allocatable_cpu_millicores, allocatable_memory_bytes, host_volumes, status, draining,
-                    last_heartbeat_at, created_at, updated_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
+                    last_heartbeat_at, created_at, updated_at, zone, instance_id, max_block_volumes)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)
                  ON CONFLICT(node_id) DO UPDATE SET
                     hostname = excluded.hostname, ip_address = excluded.ip_address,
                     node_class = excluded.node_class, agent_version = excluded.agent_version,
@@ -493,7 +592,9 @@ impl Db {
                     allocatable_memory_bytes = excluded.allocatable_memory_bytes,
                     host_volumes = excluded.host_volumes, status = excluded.status,
                     draining = excluded.draining, last_heartbeat_at = excluded.last_heartbeat_at,
-                    updated_at = excluded.updated_at",
+                    updated_at = excluded.updated_at, zone = excluded.zone,
+                    instance_id = excluded.instance_id,
+                    max_block_volumes = excluded.max_block_volumes",
             )
             .and_then(|mut s| {
                 s.execute(params![
@@ -511,6 +612,9 @@ impl Db {
                     n.last_heartbeat_at,
                     n.created_at,
                     n.updated_at,
+                    n.zone,
+                    n.instance_id,
+                    n.max_block_volumes,
                 ])
             })
             .map_err(db_err)?;

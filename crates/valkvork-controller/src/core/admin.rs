@@ -777,6 +777,9 @@ impl Core {
                     agent_version: n.agent_version.clone(),
                     runtime: n.runtime.clone(),
                     host_volumes: n.host_volumes.clone(),
+                    zone: n.zone.clone(),
+                    instance_id: n.instance_id.clone(),
+                    max_block_volumes: n.max_block_volumes,
                 }
             })
             .collect()
@@ -847,6 +850,17 @@ pub fn spec_to_toml(s: &valkvork_common::models::ServiceSpec) -> String {
         o.push('\n');
     }
     for v in &s.volumes {
+        if v.is_block() {
+            let _ = writeln!(
+                o,
+                "[[volumes]]\ntype = \"block\"\nname = {:?}\nsize = \"{}GiB\"\nclass = {:?}\ntarget = {:?}\n",
+                v.source,
+                v.size_bytes.unwrap_or(0) >> 30,
+                v.class.as_deref().unwrap_or("gp3"),
+                v.target,
+            );
+            continue;
+        }
         let _ = writeln!(
             o,
             "[[volumes]]\ntype = {:?}\nsource = {:?}\ntarget = {:?}\nread_only = {}\n{}",
@@ -975,6 +989,12 @@ host_ip = "advertise"
 POSTGRES_PASSWORD = "ssm:/valkv/dev/workloads/POSTGRES_PASSWORD"
 TLS_KEY = { ref = "ssm:/valkv/dev/workloads/TLS_KEY", file = true, owner = "70:70", mode = "0440" }
 API_KEY = { ref = "file:/etc/valkv/api_key", file = true }
+
+[[volumes]]
+type = "block"
+name = "orders-db"
+size = "100GiB"
+target = "/var/lib/data"
 
 [check]
 type = "tcp"

@@ -155,6 +155,9 @@ message NodeSummary {
   string agent_version = 13;
   string runtime = 14;
   repeated string host_volumes = 15;
+  string zone = 16;
+  string instance_id = 17;
+  uint32 max_block_volumes = 18;
 }
 
 message DrainNodeRequest {
