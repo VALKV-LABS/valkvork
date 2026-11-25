@@ -1,6 +1,6 @@
 # Block Volumes (Design)
 
-*Spec §7.3, FR-STO-10 … FR-STO-15. Status: stages 1 and 2 built (the model, the volume manager and the `local` driver); stage 3 (EBS and fencing on AWS) and 4 to come.*
+*Spec §7.3, FR-STO-10 … FR-STO-15. Status: stages 1 to 3 built (the model, the volume manager, the `local` and `aws-ebs` drivers, fencing, the agent's device handling); stage 4 (operations) to come.*
 
 Host volumes are directories that never leave their node, so a stateful service is pinned to one VM: if it dies, the service waits for it (see [placement-and-storage.md](placement-and-storage.md)). Block volumes are cloud disks (AWS EBS first) that Valkvork creates, attaches to whichever node runs the workload, and moves to another node when that one fails, without ever letting two nodes write to the same disk.
 
@@ -127,6 +127,13 @@ Each agent reports, in `Register`:
 - Device lookup with a timeout (attachments take a few seconds to appear); `mkfs` only on a device with no filesystem signature, so it never formats data.
 - Reports mounted block volumes in `Register` and heartbeats, so the controller knows when one is released.
 - Refuses to mount a device that is mounted elsewhere on the node.
+
+### The EBS Driver (stage 3)
+
+- **The client** (`crates/valkvork-controller/src/aws`): EC2 Query API requests signed with SigV4 (`ring`), over HTTPS with the Mozilla roots compiled in (`webpki-roots`), so the controller image needs no certificate store. Credentials come from `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY`, else the instance role through IMDSv2, refreshed five minutes before they expire. Responses are parsed by a small nesting-aware XML reader.
+- **Create** looks for the cell's volume by its tags first, then calls `CreateVolume` (encrypted, `ClientToken` `vk-<cell>-<name>`, tags `valkvork:volume`, `valkvork:cell`, `Name`) and waits until it is available. **Attach** picks a free device name (`/dev/sdf` … `/dev/sdz`) from `DescribeInstances` and waits until EC2 reports it attached. **Detach** (with `Force` for fencing) waits until the volume is available. Each wait polls every 2 s for up to 180 s.
+- **The agent** finds the device by the volume id (`/dev/disk/by-id/nvme-Amazon_Elastic_Block_Store_vol…`, or an NVMe controller whose serial is the id), waits up to 60 s for it, runs `mkfs` only when `blkid` finds no filesystem, mounts it at `<data_dir>/block/<name>` with `noatime`, and bind-mounts that into the container. After the last container using it is gone it unmounts it; a mounted volume counts as in use, so the controller never detaches it under a filesystem. Mounts and unmounts are serialised, so a stop-first update on the same node never reuses a mount that is being taken down.
+- **IAM** (goldenimage `block_volumes_enabled`): the controller's role may create volumes only with its cell's `valkvork:cell` tag, attach, detach and delete only volumes with that tag and only on its cell's instances, and use KMS only through EC2.
 
 ## Stages
 

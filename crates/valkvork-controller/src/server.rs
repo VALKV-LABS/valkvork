@@ -62,26 +62,41 @@ pub async fn run(cfg: ControllerConfig) -> Result<(), ValkvorkError> {
     };
     // Block volumes: the driver, and a manager that runs its calls outside
     // the core (docs/block-volumes.md).
-    let volume_driver: Option<std::sync::Arc<dyn crate::volumes::VolumeDriver>> =
-        match cfg.block_volumes.driver.as_str() {
-            "" => None,
-            "local" => {
-                let root = cfg.block_volumes.local_root.clone().ok_or_else(|| {
-                    ValkvorkError::Config(
-                        "block_volumes.driver = \"local\" needs local_root".into(),
-                    )
-                })?;
-                let d = crate::volumes::LocalDriver::new(root)
-                    .map_err(|e| ValkvorkError::Config(format!("block_volumes.local_root: {e}")))?;
-                tracing::warn!("block volumes use the local driver (development and tests only)");
-                Some(std::sync::Arc::new(d))
-            }
-            other => {
-                return Err(ValkvorkError::Config(format!(
-                    "block_volumes.driver {other:?}: use \"local\" (aws-ebs comes in stage 3)"
-                )))
-            }
-        };
+    let volume_driver: Option<std::sync::Arc<dyn crate::volumes::VolumeDriver>> = match cfg
+        .block_volumes
+        .driver
+        .as_str()
+    {
+        "" => None,
+        "local" => {
+            let root = cfg.block_volumes.local_root.clone().ok_or_else(|| {
+                ValkvorkError::Config("block_volumes.driver = \"local\" needs local_root".into())
+            })?;
+            let d = crate::volumes::LocalDriver::new(root)
+                .map_err(|e| ValkvorkError::Config(format!("block_volumes.local_root: {e}")))?;
+            tracing::warn!("block volumes use the local driver (development and tests only)");
+            Some(std::sync::Arc::new(d))
+        }
+        "aws-ebs" => {
+            let b = &cfg.block_volumes;
+            let cell = b.cell.clone().filter(|c| !c.is_empty()).ok_or_else(|| {
+                ValkvorkError::Config("block_volumes.driver = \"aws-ebs\" needs cell".into())
+            })?;
+            let client =
+                crate::aws::client::AwsClient::new(b.region.clone(), b.ec2_endpoint.clone())
+                    .await
+                    .map_err(|e| ValkvorkError::Config(format!("block_volumes (aws-ebs): {e}")))?;
+            tracing::info!(cell = %cell, region = client.region(), "block volumes use EBS");
+            Some(std::sync::Arc::new(crate::aws::ec2::EbsDriver::new(
+                client, cell,
+            )))
+        }
+        other => {
+            return Err(ValkvorkError::Config(format!(
+                "block_volumes.driver {other:?}: use \"aws-ebs\" or \"local\""
+            )))
+        }
+    };
     let volume_rx = volume_driver.as_ref().map(|d| {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         core.enable_volumes(d.clone(), tx);
