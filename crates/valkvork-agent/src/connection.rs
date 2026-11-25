@@ -165,7 +165,13 @@ impl Session<'_> {
             features: valkvork_common::models::AGENT_FEATURES
                 .iter()
                 .map(|f| f.to_string())
+                .chain(
+                    cfg.block_volumes
+                        .enabled
+                        .then(|| "block_volumes".to_string()),
+                )
                 .collect(),
+            block_volumes: supervisor.block_volumes_in_use(),
             zone: node.zone.clone(),
             instance_id: node.instance_id.clone(),
             max_block_volumes: node.max_block_volumes,
@@ -237,6 +243,7 @@ impl Session<'_> {
                         node_cpu_usage_percent: cpu.sample(),
                         node_used_memory_bytes: node_used_memory(),
                         workloads: supervisor.report(),
+                        block_volumes: supervisor.block_volumes_in_use(),
                     };
                     if tx
                         .send(pb::AgentMessage {

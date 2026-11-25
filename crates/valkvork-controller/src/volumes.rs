@@ -81,6 +81,146 @@ pub trait VolumeDriver: Send + Sync + 'static {
     /// Delete; refused while attached. Already gone is success.
     async fn delete(&self, cloud_id: &str) -> Result<()>;
     async fn instance_state(&self, instance_id: &str) -> Result<InstanceState>;
+    /// For drivers without real devices (`local`): the directory the agent
+    /// bind-mounts in place of the device.
+    fn local_path(&self, _cloud_id: &str) -> Option<PathBuf> {
+        None
+    }
+}
+
+// ============================================================================
+// The volume manager: carries out the core's intents
+// ============================================================================
+
+/// What the core asks for. One intent at a time per volume: the core only
+/// sends one when it moves the volume into a transitional state.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum VolumeOp {
+    Create {
+        size_bytes: u64,
+        class: String,
+        zone: String,
+    },
+    Attach {
+        cloud_id: String,
+        instance_id: String,
+    },
+    /// The node unmounted it: detach normally.
+    Detach {
+        cloud_id: String,
+        instance_id: String,
+    },
+    /// The node is gone or unreachable: force-detach (FR-STO-13). An empty
+    /// instance id means "whatever the cloud says it is attached to".
+    Fence {
+        cloud_id: String,
+        instance_id: String,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VolumeIntent {
+    pub name: String,
+    pub op: VolumeOp,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum VolumeOutcome {
+    Created { cloud_id: String, zone: String },
+    Attached,
+    Detached,
+}
+
+pub type VolumeReply = std::result::Result<VolumeOutcome, String>;
+
+pub type IntentSender = tokio::sync::mpsc::UnboundedSender<VolumeIntent>;
+
+/// Run each intent through `driver` and report the outcome to the core as
+/// `CoreMsg::VolumeResult`. Intents for different volumes run concurrently.
+pub fn spawn_manager(
+    driver: std::sync::Arc<dyn VolumeDriver>,
+    mut rx: tokio::sync::mpsc::UnboundedReceiver<VolumeIntent>,
+    core: crate::core::CoreHandle,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        while let Some(intent) = rx.recv().await {
+            let (driver, core) = (driver.clone(), core.clone());
+            tokio::spawn(async move {
+                let name = intent.name.clone();
+                tracing::info!(volume = %name, op = ?intent.op, "volume operation");
+                let result = carry_out(driver.as_ref(), &name, intent.op).await;
+                if let Err(e) = &result {
+                    tracing::warn!(volume = %name, error = %e, "volume operation failed");
+                }
+                let _ = core
+                    .send(crate::core::CoreMsg::VolumeResult { name, result })
+                    .await;
+            });
+        }
+    })
+}
+
+pub async fn carry_out(driver: &dyn VolumeDriver, name: &str, op: VolumeOp) -> VolumeReply {
+    let e = |e: DriverError| e.0;
+    match op {
+        VolumeOp::Create {
+            size_bytes,
+            class,
+            zone,
+        } => {
+            let v = driver
+                .create(name, size_bytes, &class, &zone)
+                .await
+                .map_err(e)?;
+            Ok(VolumeOutcome::Created {
+                cloud_id: v.cloud_id,
+                zone: v.zone,
+            })
+        }
+        VolumeOp::Attach {
+            cloud_id,
+            instance_id,
+        } => {
+            driver.attach(&cloud_id, &instance_id).await.map_err(e)?;
+            Ok(VolumeOutcome::Attached)
+        }
+        VolumeOp::Detach {
+            cloud_id,
+            instance_id,
+        } => {
+            driver
+                .detach(&cloud_id, &instance_id, false)
+                .await
+                .map_err(e)?;
+            Ok(VolumeOutcome::Detached)
+        }
+        VolumeOp::Fence {
+            cloud_id,
+            mut instance_id,
+        } => {
+            if instance_id.is_empty() {
+                instance_id = driver
+                    .describe(&cloud_id)
+                    .await
+                    .map_err(e)?
+                    .attached_to
+                    .unwrap_or_default();
+            }
+            if instance_id.is_empty() {
+                return Ok(VolumeOutcome::Detached);
+            }
+            let state = driver.instance_state(&instance_id).await.map_err(e)?;
+            tracing::warn!(
+                cloud_id, instance = %instance_id, ?state,
+                "fencing: force-detaching the volume from its previous node"
+            );
+            driver
+                .detach(&cloud_id, &instance_id, true)
+                .await
+                .map_err(e)?;
+            Ok(VolumeOutcome::Detached)
+        }
+    }
 }
 
 // ============================================================================
@@ -142,6 +282,10 @@ fn io(e: std::io::Error) -> DriverError {
 impl VolumeDriver for LocalDriver {
     fn name(&self) -> &'static str {
         "local"
+    }
+
+    fn local_path(&self, cloud_id: &str) -> Option<PathBuf> {
+        Some(self.data_dir(cloud_id))
     }
 
     async fn create(
@@ -283,6 +427,49 @@ mod tests {
         drv.delete(&v.cloud_id).await.unwrap();
         drv.delete(&v.cloud_id).await.unwrap();
         assert!(drv.describe(&v.cloud_id).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn the_manager_creates_attaches_and_fences() {
+        let d = tempfile::tempdir().unwrap();
+        let drv = LocalDriver::new(d.path()).unwrap();
+        let created = carry_out(
+            &drv,
+            "db",
+            VolumeOp::Create {
+                size_bytes: 1 << 30,
+                class: "gp3".into(),
+                zone: "z1".into(),
+            },
+        )
+        .await
+        .unwrap();
+        let VolumeOutcome::Created { cloud_id, zone } = created else {
+            panic!("{created:?}")
+        };
+        assert_eq!(zone, "z1");
+        let attach = |i: &str| VolumeOp::Attach {
+            cloud_id: cloud_id.clone(),
+            instance_id: i.into(),
+        };
+        assert_eq!(
+            carry_out(&drv, "db", attach("i-a")).await,
+            Ok(VolumeOutcome::Attached)
+        );
+        assert!(carry_out(&drv, "db", attach("i-b")).await.is_err());
+        // Fencing an unknown holder: the cloud says who it is.
+        let fence = VolumeOp::Fence {
+            cloud_id: cloud_id.clone(),
+            instance_id: String::new(),
+        };
+        assert_eq!(
+            carry_out(&drv, "db", fence).await,
+            Ok(VolumeOutcome::Detached)
+        );
+        assert_eq!(
+            carry_out(&drv, "db", attach("i-b")).await,
+            Ok(VolumeOutcome::Attached)
+        );
     }
 
     #[tokio::test]

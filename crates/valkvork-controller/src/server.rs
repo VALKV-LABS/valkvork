@@ -60,7 +60,37 @@ pub async fn run(cfg: ControllerConfig) -> Result<(), ValkvorkError> {
         }
         (t, _) => t.clone(),
     };
+    // Block volumes: the driver, and a manager that runs its calls outside
+    // the core (docs/block-volumes.md).
+    let volume_driver: Option<std::sync::Arc<dyn crate::volumes::VolumeDriver>> =
+        match cfg.block_volumes.driver.as_str() {
+            "" => None,
+            "local" => {
+                let root = cfg.block_volumes.local_root.clone().ok_or_else(|| {
+                    ValkvorkError::Config(
+                        "block_volumes.driver = \"local\" needs local_root".into(),
+                    )
+                })?;
+                let d = crate::volumes::LocalDriver::new(root)
+                    .map_err(|e| ValkvorkError::Config(format!("block_volumes.local_root: {e}")))?;
+                tracing::warn!("block volumes use the local driver (development and tests only)");
+                Some(std::sync::Arc::new(d))
+            }
+            other => {
+                return Err(ValkvorkError::Config(format!(
+                    "block_volumes.driver {other:?}: use \"local\" (aws-ebs comes in stage 3)"
+                )))
+            }
+        };
+    let volume_rx = volume_driver.as_ref().map(|d| {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        core.enable_volumes(d.clone(), tx);
+        rx
+    });
     let (handle, core_task) = core.spawn();
+    if let (Some(d), Some(rx)) = (volume_driver, volume_rx) {
+        crate::volumes::spawn_manager(d, rx, handle.clone());
+    }
 
     let builder = |tls: &Option<ServerTlsConfig>| -> Result<Server, ValkvorkError> {
         let b = Server::builder()

@@ -19,6 +19,7 @@ mod observe;
 mod reconcile;
 #[cfg(test)]
 mod tests;
+mod volumes;
 
 use crate::db::{Batch, Db, NewEvent, NewScalingEvent, NodeCertRecord};
 use crate::model::{AgentSender, CpuSamples, NodeEntry, Service, ServiceRuntime, Volume, Workload};
@@ -54,6 +55,11 @@ pub enum CoreMsg {
     AgentDisconnected {
         node_id: String,
         conn_id: u64,
+    },
+    /// The volume manager finished an intent (docs/block-volumes.md).
+    VolumeResult {
+        name: String,
+        result: crate::volumes::VolumeReply,
     },
     Admin(AdminOp),
 }
@@ -129,6 +135,12 @@ pub struct Core {
     pub(crate) workloads: HashMap<String, Workload>,
     /// Block volumes by name (docs/block-volumes.md).
     pub(crate) volumes: BTreeMap<String, Volume>,
+    /// The driver and the volume manager; None without `[block_volumes]`.
+    pub(crate) volume_system: Option<volumes::VolumeSystem>,
+    /// ASSIGNED workloads whose start waits for their block volumes.
+    pub(crate) volume_waiters: HashSet<String>,
+    /// Volume name -> no detach or fence before this, after one failed.
+    pub(crate) volume_retry_at: HashMap<String, Instant>,
     /// When each ASSIGNED workload was bound (start timeout, FR-CON-09).
     pub(crate) assigned_at: HashMap<String, Instant>,
     /// Outstanding commands keyed by workload id.
@@ -174,6 +186,7 @@ impl Core {
                     cpu_usage_percent: 0.0,
                     used_memory_bytes: 0,
                     features: Vec::new(),
+                    block_in_use: HashSet::new(),
                 };
                 (entry.node.node_id.clone(), entry)
             })
@@ -217,6 +230,9 @@ impl Core {
             node_ca: None,
             node_certs,
             volumes,
+            volume_system: None,
+            volume_waiters: HashSet::new(),
+            volume_retry_at: HashMap::new(),
             db,
             join_token,
             grace_until,
@@ -334,6 +350,7 @@ impl Core {
             CoreMsg::AgentDisconnected { node_id, conn_id } => {
                 self.on_disconnect(&node_id, conn_id)
             }
+            CoreMsg::VolumeResult { name, result } => self.on_volume_result(&name, result),
             CoreMsg::Admin(op) => self.on_admin(op),
         }
     }
@@ -516,6 +533,10 @@ impl Core {
 
     /// Queue `StartWorkload` for an ASSIGNED workload.
     pub(crate) fn queue_start(&mut self, workload_id: &str) {
+        // A workload with block volumes starts once they are attached here.
+        if !self.volumes_ready(workload_id) {
+            return;
+        }
         let command_id = self.next_command_id();
         let Some(w) = self.workloads.get(workload_id) else {
             return;
@@ -598,11 +619,20 @@ impl Core {
                     volumes: s
                         .volumes
                         .iter()
-                        .map(|v| pb::VolumeMount {
-                            r#type: v.kind.clone(),
-                            source: v.source.clone(),
-                            target: v.target.clone(),
-                            read_only: v.read_only,
+                        .map(|v| {
+                            let (cloud_id, local_path) = if v.is_block() {
+                                self.block_mount(&v.source)
+                            } else {
+                                Default::default()
+                            };
+                            pb::VolumeMount {
+                                r#type: v.kind.clone(),
+                                source: v.source.clone(),
+                                target: v.target.clone(),
+                                read_only: v.read_only,
+                                cloud_id,
+                                local_path,
+                            }
                         })
                         .collect(),
                     restart: Some(pb::RestartPolicy {

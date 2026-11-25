@@ -507,6 +507,7 @@ async fn forbidden_host_volume_is_refused() {
             source: vol.into(),
             target: "/s".into(),
             read_only: true,
+            ..Default::default()
         });
         s.start(cmd).await.unwrap();
     }
@@ -869,6 +870,58 @@ async fn file_secrets_are_mounted_refreshed_and_removed() {
     );
 }
 
+/// A block volume (local driver) is bind-mounted, writable, at its target,
+/// labelled, and reported in use until the container is gone. Without a
+/// local path the start fails.
+#[tokio::test]
+async fn block_volumes_are_mounted_and_reported_in_use() {
+    let d = tempfile::tempdir().unwrap();
+    let rt = Fake::new();
+    let s = supervisor(rt.clone(), d.path());
+    let vol = d.path().join("vols/vol-1/data");
+    std::fs::create_dir_all(&vol).unwrap();
+    let mut cmd = start_cmd("w1", 3);
+    cmd.volumes = vec![pb::VolumeMount {
+        r#type: "block".into(),
+        source: "orders-db".into(),
+        target: "/data".into(),
+        cloud_id: "vol-1".into(),
+        local_path: vol.display().to_string(),
+        ..Default::default()
+    }];
+    s.start(cmd).await.unwrap();
+    settle().await;
+    assert_eq!(state_of(&s, "w1").unwrap().0, WorkloadState::Running);
+    let spec = rt.last_created();
+    let m = spec.mounts.iter().find(|m| m.target == "/data").unwrap();
+    assert_eq!((m.source.clone(), m.read_only), (vol.clone(), false));
+    assert_eq!(spec.labels["valkvork.block_volumes"], "orders-db");
+    assert_eq!(s.block_volumes_in_use(), ["orders-db"]);
+    s.stop(pb::StopWorkload {
+        command_id: "2".into(),
+        workload_id: "w1".into(),
+        kill_timeout_seconds: 1,
+    })
+    .await
+    .unwrap();
+    settle().await;
+    assert!(s.block_volumes_in_use().is_empty());
+
+    let mut cmd = start_cmd("w2", 3);
+    cmd.volumes = vec![pb::VolumeMount {
+        r#type: "block".into(),
+        source: "other".into(),
+        target: "/data".into(),
+        cloud_id: "vol-2".into(),
+        ..Default::default()
+    }];
+    s.start(cmd).await.unwrap();
+    settle().await;
+    let (state, reason, _) = state_of(&s, "w2").unwrap();
+    assert_eq!(state, WorkloadState::Failed);
+    assert!(reason.starts_with("VOLUME_ATTACH_FAILED"), "{reason}");
+}
+
 /// The last value resolved for a reference is reused when resolving fails
 /// at a later start; without it the start fails.
 #[tokio::test]
@@ -1096,6 +1149,7 @@ async fn ephemeral_volume_lives_with_the_workload() {
         source: "cache".into(),
         target: "/var/cache/app".into(),
         read_only: false,
+        ..Default::default()
     }];
     s.start(cmd).await.unwrap();
     settle().await;

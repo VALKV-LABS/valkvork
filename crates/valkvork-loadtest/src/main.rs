@@ -238,6 +238,7 @@ async fn agent_session(
             zone: format!("load-zone-{}", a.i % 3),
             instance_id: format!("i-load{:04}", a.i),
             max_block_volumes: 20,
+            block_volumes: vec![],
             features: valkvork_common::models::AGENT_FEATURES
                 .iter()
                 .map(|f| f.to_string())
@@ -287,6 +288,7 @@ async fn agent_session(
                     node_cpu_usage_percent: 20.0,
                     node_used_memory_bytes: 8 << 30,
                     workloads: a.statuses(),
+                    block_volumes: vec![],
                 };
                 let msg = pb::AgentMessage {
                     msg: Some(pb::agent_message::Msg::Heartbeat(hb)),

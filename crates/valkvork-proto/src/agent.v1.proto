@@ -68,6 +68,7 @@ message Register {
   string zone = 13;                     // e.g. "us-west-1a"
   string instance_id = 14;              // e.g. "i-0ba574f883faac8a7"
   uint32 max_block_volumes = 15;        // attachment slots for block volumes
+  repeated string block_volumes = 16;   // block volumes a container on the node still uses
 }
 
 message RegisterAck {
@@ -82,6 +83,7 @@ message Heartbeat {
   double node_cpu_usage_percent = 2;
   uint64 node_used_memory_bytes = 3;
   repeated WorkloadStatus workloads = 4;
+  repeated string block_volumes = 5;   // block volumes a container on the node still uses
 }
 
 enum WorkloadState {
@@ -198,10 +200,12 @@ message PortMapping {
 }
 
 message VolumeMount {
-  string type = 1;
-  string source = 2;
+  string type = 1;                     // host, ephemeral or block
+  string source = 2;                   // block: the volume's name
   string target = 3;
   bool read_only = 4;
+  string cloud_id = 5;                 // block: the attached volume (vol-…)
+  string local_path = 6;               // block, local driver: a directory to bind-mount
 }
 
 message RestartPolicy {

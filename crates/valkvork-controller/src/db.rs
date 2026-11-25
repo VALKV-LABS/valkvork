@@ -431,6 +431,13 @@ impl Db {
         rows.collect::<Result<_, _>>().map_err(db_err)
     }
 
+    pub fn delete_volume(&self, name: &str) -> Result<(), ValkvorkError> {
+        self.conn
+            .execute("DELETE FROM volumes WHERE name = ?1", params![name])
+            .map_err(db_err)?;
+        Ok(())
+    }
+
     /// Insert or replace one volume row.
     pub fn save_volume(&self, v: &Volume) -> Result<(), ValkvorkError> {
         self.conn
