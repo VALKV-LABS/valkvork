@@ -30,6 +30,9 @@ pub struct SecretResolver {
     last: Mutex<HashMap<String, String>>,
 }
 
+/// `ETXTBSY` on Linux and macOS.
+const TEXT_FILE_BUSY: i32 = 26;
+
 /// How long an ECR login is reused (they are valid for 12 hours).
 const ECR_REUSE: Duration = Duration::from_secs(6 * 3600);
 
@@ -188,17 +191,31 @@ impl SecretResolver {
 
     /// Run the AWS CLI; its output with one trailing newline dropped.
     async fn aws(&self, args: &[&str], region: Option<&str>) -> Result<String, String> {
-        let mut cmd = tokio::process::Command::new(&self.cfg.aws_cli);
-        cmd.args(args);
-        if let Some(region) = region {
-            cmd.args(["--region", region]);
-        }
-        cmd.env("AWS_PAGER", "")
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true);
-        let run = cmd.output();
+        let run = async {
+            // ETXTBSY: the CLI is still open for writing somewhere, e.g. being
+            // replaced by an upgrade, or (in tests) inherited by a process
+            // forked while it was written. It clears within milliseconds.
+            let mut attempt = 0;
+            loop {
+                let mut cmd = tokio::process::Command::new(&self.cfg.aws_cli);
+                cmd.args(args);
+                if let Some(region) = region {
+                    cmd.args(["--region", region]);
+                }
+                cmd.env("AWS_PAGER", "")
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped())
+                    .kill_on_drop(true);
+                match cmd.output().await {
+                    Err(e) if e.raw_os_error() == Some(TEXT_FILE_BUSY) && attempt < 10 => {
+                        attempt += 1;
+                        tokio::time::sleep(Duration::from_millis(20)).await;
+                    }
+                    r => break r,
+                }
+            }
+        };
         let out = tokio::time::timeout(Duration::from_secs(self.cfg.timeout_seconds), run)
             .await
             .map_err(|_| format!("timed out after {}s", self.cfg.timeout_seconds))?
