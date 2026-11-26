@@ -180,6 +180,8 @@ pub struct SupervisorConfig {
     pub default_pids_limit: u32,
     /// Where file secrets are written; None: workloads with them fail.
     pub secret_files: Option<Arc<crate::secret_files::SecretFiles>>,
+    /// Cloud block devices; None: only local-driver block volumes mount.
+    pub block: Option<Arc<crate::block::BlockDevices>>,
     /// This node's id, class and hostname, for `${node.NAME}` in [env].
     pub node_id: String,
     pub node_class: String,
@@ -639,16 +641,26 @@ impl Supervisor {
                 // Attached to this node by the controller before the start.
                 // The local driver's volume is a directory; real devices
                 // (EBS) arrive in stage 3.
-                if v.local_path.is_empty() {
-                    return Err((
-                        "VOLUME_ATTACH_FAILED".to_string(),
-                        format!(
-                            "block volume {}: this agent mounts only local-driver volumes",
-                            v.source
-                        ),
-                    ));
-                }
-                let dir = PathBuf::from(&v.local_path);
+                let dir = if v.local_path.is_empty() {
+                    // A cloud disk, attached to this instance by the controller.
+                    let Some(block) = &self.cfg.block else {
+                        return Err((
+                            "VOLUME_ATTACH_FAILED".to_string(),
+                            format!(
+                                "block volume {}: block volumes are off on this node (agent.toml [block_volumes])",
+                                v.source
+                            ),
+                        ));
+                    };
+                    block.mount(&v.source, &v.cloud_id).await.map_err(|e| {
+                        (
+                            format!("VOLUME_ATTACH_FAILED: block volume {}: {e}", v.source),
+                            format!("block volume {}: {e}", v.source),
+                        )
+                    })?
+                } else {
+                    PathBuf::from(&v.local_path)
+                };
                 if !dir.is_dir() || self.forbidden(&dir) {
                     return Err((
                         "VOLUME_ATTACH_FAILED".to_string(),
@@ -1095,6 +1107,24 @@ impl Supervisor {
         Ok(())
     }
 
+    /// Unmount the cloud disks no remaining workload uses, so the controller
+    /// may detach them.
+    async fn release_block_volumes(&self, names: Vec<String>) {
+        let Some(block) = &self.cfg.block else { return };
+        for name in names {
+            let used = || {
+                self.workloads
+                    .lock()
+                    .unwrap()
+                    .values()
+                    .any(|l| l.block_volumes.contains(&name))
+            };
+            if let Err(e) = block.release(&name, used).await {
+                tracing::warn!(volume = %name, error = %e, "cannot unmount the block volume; it stays in use");
+            }
+        }
+    }
+
     async fn finish_stop(&self, wid: &str, container_id: Option<String>, timeout: u32) {
         if self.is_kept(wid) {
             return; // already stopped, and kept for its logs
@@ -1118,7 +1148,13 @@ impl Supervisor {
             let _ = std::fs::remove_dir_all(self.volumes_dir(wid));
             self.remove_secret_files(wid);
             let _ = std::fs::remove_file(self.failed_marker(wid));
-            self.workloads.lock().unwrap().remove(wid);
+            let blocks = self
+                .workloads
+                .lock()
+                .unwrap()
+                .remove(wid)
+                .map(|l| l.block_volumes);
+            self.release_block_volumes(blocks.unwrap_or_default()).await;
             return;
         }
         if let Err(e) = self.rt.remove(&id).await {
@@ -1133,7 +1169,13 @@ impl Supervisor {
         let _ = std::fs::remove_dir_all(self.volumes_dir(wid));
         self.remove_secret_files(wid);
         let _ = std::fs::remove_file(self.failed_marker(wid));
-        self.workloads.lock().unwrap().remove(wid);
+        let blocks = self
+            .workloads
+            .lock()
+            .unwrap()
+            .remove(wid)
+            .map(|l| l.block_volumes);
+        self.release_block_volumes(blocks.unwrap_or_default()).await;
         tracing::info!(workload = wid, "workload stopped and removed");
     }
 
@@ -1632,6 +1674,11 @@ impl Supervisor {
             .values()
             .flat_map(|l| l.block_volumes.iter().cloned())
             .collect();
+        drop(map);
+        // Mounted counts as in use: never detached under a filesystem.
+        if let Some(b) = &self.cfg.block {
+            names.extend(b.mounted());
+        }
         names.sort();
         names.dedup();
         names

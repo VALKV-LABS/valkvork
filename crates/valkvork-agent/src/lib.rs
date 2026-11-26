@@ -14,6 +14,7 @@
 //! * [`metadata`]: blocks containers from the cloud instance metadata service.
 //! * [`discovery`]: DNS for services on the node, from the controller's endpoints.
 
+pub mod block;
 pub mod certs;
 pub mod connection;
 pub mod discovery;

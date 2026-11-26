@@ -488,6 +488,8 @@ pass "block volume: a stop-first update keeps its data"
 vk delete service block-demo >/dev/null
 for _ in $(seq 30); do [ -z "$(docker ps -aq --filter label=valkvork.service_id=block-demo)" ] && break; sleep 1; done
 [ -d "$BV/data" ] || fail "the volume went with its service"
+# The service is gone once the controller has seen its workload stop.
+for _ in $(seq 30); do vk status 2>/dev/null | grep -q block-demo || break; sleep 1; done
 bv_manifest 3
 bv_running "re-applied"
 for _ in $(seq 20); do [ "$(wc -l < "$BV/data/runs")" -ge 3 ] && break; sleep 1; done

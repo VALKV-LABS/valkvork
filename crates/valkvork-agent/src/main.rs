@@ -114,6 +114,14 @@ async fn run(args: Args) -> Result<(), ValkvorkError> {
         valkvork_agent::secret_files::SecretFiles::prepare(&cfg.data_dir, cfg.secrets.files_tmpfs)
             .map_err(ValkvorkError::Config)?,
     );
+    let block = if cfg.block_volumes.enabled {
+        Some(Arc::new(
+            valkvork_agent::block::BlockDevices::new(&cfg.data_dir, &cfg.block_volumes.fs)
+                .map_err(ValkvorkError::Config)?,
+        ))
+    } else {
+        None
+    };
     if !secret_files.in_memory {
         tracing::warn!(
             "secrets.files_tmpfs is off: file secrets are kept on disk (development only)"
@@ -149,6 +157,7 @@ async fn run(args: Args) -> Result<(), ValkvorkError> {
             metadata,
             default_pids_limit: cfg.default_pids_limit,
             secret_files: Some(secret_files),
+            block,
             node_id: node.node_id.clone(),
             node_class: cfg.node_class.clone(),
             hostname: node.hostname.clone(),

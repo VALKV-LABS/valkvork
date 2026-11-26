@@ -70,12 +70,19 @@ pub struct ControllerConfig {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ControllerBlockVolumesConfig {
-    /// `""` (none: workloads with block volumes fail), or `local`
-    /// (directories under `local_root`, for development and tests).
+    /// `""` (none: workloads with block volumes fail), `aws-ebs`, or
+    /// `local` (directories under `local_root`, for development and tests).
     pub driver: String,
     /// The `local` driver's directory; agents bind-mount volumes from it,
     /// so it must be the same path on every node (a shared or local disk).
     pub local_root: Option<PathBuf>,
+    /// aws-ebs: the cell's name, tagged on every volume (`valkvork:cell`),
+    /// which the controller's IAM policy should require.
+    pub cell: Option<String>,
+    /// aws-ebs: the region; unset: the instance's, from its metadata.
+    pub region: Option<String>,
+    /// aws-ebs: an EC2 endpoint other than `https://ec2.<region>.amazonaws.com`.
+    pub ec2_endpoint: Option<String>,
 }
 
 impl Default for ControllerConfig {
@@ -255,6 +262,8 @@ pub struct AgentConfig {
 pub struct BlockVolumesConfig {
     /// Run workloads with block volumes (the `block_volumes` agent feature).
     pub enabled: bool,
+    /// The filesystem a blank cloud disk gets (`mkfs -t`).
+    pub fs: String,
     /// Block volumes this node may have attached at once. Nitro instances
     /// allow about 28 attachments, network interfaces and the root disk
     /// included.
@@ -265,6 +274,7 @@ impl Default for BlockVolumesConfig {
     fn default() -> Self {
         Self {
             enabled: false,
+            fs: "ext4".into(),
             max: 20,
         }
     }

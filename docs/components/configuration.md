@@ -52,8 +52,11 @@ lifetime_days = 30        # agents renew at two thirds of it
 # Cloud block volumes (docs/block-volumes.md). Unset driver: workloads with
 # block volumes fail with VOLUME_ATTACH_FAILED.
 [block_volumes]
-driver     = "local"                       # "local" (development and tests); "aws-ebs" in stage 3
-local_root = "/var/lib/valkvork/blockvols" # local: volumes are directories here, the same path on every node
+driver = "aws-ebs"                         # "aws-ebs", or "local" (development and tests)
+cell   = "aws-us-west-1-valkvork"          # aws-ebs: tagged valkvork:cell on every volume (IAM scopes to it)
+# region       = "us-west-1"               # aws-ebs: default the instance's (metadata service)
+# ec2_endpoint = "https://ec2.us-west-1.amazonaws.com"   # aws-ebs: another EC2 endpoint
+# local_root   = "/var/lib/valkvork/blockvols"           # local: volumes are directories here, the same path on every node
 ```
 
 Keep `recovery_grace_period_seconds` above the agents' maximum reconnect delay (18 s), and `node_unhealthy_timeout_seconds` at several heartbeat intervals.
@@ -102,6 +105,7 @@ ttl_seconds = 5
 
 [block_volumes]            # cloud disks on this node (docs/block-volumes.md)
 enabled = false            # true: run workloads with block volumes (the block_volumes feature)
+fs      = "ext4"           # filesystem for blank EBS volumes; mounted under <data_dir>/block/<name>
 max     = 20               # attachment slots; Nitro allows ~28 attachments including network interfaces and root
 
 [instance_metadata]        # containers' access to 169.254.169.254; see security.md#instance-metadata

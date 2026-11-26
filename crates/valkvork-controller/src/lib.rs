@@ -5,6 +5,7 @@
 //!   checks, rollouts, drains and the autoscaler all run inside it.
 //! * [`grpc`]: thin adapters exposing `AgentService` and `AdminService`.
 
+pub mod aws;
 pub mod core;
 pub mod db;
 pub mod grpc;

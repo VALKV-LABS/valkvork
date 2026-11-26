@@ -158,7 +158,7 @@ Per-container files that need no sharing, such as logs read while the container 
 The spec's phase 2 (§7.3) describes network block volumes declared inline:
 
 ```toml
-[[volumes]]          # local driver now; EBS in stage 3
+[[volumes]]          # an EBS volume (or a directory with the local driver)
 type   = "block"
 name   = "orders-db"
 size   = "100GiB"
@@ -166,7 +166,7 @@ class  = "gp3"
 target = "/data"
 ```
 
-It would create the volume on first placement, attach and mount it as part of the workload's start, and, before attaching it to a new node after a failure, **fence** the old node: confirm through the cloud API that the old instance is stopped or terminated, or force-detach the volume. The availability zone would become a placement constraint. The design and its stages are in [block-volumes.md](block-volumes.md). Stages 1 and 2 are built: the manifest, the zone, attachment-slot and cluster-wide single-writer rules, and the controller's volume manager, which creates, attaches, detaches and fences volumes before a workload starts, with the `local` driver (directories, for development and `make e2e`). Agents run them with agent.toml `[block_volumes] enabled = true`. Real EBS volumes come with stage 3.
+It would create the volume on first placement, attach and mount it as part of the workload's start, and, before attaching it to a new node after a failure, **fence** the old node: confirm through the cloud API that the old instance is stopped or terminated, or force-detach the volume. The availability zone would become a placement constraint. The design and its stages are in [block-volumes.md](block-volumes.md). Stages 1 to 3 are built: the manifest, the zone, attachment-slot and cluster-wide single-writer rules, and the controller's volume manager, which creates, attaches, detaches and fences volumes before a workload starts, with the `aws-ebs` driver, or `local` (directories, for development and `make e2e`). Agents run them with agent.toml `[block_volumes] enabled = true`; on the golden image, Terraform `block_volumes_enabled` sets both sides and the IAM policy.
 
 ## Try It Locally
 
