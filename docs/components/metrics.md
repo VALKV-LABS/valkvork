@@ -28,6 +28,8 @@ The controller's values are computed from the core's in-memory state on each scr
 | `valkvork_scaling_actions_total` | counter | `service`, `direction` (`up`, `down`) | Autoscaler actions |
 | `valkvork_schedule_duration_seconds` | histogram | | Time to place one workload |
 | `valkvork_agent_registrations_total` | counter | | Accepted Register messages |
+| `valkvork_block_volumes` | gauge | `state` | Block volumes by state, every state listed even at 0 |
+| `valkvork_volume_operations_total` | counter | `op` (`create`, `attach`, `detach`, `fence`, `delete`), `result` (`ok`, `error`) | Volume manager operations finished; alert on `fence` and on errors |
 | `valkvork_agents_connected` | gauge | | Agents with an open stream |
 | `valkvork_commands_outstanding` | gauge | | Commands not yet acknowledged |
 | `valkvork_controller_recovery_grace` | gauge | | 1 during the recovery grace period |

@@ -30,6 +30,8 @@ With an `https://` endpoint the controller's certificate is verified against `--
 | `node list [--class C]` | Nodes with allocation, workloads, heartbeat age and runtime |
 | `node drain <id>` / `node undrain <id>` | Move workloads off a node, or allow placements again |
 | `node remove <id>` | Forget an UNHEALTHY node, such as a terminated VM. Its LOST workloads are marked STOPPED. If it comes back, it joins as a new node |
+| `volume list` | Block volumes: state, size, class (and gp3 IOPS and throughput), zone, node, the services that name it, cloud id, last error |
+| `volume delete <name> --yes` | Destroy a block volume and its data (detaching it first). Refused while a service names it, while it is mid-operation, or while a healthy node has it mounted; without `--yes` it only says so |
 
 Manifests are validated locally before anything is sent, so a bad file fails with exit code 2 even when no controller is reachable.
 

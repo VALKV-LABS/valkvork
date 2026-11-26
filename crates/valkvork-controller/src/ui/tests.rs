@@ -460,3 +460,41 @@ fn decodes_query_values() {
     assert_eq!(percent_decode("100%"), "100%");
     assert_eq!(percent_decode("%zz"), "%zz");
 }
+
+/// The Volumes page's API: an empty list, and a delete that needs the typed
+/// name (and a volume that exists).
+#[tokio::test]
+async fn volumes_list_and_delete_confirmation() {
+    let (s, _d) = setup().await;
+    let (cookie, csrf) = login(&s).await;
+    let r = handle(
+        s.clone(),
+        request(Method::GET, "/ui/api/volumes", None, Some(&cookie), None),
+    )
+    .await;
+    assert_eq!(r.status(), StatusCode::OK);
+    let r = handle(
+        s.clone(),
+        request(
+            Method::POST,
+            "/ui/api/volumes/orders-db/delete",
+            Some(json!({ "confirm": "wrong" })),
+            Some(&cookie),
+            Some(&csrf),
+        ),
+    )
+    .await;
+    assert_eq!(r.status(), StatusCode::BAD_REQUEST);
+    let r = handle(
+        s.clone(),
+        request(
+            Method::POST,
+            "/ui/api/volumes/orders-db/delete",
+            Some(json!({ "confirm": "orders-db" })),
+            Some(&cookie),
+            Some(&csrf),
+        ),
+    )
+    .await;
+    assert_eq!(r.status(), StatusCode::NOT_FOUND);
+}

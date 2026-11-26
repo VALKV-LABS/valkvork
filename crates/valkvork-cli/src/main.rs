@@ -94,6 +94,23 @@ enum Command {
         #[command(subcommand)]
         cmd: NodeCmd,
     },
+    /// Block volumes
+    Volume {
+        #[command(subcommand)]
+        cmd: VolumeCmd,
+    },
+}
+
+#[derive(Subcommand)]
+enum VolumeCmd {
+    List,
+    /// Destroy a block volume and its data. Refused while a service names it.
+    Delete {
+        name: String,
+        /// Confirm: the volume and its data are destroyed
+        #[arg(long)]
+        yes: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -496,6 +513,66 @@ async fn run(cli: &Cli) -> Result<(), Failure> {
             .await?;
             println!("node {node_id} accepts placements again");
         }
+        Command::Volume {
+            cmd: VolumeCmd::List,
+        } => {
+            let volumes = c
+                .list_volumes(pb::ListVolumesRequest {})
+                .await?
+                .into_inner()
+                .volumes;
+            if as_json {
+                json(&volumes);
+                return Ok(());
+            }
+            table(
+                &[
+                    "NAME", "STATE", "SIZE", "CLASS", "ZONE", "NODE", "USED BY", "CLOUD ID",
+                    "ERROR",
+                ],
+                volumes
+                    .iter()
+                    .map(|v| {
+                        vec![
+                            v.name.clone(),
+                            v.state.clone(),
+                            format!("{}GiB", v.size_bytes >> 30),
+                            if v.iops > 0 || v.throughput_mibps > 0 {
+                                format!(
+                                    "{} ({} iops, {}MiB/s)",
+                                    v.class, v.iops, v.throughput_mibps
+                                )
+                            } else {
+                                v.class.clone()
+                            },
+                            dash(&v.zone),
+                            dash(&v.hostname),
+                            dash(&v.used_by.join(",")),
+                            dash(&v.cloud_id),
+                            dash(&v.error),
+                        ]
+                    })
+                    .collect(),
+            );
+        }
+        Command::Volume {
+            cmd: VolumeCmd::Delete { name, yes },
+        } => {
+            if !yes {
+                return Err(Failure::Other(format!(
+                    "this destroys block volume {name} and its data; run again with --yes"
+                )));
+            }
+            let r = c
+                .delete_volume(pb::DeleteVolumeRequest { name: name.clone() })
+                .await?
+                .into_inner();
+            if r.state.is_empty() {
+                println!("block volume {name} removed (it was never created in the cloud)");
+            } else {
+                println!("block volume {name} is being deleted; `valkvork volume list` shows when it is gone");
+            }
+        }
         Command::Node {
             cmd: NodeCmd::Remove { node_id },
         } => {
@@ -686,4 +763,12 @@ fn time(ms: u64) -> String {
                 .to_string()
         })
         .unwrap_or_default()
+}
+
+fn dash(s: &str) -> String {
+    if s.is_empty() {
+        "-".into()
+    } else {
+        s.to_string()
+    }
 }

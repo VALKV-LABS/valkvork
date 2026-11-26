@@ -26,9 +26,25 @@ pub struct CoreMetrics {
     schedule_count: u64,
     schedule_sum: f64,
     registrations: u64,
+    /// (volume operation, ok) -> count.
+    volume_ops: BTreeMap<(String, bool), u64>,
 }
 
 impl CoreMetrics {
+    /// A volume manager result, by the state it answered (CREATING ->
+    /// create, ATTACHING -> attach, ...).
+    pub fn volume_operation(&mut self, state: &str, ok: bool) {
+        let op = match state {
+            "CREATING" => "create",
+            "ATTACHING" => "attach",
+            "DETACHING" => "detach",
+            "FENCING" => "fence",
+            "DELETING" => "delete",
+            other => other,
+        };
+        *self.volume_ops.entry((op.to_string(), ok)).or_default() += 1;
+    }
+
     pub fn observe_schedule(&mut self, d: Duration) {
         let secs = d.as_secs_f64();
         for (i, b) in SCHEDULE_BUCKETS.iter().enumerate() {
@@ -312,6 +328,43 @@ impl Core {
                 &mut o,
                 "valkvork_nodes_draining",
                 &[("class", class)],
+                *n as f64,
+            );
+        }
+
+        // Block volumes (docs/block-volumes.md).
+        header(
+            &mut o,
+            "valkvork_block_volumes",
+            "gauge",
+            "Block volumes by state.",
+        );
+        let mut by_state: BTreeMap<&str, u32> = crate::model::VolumeState::ALL
+            .iter()
+            .map(|s| (s.as_str(), 0))
+            .collect();
+        for v in self.volumes.values() {
+            *by_state.entry(v.state.as_str()).or_default() += 1;
+        }
+        for (state, n) in &by_state {
+            line(
+                &mut o,
+                "valkvork_block_volumes",
+                &[("state", state)],
+                *n as f64,
+            );
+        }
+        header(
+            &mut o,
+            "valkvork_volume_operations_total",
+            "counter",
+            "Block volume operations finished by the volume manager, by operation and result.",
+        );
+        for ((op, ok), n) in &self.metrics.volume_ops {
+            line(
+                &mut o,
+                "valkvork_volume_operations_total",
+                &[("op", op), ("result", if *ok { "ok" } else { "error" })],
                 *n as f64,
             );
         }

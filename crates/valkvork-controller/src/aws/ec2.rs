@@ -8,7 +8,7 @@
 use super::client::{AwsClient, AwsError};
 use super::xml;
 use crate::volumes::{
-    CloudVolume, CloudVolumeState, DriverError, InstanceState, Result, VolumeDriver,
+    CloudVolume, CloudVolumeState, DriverError, InstanceState, Result, VolumeDriver, VolumeOptions,
 };
 use async_trait::async_trait;
 use std::time::Duration;
@@ -197,6 +197,7 @@ impl VolumeDriver for EbsDriver {
         size_bytes: u64,
         class: &str,
         zone: &str,
+        opts: &VolumeOptions,
     ) -> Result<CloudVolume> {
         let id = match self.find(name).await? {
             Some(v) => v.cloud_id,
@@ -206,28 +207,32 @@ impl VolumeDriver for EbsDriver {
                     .chars()
                     .take(64)
                     .collect();
+                let mut params = vec![
+                    p("AvailabilityZone", zone),
+                    p("Size", gib.to_string()),
+                    p("VolumeType", class),
+                    p("Encrypted", "true"),
+                    p("ClientToken", token),
+                    p("TagSpecification.1.ResourceType", "volume"),
+                    p("TagSpecification.1.Tag.1.Key", TAG_VOLUME),
+                    p("TagSpecification.1.Tag.1.Value", name),
+                    p("TagSpecification.1.Tag.2.Key", TAG_CELL),
+                    p("TagSpecification.1.Tag.2.Value", &self.cell),
+                    p("TagSpecification.1.Tag.3.Key", "Name"),
+                    p(
+                        "TagSpecification.1.Tag.3.Value",
+                        format!("valkvork-{}-{name}", self.cell),
+                    ),
+                ];
+                if let Some(n) = opts.iops {
+                    params.push(p("Iops", n.to_string()));
+                }
+                if let Some(n) = opts.throughput_mibps {
+                    params.push(p("Throughput", n.to_string()));
+                }
                 let body = self
                     .client
-                    .ec2(
-                        "CreateVolume",
-                        &[
-                            p("AvailabilityZone", zone),
-                            p("Size", gib.to_string()),
-                            p("VolumeType", class),
-                            p("Encrypted", "true"),
-                            p("ClientToken", token),
-                            p("TagSpecification.1.ResourceType", "volume"),
-                            p("TagSpecification.1.Tag.1.Key", TAG_VOLUME),
-                            p("TagSpecification.1.Tag.1.Value", name),
-                            p("TagSpecification.1.Tag.2.Key", TAG_CELL),
-                            p("TagSpecification.1.Tag.2.Value", &self.cell),
-                            p("TagSpecification.1.Tag.3.Key", "Name"),
-                            p(
-                                "TagSpecification.1.Tag.3.Value",
-                                format!("valkvork-{}-{name}", self.cell),
-                            ),
-                        ],
-                    )
+                    .ec2("CreateVolume", &params)
                     .await
                     .map_err(err)?;
                 xml::text(&body, "volumeId")
@@ -365,6 +370,8 @@ mod tests {
         instances: HashMap<String, String>,
         next: u32,
         calls: Vec<String>,
+        /// (Iops, Throughput) of the last CreateVolume.
+        provisioned: (Option<String>, Option<String>),
     }
 
     fn form(body: &str) -> HashMap<String, String> {
@@ -423,6 +430,7 @@ mod tests {
                     })
                     .collect();
                 assert_eq!(q["Encrypted"], "true");
+                f.provisioned = (q.get("Iops").cloned(), q.get("Throughput").cloned());
                 f.volumes.insert(
                     id.clone(),
                     (
@@ -558,7 +566,13 @@ mod tests {
     async fn create_is_idempotent_and_tagged() {
         let (d, fake) = driver().await;
         let v = d
-            .create("orders-db", 10 * GIB, "gp3", "us-west-1a")
+            .create(
+                "orders-db",
+                10 * GIB,
+                "gp3",
+                "us-west-1a",
+                &VolumeOptions::default(),
+            )
             .await
             .unwrap();
         assert_eq!(
@@ -566,7 +580,13 @@ mod tests {
             ("us-west-1a", 10 * GIB, CloudVolumeState::Available)
         );
         let again = d
-            .create("orders-db", 10 * GIB, "gp3", "us-west-1a")
+            .create(
+                "orders-db",
+                10 * GIB,
+                "gp3",
+                "us-west-1a",
+                &VolumeOptions::default(),
+            )
             .await
             .unwrap();
         assert_eq!(
@@ -581,6 +601,22 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn create_passes_gp3_provisioning() {
+        let (d, fake) = driver().await;
+        let opts = VolumeOptions {
+            iops: Some(6000),
+            throughput_mibps: Some(500),
+        };
+        d.create("fast", 100 * GIB, "gp3", "us-west-1a", &opts)
+            .await
+            .unwrap();
+        assert_eq!(
+            fake.lock().unwrap().provisioned,
+            (Some("6000".into()), Some("500".into()))
+        );
+    }
+
+    #[tokio::test]
     async fn attach_detach_fence_and_delete() {
         let (d, fake) = driver().await;
         fake.lock()
@@ -591,7 +627,10 @@ mod tests {
             .unwrap()
             .instances
             .insert("i-b".into(), "stopped".into());
-        let v = d.create("db", GIB, "gp3", "us-west-1a").await.unwrap();
+        let v = d
+            .create("db", GIB, "gp3", "us-west-1a", &VolumeOptions::default())
+            .await
+            .unwrap();
         d.attach(&v.cloud_id, "i-a").await.unwrap();
         d.attach(&v.cloud_id, "i-a").await.unwrap();
         assert_eq!(
@@ -608,7 +647,10 @@ mod tests {
         );
         assert!(d.detach(&v.cloud_id, "i-b", false).await.is_err());
         // Fencing: force-detach from whoever holds it.
-        let v = d.create("db2", GIB, "gp3", "us-west-1a").await.unwrap();
+        let v = d
+            .create("db2", GIB, "gp3", "us-west-1a", &VolumeOptions::default())
+            .await
+            .unwrap();
         d.attach(&v.cloud_id, "i-a").await.unwrap();
         d.detach(&v.cloud_id, "i-b", true).await.unwrap();
         assert_eq!(d.describe(&v.cloud_id).await.unwrap().attached_to, None);

@@ -1757,6 +1757,8 @@ fn nodes_keep_their_topology_and_volumes_survive_a_restart() {
         name: "orders-db".into(),
         size_bytes: 100 << 30,
         class: "gp3".into(),
+        iops: Some(6000),
+        throughput_mibps: None,
         driver: "local".into(),
         cloud_id: Some("vol-local-orders-db".into()),
         zone: Some("zone-a".into()),
@@ -2068,6 +2070,107 @@ mod block_volumes {
             .as_deref()
             .unwrap()
             .contains("no [block_volumes] driver"));
+    }
+
+    fn delete(c: &mut Core) -> Result<String, ValkvorkError> {
+        let (tx, mut rx) = oneshot::channel();
+        c.handle(CoreMsg::Admin(AdminOp::DeleteVolume {
+            name: "orders-db".into(),
+            actor: "t".into(),
+            reply: tx,
+        }));
+        c.finish().unwrap();
+        rx.try_recv().unwrap()
+    }
+
+    #[test]
+    fn delete_waits_for_its_services_and_its_mount() {
+        let mut r = rig();
+        let mut a = register(&mut r.c, "a");
+        apply(&mut r.c, &manifest("orders", "postgres:16", 1, DB));
+        r.create_and_attach("a");
+        a.take();
+        run_all(&mut r.c, &a);
+        let e = delete(&mut r.c).unwrap_err().to_string();
+        assert!(e.contains("named by service orders"), "{e}");
+
+        // Delete the service; its agent still has the volume mounted.
+        r.c.handle(CoreMsg::Admin(AdminOp::Delete {
+            service_id: "orders".into(),
+            actor: "t".into(),
+            reply: oneshot::channel().0,
+        }));
+        r.c.finish().unwrap();
+        let hb = |c: &mut Core, a: &Agent, in_use: Vec<String>| {
+            c.handle(CoreMsg::AgentMsg {
+                node_id: a.id.clone(),
+                conn_id: a.conn,
+                msg: pb::agent_message::Msg::Heartbeat(pb::Heartbeat {
+                    seq: 1,
+                    block_volumes: in_use,
+                    ..Default::default()
+                }),
+            });
+            c.finish().unwrap();
+        };
+        hb(&mut r.c, &a, vec!["orders-db".into()]);
+        assert!(!r.c.services.contains_key("orders"));
+        let e = delete(&mut r.c).unwrap_err().to_string();
+        assert!(e.contains("still mounted on host-a"), "{e}");
+
+        // Unmounted: deleting detaches it from a first, unforced.
+        hb(&mut r.c, &a, vec![]);
+        assert_eq!(delete(&mut r.c).unwrap(), "DELETING");
+        assert_eq!(delete(&mut r.c).unwrap(), "DELETING", "idempotent");
+        match r.intent().op {
+            VolumeOp::Delete {
+                cloud_id,
+                instance_id,
+                force,
+            } => {
+                assert_eq!(
+                    (cloud_id.as_str(), instance_id.as_str(), force),
+                    ("vol-1", "i-a", false)
+                );
+            }
+            op => panic!("expected delete, got {op:?}"),
+        }
+        // A failure keeps it, attached, with the cause.
+        r.result(Err("VolumeInUse".into()));
+        let v = r.volume();
+        assert_eq!(v.state, VolumeState::Attached);
+        assert!(v.error.as_deref().unwrap().contains("VolumeInUse"));
+        delete(&mut r.c).unwrap();
+        r.intent();
+        r.result(Ok(VolumeOutcome::Deleted));
+        assert!(r.c.volumes.is_empty());
+        assert!(r.c.db.load_volumes().unwrap().is_empty());
+
+        let m = r.c.render_metrics();
+        assert!(
+            m.contains("valkvork_block_volumes{state=\"ATTACHED\"} 0"),
+            "{m}"
+        );
+        assert!(m.contains("valkvork_volume_operations_total{op=\"delete\",result=\"ok\"} 1"));
+        assert!(m.contains("valkvork_volume_operations_total{op=\"delete\",result=\"error\"} 1"));
+        assert!(m.contains("valkvork_volume_operations_total{op=\"attach\",result=\"ok\"} 1"));
+    }
+
+    #[test]
+    fn listing_shows_state_node_and_users() {
+        let mut r = rig();
+        let _a = register(&mut r.c, "a");
+        apply(&mut r.c, &manifest("orders", "postgres:16", 1, DB));
+        r.create_and_attach("a");
+        let vs = r.c.volume_summaries();
+        assert_eq!(vs.len(), 1);
+        let v = &vs[0];
+        assert_eq!(
+            (v.state.as_str(), v.hostname.as_str(), v.cloud_id.as_str()),
+            ("ATTACHED", "host-a", "vol-1")
+        );
+        assert_eq!(v.used_by, ["orders"]);
+        assert_eq!((v.size_bytes, v.zone.as_str()), (10 << 30, "zone-a"));
     }
 
     #[test]

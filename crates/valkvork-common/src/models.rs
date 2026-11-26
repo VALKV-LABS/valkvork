@@ -200,6 +200,12 @@ pub struct VolumeSpec {
     pub size_bytes: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub class: Option<String>,
+    /// Block volumes, gp3: provisioned IOPS and throughput (MiB/s) at
+    /// creation. Omitted when unset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub iops: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub throughput_mibps: Option<u32>,
 }
 
 impl VolumeSpec {
@@ -750,6 +756,8 @@ mod tests {
             shared: false,
             size_bytes: None,
             class: None,
+            iops: None,
+            throughput_mibps: None,
         });
         let json = a.canonical_json();
         assert!(!json.contains("shared"));

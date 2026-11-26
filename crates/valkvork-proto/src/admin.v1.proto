@@ -14,6 +14,8 @@ service AdminService {
   rpc RemoveNode(RemoveNodeRequest) returns (RemoveNodeResponse);
   rpc ScaleService(ScaleServiceRequest) returns (ScaleServiceResponse);
   rpc ListEvents(ListEventsRequest) returns (ListEventsResponse);
+  rpc ListVolumes(ListVolumesRequest) returns (ListVolumesResponse);
+  rpc DeleteVolume(DeleteVolumeRequest) returns (DeleteVolumeResponse);
 }
 
 message ApplyRequest {
@@ -218,4 +220,40 @@ message ClusterEvent {
   string message = 5;
   string actor = 6;       // controller | cli | ui:<session-id>
   uint64 created_at = 7;
+}
+
+// Block volumes (docs/block-volumes.md).
+message ListVolumesRequest {}
+
+message VolumeSummary {
+  string name = 1;
+  string state = 2;          // CREATING, AVAILABLE, ATTACHING, ATTACHED, DETACHING, FENCING, DELETING, FAILED
+  string driver = 3;         // aws-ebs or local
+  string cloud_id = 4;       // vol-…
+  string zone = 5;
+  uint64 size_bytes = 6;
+  string class = 7;
+  uint32 iops = 8;           // 0: the class's default
+  uint32 throughput_mibps = 9;
+  string node_id = 10;       // attached (or attaching, detaching, being fenced) to
+  string hostname = 11;
+  repeated string used_by = 12;  // services whose manifest names it
+  string error = 13;         // the last failed operation's cause
+  string created_by = 14;
+  uint64 created_at = 15;
+  uint64 updated_at = 16;
+}
+
+message ListVolumesResponse {
+  repeated VolumeSummary volumes = 1;
+}
+
+// Destroys the volume and its data. Refused while a service names it,
+// while it is mid-operation, or while a healthy node still has it mounted.
+message DeleteVolumeRequest {
+  string name = 1;
+}
+
+message DeleteVolumeResponse {
+  string state = 1;          // DELETING, or "" when there was nothing to delete in the cloud
 }

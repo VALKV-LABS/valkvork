@@ -162,6 +162,7 @@ const routes = [
   [/^\/ui\/services\/([^/]+)$/, 'services', servicePage],
   [/^\/ui\/nodes\/?$/, 'nodes', nodesPage],
   [/^\/ui\/nodes\/([^/]+)$/, 'nodes', nodePage],
+  [/^\/ui\/volumes\/?$/, 'volumes', volumesPage],
   [/^\/ui\/workloads\/?$/, 'workloads', workloadsPage],
   [/^\/ui\/events\/?$/, 'events', eventsPage],
   [/^\/ui\/deploy\/?$/, 'deploy', deployPage, true],
@@ -404,6 +405,45 @@ async function nodesPage() {
         bar(n.used_memory_bytes, n.allocatable_memory_bytes),
         n.workload_count, ago(n.last_heartbeat_at), n.agent_version, n.runtime,
       ]), 'No nodes have registered yet.'));
+}
+
+// Block volumes (docs/block-volumes.md): one row each, deletable when no
+// service names it, by typing its name.
+async function volumesPage() {
+  const vols = await api('volumes');
+  const msg = h('div');
+  const gib = (b) => `${Math.round(b / 2 ** 30)} GiB`;
+  const rows = vols.map((v) => {
+    let del = '—';
+    if (v.used_by.length === 0 && v.state !== 'DELETING') {
+      const confirm = h('input', { type: 'text', placeholder: `type ${v.name}`, 'aria-label': `Type ${v.name} to delete it` });
+      const btn = h('button', { type: 'submit', class: 'danger', disabled: true }, 'Delete');
+      confirm.addEventListener('input', () => { btn.disabled = confirm.value !== v.name; });
+      del = h('form', {
+        class: 'inline',
+        onsubmit: async (e) => {
+          e.preventDefault();
+          try {
+            await api(`volumes/${enc(v.name)}/delete`, { method: 'POST', body: { confirm: confirm.value } });
+            msg.replaceChildren(h('div', { class: 'msg ok' }, `Deleting ${v.name}: the volume and its data are destroyed.`));
+            render(true);
+          } catch (err) { msg.replaceChildren(errorBox(err)); }
+        },
+      }, confirm, btn);
+    }
+    const provisioned = v.iops || v.throughput_mibps ? ` (${v.iops} IOPS, ${v.throughput_mibps} MiB/s)` : '';
+    return [
+      h('span', { class: 'mono' }, v.name), badge(v.state), gib(v.size_bytes), v.class + provisioned,
+      v.zone || '—', v.node_id ? link(`/ui/nodes/${enc(v.node_id)}`, v.hostname || short(v.node_id)) : '—',
+      v.used_by.length ? v.used_by.map((s) => link(`/ui/services/${enc(s)}`, s)).reduce((a, b) => [a, ', ', b]) : '—',
+      h('span', { class: 'mono' }, v.cloud_id || '—'), v.error || '', del,
+    ];
+  });
+  return h('div', {},
+    h('h1', {}, 'Volumes'),
+    h('p', { class: 'sub' }, `${vols.length} block volumes. A volume outlives its service; delete it here once no service names it.`),
+    msg,
+    table(['Name', 'State', 'Size', 'Class', 'Zone', 'Node', 'Used by', 'Cloud id', 'Error', ''], rows, 'No block volumes.'));
 }
 
 async function nodePage(id) {

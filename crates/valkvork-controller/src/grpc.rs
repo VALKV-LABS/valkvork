@@ -369,6 +369,33 @@ impl pb::admin_service_server::AdminService for AdminApi {
         }))
     }
 
+    async fn list_volumes(
+        &self,
+        _request: Request<pb::ListVolumesRequest>,
+    ) -> Result<Response<pb::ListVolumesResponse>, Status> {
+        let volumes = self
+            .core
+            .ask(|reply| AdminOp::ListVolumes { reply })
+            .await?;
+        Ok(Response::new(pb::ListVolumesResponse { volumes }))
+    }
+
+    async fn delete_volume(
+        &self,
+        request: Request<pb::DeleteVolumeRequest>,
+    ) -> Result<Response<pb::DeleteVolumeResponse>, Status> {
+        let name = request.into_inner().name;
+        let state = self
+            .core
+            .ask(|reply| AdminOp::DeleteVolume {
+                name,
+                actor: CLI.into(),
+                reply,
+            })
+            .await?;
+        Ok(Response::new(pb::DeleteVolumeResponse { state }))
+    }
+
     async fn scale_service(
         &self,
         request: Request<pb::ScaleServiceRequest>,

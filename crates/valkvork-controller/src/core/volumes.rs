@@ -52,6 +52,7 @@ impl Core {
                         | VolumeState::Attaching
                         | VolumeState::Detaching
                         | VolumeState::Fencing
+                        | VolumeState::Deleting
                 )
             })
             .cloned()
@@ -129,6 +130,8 @@ impl Core {
                         name: name.clone(),
                         size_bytes: spec.size_bytes.unwrap_or(0),
                         class: spec.class.clone().unwrap_or_else(|| "gp3".into()),
+                        iops: spec.iops,
+                        throughput_mibps: spec.throughput_mibps,
                         driver: self.volume_system.as_ref().unwrap().driver.name().into(),
                         cloud_id: None,
                         zone: Some(zone.clone()),
@@ -281,6 +284,10 @@ impl Core {
                 size_bytes: v.size_bytes,
                 class: v.class.clone(),
                 zone: v.zone.clone().unwrap_or_default(),
+                opts: crate::volumes::VolumeOptions {
+                    iops: v.iops,
+                    throughput_mibps: v.throughput_mibps,
+                },
             },
             VolumeState::Attaching => VolumeOp::Attach {
                 cloud_id,
@@ -293,6 +300,16 @@ impl Core {
             VolumeState::Fencing => VolumeOp::Fence {
                 cloud_id,
                 instance_id: instance(self),
+            },
+            VolumeState::Deleting => VolumeOp::Delete {
+                instance_id: instance(self),
+                // The node is gone or unreachable: nothing will unmount it.
+                force: v.node_id.as_ref().is_some_and(|n| {
+                    self.nodes
+                        .get(n)
+                        .is_none_or(|e| e.node.status == NodeStatus::Unhealthy)
+                }),
+                cloud_id,
             },
             _ => return,
         };
@@ -308,6 +325,7 @@ impl Core {
             return;
         };
         let was = v.state;
+        self.metrics.volume_operation(was.as_str(), result.is_ok());
         match (was, result) {
             (VolumeState::Creating, Ok(VolumeOutcome::Created { cloud_id, zone })) => {
                 v.cloud_id = Some(cloud_id);
@@ -365,6 +383,25 @@ impl Core {
                 self.set_volume(v);
                 self.volume_retry_at
                     .insert(name.to_string(), std::time::Instant::now() + VOLUME_RETRY);
+            }
+            (VolumeState::Deleting, Ok(VolumeOutcome::Deleted)) => {
+                self.remove_volume(name);
+                self.event(
+                    EventKind::Workload,
+                    SubjectType::Service,
+                    &v.created_by,
+                    format!("block volume {name} deleted"),
+                    CONTROLLER,
+                );
+            }
+            (VolumeState::Deleting, Err(e)) => {
+                v.state = if v.node_id.is_some() {
+                    VolumeState::Attached
+                } else {
+                    VolumeState::Available
+                };
+                v.error = Some(format!("delete failed: {e}"));
+                self.set_volume(v);
             }
             (state, r) => {
                 tracing::warn!(volume = name, state = state.as_str(), result = ?r, "unexpected volume result ignored");
@@ -443,5 +480,117 @@ impl Core {
             .map(|p| p.display().to_string())
             .unwrap_or_default();
         (cloud_id, local)
+    }
+
+    /// The services whose manifests name block volume `name`.
+    fn services_using(&self, name: &str) -> Vec<String> {
+        self.services
+            .values()
+            .filter(|s| {
+                s.spec
+                    .volumes
+                    .iter()
+                    .any(|v| v.is_block() && v.source == name)
+            })
+            .map(|s| s.service_id.clone())
+            .collect()
+    }
+
+    pub(crate) fn volume_summaries(&self) -> Vec<valkvork_proto::v1::VolumeSummary> {
+        self.volumes
+            .values()
+            .map(|v| valkvork_proto::v1::VolumeSummary {
+                name: v.name.clone(),
+                state: v.state.as_str().to_string(),
+                driver: v.driver.clone(),
+                cloud_id: v.cloud_id.clone().unwrap_or_default(),
+                zone: v.zone.clone().unwrap_or_default(),
+                size_bytes: v.size_bytes,
+                class: v.class.clone(),
+                iops: v.iops.unwrap_or(0),
+                throughput_mibps: v.throughput_mibps.unwrap_or(0),
+                node_id: v.node_id.clone().unwrap_or_default(),
+                hostname: v
+                    .node_id
+                    .as_ref()
+                    .and_then(|n| self.nodes.get(n))
+                    .map(|e| e.node.hostname.clone())
+                    .unwrap_or_default(),
+                used_by: self.services_using(&v.name),
+                error: v.error.clone().unwrap_or_default(),
+                created_by: v.created_by.clone(),
+                created_at: v.created_at as u64,
+                updated_at: v.updated_at as u64,
+            })
+            .collect()
+    }
+
+    /// `valkvork volume delete`: destroy `name` and its data. Refused while a
+    /// service names it (it would be created again), while it is
+    /// mid-operation, or while a healthy node still has it mounted.
+    pub(crate) fn delete_volume(
+        &mut self,
+        name: &str,
+        actor: &str,
+    ) -> Result<String, valkvork_common::ValkvorkError> {
+        use valkvork_common::ValkvorkError::{FailedPrecondition, NotFound};
+        let v = self
+            .volumes
+            .get(name)
+            .cloned()
+            .ok_or_else(|| NotFound(format!("block volume {name}")))?;
+        let users = self.services_using(name);
+        if !users.is_empty() {
+            return Err(FailedPrecondition(format!(
+                "block volume {name} is named by service {}: delete it, or remove the volume from its manifest, first",
+                users.join(", ")
+            )));
+        }
+        match v.state {
+            VolumeState::Deleting => return Ok("DELETING".into()),
+            VolumeState::Creating
+            | VolumeState::Attaching
+            | VolumeState::Detaching
+            | VolumeState::Fencing => {
+                return Err(FailedPrecondition(format!(
+                    "block volume {name} is {}; try again when it is done",
+                    v.state.as_str().to_lowercase()
+                )));
+            }
+            _ => {}
+        }
+        if let Some(n) = &v.node_id {
+            if let Some(e) = self.nodes.get(n) {
+                if e.node.status != NodeStatus::Unhealthy && e.block_in_use.contains(name) {
+                    return Err(FailedPrecondition(format!(
+                        "block volume {name} is still mounted on {}",
+                        e.node.hostname
+                    )));
+                }
+            }
+        }
+        self.event(
+            EventKind::Audit,
+            SubjectType::Service,
+            &v.created_by,
+            format!("delete block volume {name}"),
+            actor,
+        );
+        let Some(_) = &v.cloud_id else {
+            // Never created in the cloud: only the row.
+            self.remove_volume(name);
+            return Ok(String::new());
+        };
+        if self.volume_system.is_none() {
+            return Err(FailedPrecondition(
+                "this controller has no [block_volumes] driver to delete it with".into(),
+            ));
+        }
+        let mut v = v;
+        v.state = VolumeState::Deleting;
+        v.error = None;
+        self.set_volume(v.clone());
+        self.send_intent_for(&v);
+        Ok("DELETING".into())
     }
 }
