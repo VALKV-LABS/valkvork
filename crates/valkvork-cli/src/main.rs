@@ -184,6 +184,14 @@ async fn connect(cli: &Cli) -> Result<Client, Failure> {
 
 #[tokio::main]
 async fn main() -> ExitCode {
+    // Rust ignores SIGPIPE, so `valkvork events | head` would panic on the
+    // first write after head exits. Die of it quietly, like other tools.
+    #[cfg(unix)]
+    // SAFETY: setting a signal's disposition to the default, before any
+    // other thread could depend on it.
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+    }
     let cli = Cli::parse();
     match run(&cli).await {
         Ok(()) => ExitCode::SUCCESS,
