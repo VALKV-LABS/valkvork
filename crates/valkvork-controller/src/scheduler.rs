@@ -472,6 +472,8 @@ mod tests {
             shared: false,
             size_bytes: None,
             class: None,
+            iops: None,
+            throughput_mibps: None,
         });
         assert!(s.place(&v).unwrap_err().contains("pgdata"));
         s.nodes
@@ -526,6 +528,8 @@ mod tests {
             shared: false,
             size_bytes: None,
             class: None,
+            iops: None,
+            throughput_mibps: None,
         });
         assert_eq!(s.place(&v).unwrap(), "a");
         s.reserve("a", &v, true);
@@ -545,6 +549,8 @@ mod tests {
             shared: false,
             size_bytes: Some(10 << 30),
             class: Some("gp3".into()),
+            iops: None,
+            throughput_mibps: None,
         }
     }
 

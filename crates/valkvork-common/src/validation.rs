@@ -172,6 +172,11 @@ struct RawVolume {
     size: Option<String>,
     #[serde(default)]
     class: Option<String>,
+    /// Block volumes, gp3: provisioned IOPS and throughput (`"250MiB"`, per second).
+    #[serde(default)]
+    iops: Option<i64>,
+    #[serde(default)]
+    throughput: Option<String>,
     #[serde(default)]
     read_only: bool,
     /// Defaults to true for writable volumes (only one live workload uses
@@ -410,7 +415,7 @@ fn canonicalise(mut raw: RawManifest, out: &mut Vec<ValidationError>) -> Option<
     // Block volumes: name, size and class; always single-writer. The other
     // types take none of those.
     let mut block_names = HashSet::new();
-    let mut block_specs: Vec<Option<(u64, String)>> = Vec::with_capacity(raw.volumes.len());
+    let mut block_specs: Vec<Option<BlockFields>> = Vec::with_capacity(raw.volumes.len());
     for (i, v) in raw.volumes.iter().enumerate() {
         let mut bad = |field: &str, msg: String| {
             out.push(ValidationError::new(
@@ -424,6 +429,8 @@ fn canonicalise(mut raw: RawManifest, out: &mut Vec<ValidationError>) -> Option<
                 (v.name.is_some(), "name"),
                 (v.size.is_some(), "size"),
                 (v.class.is_some(), "class"),
+                (v.iops.is_some(), "iops"),
+                (v.throughput.is_some(), "throughput"),
             ] {
                 if set {
                     bad(
@@ -505,7 +512,51 @@ fn canonicalise(mut raw: RawManifest, out: &mut Vec<ValidationError>) -> Option<
                 b
             }
         };
-        block_specs.push(Some((size, class)));
+        // gp3 provisioning: 3000 to 16000 IOPS, at most 500 per GiB;
+        // 125 to 1000 MiB/s, at most a quarter of the IOPS.
+        let gib = size >> 30;
+        let iops = v.iops.and_then(|n| {
+            if class != "gp3" {
+                bad("iops", format!("iops applies to gp3 volumes, not {class}"));
+                ok = false;
+                None
+            } else if !(3000..=16000).contains(&n) || (gib > 0 && n as u64 > 500 * gib) {
+                bad(
+                    "iops",
+                    format!(
+                        "{n}: 3000 to 16000 for gp3, and at most 500 per GiB ({})",
+                        500 * gib.max(1)
+                    ),
+                );
+                ok = false;
+                None
+            } else {
+                Some(n as u32)
+            }
+        });
+        let throughput = v.throughput.as_deref().and_then(|t| {
+            let mib = crate::units::parse_size(t).map(|b| b.0 >> 20);
+            let limit = iops.unwrap_or(3000) as u64 / 4;
+            match mib {
+                _ if class != "gp3" => {
+                    bad("throughput", format!("throughput applies to gp3 volumes, not {class}"));
+                    ok = false;
+                    None
+                }
+                Ok(m) if (125..=1000).contains(&m) && m <= limit => Some(m as u32),
+                Ok(m) => {
+                    bad("throughput", format!("{m}MiB: 125 to 1000 MiB per second for gp3, and at most a quarter of the IOPS ({limit}MiB)"));
+                    ok = false;
+                    None
+                }
+                Err(e) => {
+                    bad("throughput", format!("{e}, e.g. \"250MiB\" (per second)"));
+                    ok = false;
+                    None
+                }
+            }
+        });
+        block_specs.push(Some((size, class, iops, throughput)));
     }
 
     // VE-07: sharing rules only apply to writable host volumes.
@@ -800,7 +851,9 @@ fn canonicalise(mut raw: RawManifest, out: &mut Vec<ValidationError>) -> Option<
                 read_only: v.read_only,
                 shared: v.single_writer == Some(false),
                 size_bytes: block.as_ref().map(|b| b.0),
-                class: block.map(|b| b.1),
+                class: block.as_ref().map(|b| b.1.clone()),
+                iops: block.as_ref().and_then(|b| b.2),
+                throughput_mibps: block.and_then(|b| b.3),
             })
             .collect(),
         autoscale,
@@ -813,6 +866,9 @@ fn canonicalise(mut raw: RawManifest, out: &mut Vec<ValidationError>) -> Option<
     };
     ok.then_some(spec)
 }
+
+/// A block volume's size, class, IOPS and throughput (MiB/s), validated.
+type BlockFields = (u64, String, Option<u32>, Option<u32>);
 
 /// A block volume's name: cluster-wide, used in cloud tags and as a
 /// directory name on nodes.
@@ -1867,6 +1923,34 @@ target_cpu_percent = 75
                 "{extra}"
             );
         }
+        // gp3 provisioning.
+        let gp3 = |extra: &str| block(&format!("name = \"db\"\nsize = \"100GiB\"\n{extra}"));
+        let p = parse_manifest_str(&gp3("iops = 6000\nthroughput = \"500MiB\"")).unwrap();
+        assert_eq!(
+            (p.spec.volumes[0].iops, p.spec.volumes[0].throughput_mibps),
+            (Some(6000), Some(500))
+        );
+        for (extra, field) in [
+            ("iops = 2000", "volumes[0].iops"),
+            ("iops = 60000", "volumes[0].iops"),
+            ("throughput = \"2000MiB\"", "volumes[0].throughput"),
+            ("throughput = \"800MiB\"", "volumes[0].throughput"), // over 3000/4 = 750
+            ("throughput = \"fast\"", "volumes[0].throughput"),
+            ("class = \"gp2\"\niops = 3000", "volumes[0].iops"),
+        ] {
+            assert_eq!(
+                err_code(&gp3(extra)),
+                (Code::InvalidVolumeSpec, field.into()),
+                "{extra}"
+            );
+        }
+        // 500 IOPS per GiB: 4 GiB allows 2000, below gp3's minimum.
+        let small = block("name = \"db\"\nsize = \"4GiB\"\niops = 3000");
+        assert_eq!(
+            err_code(&small),
+            (Code::InvalidVolumeSpec, "volumes[0].iops".into())
+        );
+
         let twice = format!(
             "{VALID}\n[[volumes]]\ntype = \"block\"\nname = \"db\"\nsize = \"10GiB\"\ntarget = \"/a\"\n\n[[volumes]]\ntype = \"block\"\nname = \"db\"\nsize = \"10GiB\"\ntarget = \"/b\"\n"
         );

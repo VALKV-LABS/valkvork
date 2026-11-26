@@ -82,6 +82,9 @@ pub struct Volume {
     pub name: String,
     pub size_bytes: u64,
     pub class: String,
+    /// gp3 provisioning it was created with; None: the class's default.
+    pub iops: Option<u32>,
+    pub throughput_mibps: Option<u32>,
     /// `aws-ebs` or `local`.
     pub driver: String,
     /// The cloud's id (`vol-…`) once created.

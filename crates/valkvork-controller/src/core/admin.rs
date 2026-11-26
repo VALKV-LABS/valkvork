@@ -54,6 +54,15 @@ pub enum AdminOp {
         actor: String,
         reply: Reply<u32>,
     },
+    ListVolumes {
+        reply: Reply<Vec<pb::VolumeSummary>>,
+    },
+    /// Returns the state it moved to (DELETING, or "" if only a row).
+    DeleteVolume {
+        name: String,
+        actor: String,
+        reply: Reply<String>,
+    },
     GetService {
         service_id: String,
         reply: Reply<pb::ServiceDetail>,
@@ -178,6 +187,15 @@ impl Core {
                 let _ = reply.send(Ok(
                     self.node_summaries(node_id.as_deref(), node_class.as_deref())
                 ));
+            }
+            AdminOp::ListVolumes { reply } => {
+                let _ = reply.send(Ok(self.volume_summaries()));
+            }
+            AdminOp::DeleteVolume { name, actor, reply } => {
+                let res = self.delete_volume(&name, &actor);
+                self.after_commit(move || {
+                    let _ = reply.send(res);
+                });
             }
             AdminOp::Overview { reply } => {
                 let _ = reply.send(Ok(self.overview()));
@@ -853,11 +871,15 @@ pub fn spec_to_toml(s: &valkvork_common::models::ServiceSpec) -> String {
         if v.is_block() {
             let _ = writeln!(
                 o,
-                "[[volumes]]\ntype = \"block\"\nname = {:?}\nsize = \"{}GiB\"\nclass = {:?}\ntarget = {:?}\n",
+                "[[volumes]]\ntype = \"block\"\nname = {:?}\nsize = \"{}GiB\"\nclass = {:?}\ntarget = {:?}\n{}{}",
                 v.source,
                 v.size_bytes.unwrap_or(0) >> 30,
                 v.class.as_deref().unwrap_or("gp3"),
                 v.target,
+                v.iops.map(|n| format!("iops = {n}\n")).unwrap_or_default(),
+                v.throughput_mibps
+                    .map(|n| format!("throughput = \"{n}MiB\"\n"))
+                    .unwrap_or_default(),
             );
             continue;
         }

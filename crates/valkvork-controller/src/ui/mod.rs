@@ -580,6 +580,29 @@ async fn api(state: &Arc<UiState>, req: Request<Body>, rest: &str) -> ApiResult 
             ok(&json!({ "accepted": true }))
         }
 
+        (&Method::GET, ["volumes"]) => {
+            let volumes = core.ask(|reply| AdminOp::ListVolumes { reply }).await?;
+            ok(&volumes)
+        }
+        (&Method::POST, ["volumes", name, "delete"]) => {
+            let name = name.to_string();
+            let body: DeleteBody = read_json(req.into_body()).await?;
+            // Destroys data: confirmed by typing the volume's name.
+            if body.confirm != name {
+                return Err(ApiError::new(
+                    StatusCode::BAD_REQUEST,
+                    "type the volume's name to confirm the delete",
+                ));
+            }
+            let state = core
+                .ask(|reply| AdminOp::DeleteVolume {
+                    name,
+                    actor: actor.clone(),
+                    reply,
+                })
+                .await?;
+            ok(&serde_json::json!({ "state": state }))
+        }
         (&Method::GET, ["nodes"]) => {
             let nodes = core
                 .ask(|reply| AdminOp::ListNodes {

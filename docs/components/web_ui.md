@@ -28,6 +28,7 @@ The split is a tower layer (`UiLayer`) wrapped around tonic's server, which also
 | Services | `/ui/services` | Id, image, version, running/target, CPU, status, rollout status | |
 | Service detail | `/ui/services/<id>` | Status, rollout progress, a 60-minute CPU sparkline, workloads with node, status, reason and restarts, scaling events, the canonical spec as TOML | **Scale**; **Delete**, enabled only once you type the service id |
 | Nodes | `/ui/nodes` | Id, hostname, class, status and draining, CPU and memory allocation bars, workload count, heartbeat age, agent and runtime versions | |
+| Volumes | `/ui/volumes` | Block volumes: name, state, size, class, zone, node, the services that name it, cloud id, last error | **Delete** once no service names it, confirmed by typing the name |
 | Node detail | `/ui/nodes/<id>` | Capacity and allocation, address, host volumes, the workloads on the node | **Drain** (with a confirmation) / **Undrain**; **Remove** (with a confirmation) on an UNHEALTHY node |
 | Workloads | `/ui/workloads?service=&node=&status=` | Every workload, filterable | |
 | Events | `/ui/events?kind=` | Cluster events, newest first, filterable by kind | |
@@ -65,6 +66,8 @@ Internal and unversioned (FR-UI-05); scripts should use the gRPC API or the CLI.
 | `GET /ui/api/nodes`, `GET /ui/api/nodes/<id>` | Node list; detail with its workloads |
 | `POST /ui/api/nodes/<id>/drain`, `…/undrain` | Drain or undrain |
 | `POST /ui/api/nodes/<id>/remove` | Remove an UNHEALTHY node (`409` if it is HEALTHY) |
+| `GET /ui/api/volumes` | Block volumes |
+| `POST /ui/api/volumes/<name>/delete` `{confirm}` | Delete a block volume; `confirm` must equal its name |
 | `GET /ui/api/workloads?service=&node=&status=` | Workloads |
 | `GET /ui/api/cluster-events?kind=&limit=` | Events (default 100, max 1000) |
 | `POST /ui/api/plan`, `POST /ui/api/apply` `{manifest}` | Plan or apply a manifest |

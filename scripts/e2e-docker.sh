@@ -495,8 +495,16 @@ bv_running "re-applied"
 for _ in $(seq 20); do [ "$(wc -l < "$BV/data/runs")" -ge 3 ] && break; sleep 1; done
 [ "$(cat "$BV/data/runs" | tr '\n' ' ')" = "run-1 run-2 run-3 " ] || fail "after delete and re-apply: $(cat "$BV/data/runs")"
 pass "block volume: outlives its service; a new one finds the data"
+vk volume list | grep -E "^e2e-data +ATTACHED +1GiB +gp3 +local-a +.* block-demo " >/dev/null || { vk volume list; fail "volume list"; }
+vk volume delete e2e-data --yes 2>&1 | grep -q "named by service block-demo" || fail "deleted while a service names it"
 vk delete service block-demo >/dev/null
-for _ in $(seq 30); do [ -z "$(docker ps -aq --filter label=valkvork.service_id=block-demo)" ] && break; sleep 1; done
+for _ in $(seq 30); do vk status 2>/dev/null | grep -q block-demo || break; sleep 1; done
+vk volume delete e2e-data 2>&1 | grep -q -- "--yes" || fail "deleted without --yes"
+for _ in $(seq 10); do vk volume delete e2e-data --yes >/dev/null 2>&1 && break; sleep 1; done
+for _ in $(seq 30); do [ -z "$(vk volume list | grep e2e-data)" ] && break; sleep 1; done
+[ -z "$(vk volume list | grep e2e-data)" ] || { vk volume list; fail "e2e-data not deleted"; }
+[ ! -d "$BV" ] || fail "the local volume's directory is still there"
+pass "volume list and volume delete: refused while named or without --yes; deleted with its data"
 
 # ── secrets as files: /run/secrets, not in docker inspect, rotated in place ─
 printf 'k3y-%s\n' "$(head -c 6 /dev/urandom | od -An -tx1 | tr -d ' \n')" > "$W/secrets/api_key"

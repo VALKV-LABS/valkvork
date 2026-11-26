@@ -1,6 +1,6 @@
 # Block Volumes (Design)
 
-*Spec §7.3, FR-STO-10 … FR-STO-15. Status: stages 1 to 3 built (the model, the volume manager, the `local` and `aws-ebs` drivers, fencing, the agent's device handling); stage 4 (operations) to come.*
+*Spec §7.3, FR-STO-10 … FR-STO-14. Status: built, stages 1 to 4. Not built: I/O limits (FR-STO-15), resizing, snapshots, multi-attach.*
 
 Host volumes are directories that never leave their node, so a stateful service is pinned to one VM: if it dies, the service waits for it (see [placement-and-storage.md](placement-and-storage.md)). Block volumes are cloud disks (AWS EBS first) that Valkvork creates, attaches to whichever node runs the workload, and moves to another node when that one fails, without ever letting two nodes write to the same disk.
 
@@ -13,8 +13,8 @@ name   = "orders-db"                  # cluster-wide; the volume outlives the se
 size   = "100GiB"
 class  = "gp3"                        # gp3 (default), gp2, io1, io2, st1, sc1
 target = "/var/lib/postgresql/data"
-# iops       = 6000                   # gp3/io1/io2 provisioned IOPS          [stage 4]
-# throughput = "250MiB"               # gp3 provisioned throughput            [stage 4]
+# iops       = 6000                   # gp3: 3000-16000, at most 500 per GiB
+# throughput = "250MiB"               # gp3: 125-1000 MiB/s, at most iops / 4
 ```
 
 - **Single-writer, always.** One live workload uses a block volume at a time, cluster-wide. `read_only` and `single_writer = false` are rejected. The existing stop-first updates and drains apply unchanged: the old workload stops and its container is gone before the new one starts.
@@ -135,14 +135,21 @@ Each agent reports, in `Register`:
 - **The agent** finds the device by the volume id (`/dev/disk/by-id/nvme-Amazon_Elastic_Block_Store_vol…`, or an NVMe controller whose serial is the id), waits up to 60 s for it, runs `mkfs` only when `blkid` finds no filesystem, mounts it at `<data_dir>/block/<name>` with `noatime`, and bind-mounts that into the container. After the last container using it is gone it unmounts it; a mounted volume counts as in use, so the controller never detaches it under a filesystem. Mounts and unmounts are serialised, so a stop-first update on the same node never reuses a mount that is being taken down.
 - **IAM** (goldenimage `block_volumes_enabled`): the controller's role may create volumes only with its cell's `valkvork:cell` tag, attach, detach and delete only volumes with that tag and only on its cell's instances, and use KMS only through EC2.
 
+### Operations (stage 4)
+
+- `valkvork volume list` and the UI's **Volumes** page show every volume: state, size, class and provisioning, zone, node, the services that name it, cloud id and the last error.
+- `valkvork volume delete <name> --yes` (or **Delete** on the page, confirmed by typing the name) destroys a volume: DELETING, then the manager detaches it (forced if its node is gone) and deletes it, and the row goes. It is refused while a service names it (the next placement would create it again), while it is mid-operation, or while a healthy node still has it mounted. A failed delete leaves it as it was, with the error. Recorded in the audit log.
+- gp3 `iops` and `throughput` are applied at creation. Changing them, or `size` or `class`, later does not change an existing volume.
+- Metrics: `valkvork_block_volumes{state}` and `valkvork_volume_operations_total{op,result}`.
+
 ## Stages
 
 | Stage | Contents | Needs AWS |
 |---|---|---|
 | **1. Topology and model** | Agents report `zone`, `instance_id`, `max_block_volumes`; `type = "block"` in manifests (validation, `block_volumes` feature, always single-writer); the `volumes` table; the scheduler's zone, slot and cluster-wide single-writer filters; the `VolumeDriver` trait and the `local` driver. No agent advertises `block_volumes` yet, so such workloads stay PENDING with a clear reason | No |
 | **2. Volume manager and agent mount** | The state machine, intents and results, start gating, rollback (`VOLUME_ATTACH_FAILED`), resume after a controller restart; `StartWorkload` with block volumes; the agent's device lookup, `mkfs`, mount, unmount and release reports; `make e2e` with the `local` driver | No |
-| **3. EBS and fencing** | The EC2 client (SigV4, IMDSv2 credentials), the `aws-ebs` driver, fencing; IAM for the controller's role in valkv-platform-infra; verified on a dev cell: create, move after a node is stopped, force-detach from a partitioned node | Yes |
-| **4. Operations** | `valkvork volume list/delete`, the UI's Volumes page, `iops`/`throughput`, I/O limits (FR-STO-15), metrics, docs | No |
+| **3. EBS and fencing** | The EC2 client (SigV4, IMDSv2 credentials), the `aws-ebs` driver, fencing; IAM for the controller's role in goldenimage (`block_volumes_enabled`; valkv-platform-infra's `platform-cell` still needs the same); verified on a dev cell: create, move after a node is stopped, force-detach from a partitioned node | Yes |
+| **4. Operations** | `valkvork volume list/delete`, the UI's Volumes page, gp3 `iops`/`throughput`, metrics, docs. I/O limits (FR-STO-15) are left for later | No |
 
 ## Verified
 

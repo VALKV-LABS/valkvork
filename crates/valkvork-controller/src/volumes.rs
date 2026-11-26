@@ -28,6 +28,13 @@ pub enum CloudVolumeState {
     Error,
 }
 
+/// Provisioning beyond size and class, applied at creation.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct VolumeOptions {
+    pub iops: Option<u32>,
+    pub throughput_mibps: Option<u32>,
+}
+
 /// An instance's state, for fencing (FR-STO-13).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InstanceState {
@@ -70,6 +77,7 @@ pub trait VolumeDriver: Send + Sync + 'static {
         size_bytes: u64,
         class: &str,
         zone: &str,
+        opts: &VolumeOptions,
     ) -> Result<CloudVolume>;
     async fn describe(&self, cloud_id: &str) -> Result<CloudVolume>;
     /// Attach to `instance_id`; already attached there is success, attached
@@ -100,6 +108,7 @@ pub enum VolumeOp {
         size_bytes: u64,
         class: String,
         zone: String,
+        opts: VolumeOptions,
     },
     Attach {
         cloud_id: String,
@@ -116,6 +125,13 @@ pub enum VolumeOp {
         cloud_id: String,
         instance_id: String,
     },
+    /// `valkvork volume delete`: detach from `instance_id` if attached
+    /// (forced when that node is gone), then destroy the volume.
+    Delete {
+        cloud_id: String,
+        instance_id: String,
+        force: bool,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -129,6 +145,7 @@ pub enum VolumeOutcome {
     Created { cloud_id: String, zone: String },
     Attached,
     Detached,
+    Deleted,
 }
 
 pub type VolumeReply = std::result::Result<VolumeOutcome, String>;
@@ -167,9 +184,10 @@ pub async fn carry_out(driver: &dyn VolumeDriver, name: &str, op: VolumeOp) -> V
             size_bytes,
             class,
             zone,
+            opts,
         } => {
             let v = driver
-                .create(name, size_bytes, &class, &zone)
+                .create(name, size_bytes, &class, &zone, &opts)
                 .await
                 .map_err(e)?;
             Ok(VolumeOutcome::Created {
@@ -219,6 +237,20 @@ pub async fn carry_out(driver: &dyn VolumeDriver, name: &str, op: VolumeOp) -> V
                 .await
                 .map_err(e)?;
             Ok(VolumeOutcome::Detached)
+        }
+        VolumeOp::Delete {
+            cloud_id,
+            instance_id,
+            force,
+        } => {
+            if !instance_id.is_empty() {
+                driver
+                    .detach(&cloud_id, &instance_id, force)
+                    .await
+                    .map_err(e)?;
+            }
+            driver.delete(&cloud_id).await.map_err(e)?;
+            Ok(VolumeOutcome::Deleted)
         }
     }
 }
@@ -294,6 +326,7 @@ impl VolumeDriver for LocalDriver {
         size_bytes: u64,
         _class: &str,
         zone: &str,
+        _opts: &VolumeOptions,
     ) -> Result<CloudVolume> {
         let id = format!("vol-local-{name}");
         if self.read(&id).is_err() {
@@ -388,7 +421,13 @@ mod tests {
         let d = tempfile::tempdir().unwrap();
         let drv = LocalDriver::new(d.path()).unwrap();
         let v = drv
-            .create("orders-db", 1 << 30, "gp3", "zone-a")
+            .create(
+                "orders-db",
+                1 << 30,
+                "gp3",
+                "zone-a",
+                &VolumeOptions::default(),
+            )
             .await
             .unwrap();
         assert_eq!(v.cloud_id, "vol-local-orders-db");
@@ -396,7 +435,13 @@ mod tests {
         // Idempotent: the same volume, with its data.
         std::fs::write(drv.data_dir(&v.cloud_id).join("row"), "1").unwrap();
         let again = drv
-            .create("orders-db", 1 << 30, "gp3", "zone-a")
+            .create(
+                "orders-db",
+                1 << 30,
+                "gp3",
+                "zone-a",
+                &VolumeOptions::default(),
+            )
             .await
             .unwrap();
         assert_eq!(again, v);
@@ -440,6 +485,7 @@ mod tests {
                 size_bytes: 1 << 30,
                 class: "gp3".into(),
                 zone: "z1".into(),
+                opts: VolumeOptions::default(),
             },
         )
         .await

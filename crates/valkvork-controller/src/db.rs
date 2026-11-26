@@ -181,6 +181,14 @@ CREATE TABLE volumes (
 );
 "#,
     ),
+    (
+        5,
+        // gp3 provisioning a block volume was created with.
+        r#"
+ALTER TABLE volumes ADD COLUMN iops INTEGER;
+ALTER TABLE volumes ADD COLUMN throughput_mibps INTEGER;
+"#,
+    ),
 ];
 
 /// The serials a node may present: the newest, and the one before it so an
@@ -400,7 +408,8 @@ impl Db {
             .conn
             .prepare(
                 "SELECT name, size_bytes, class, driver, cloud_id, zone, state, node_id, error,
-                        created_by, created_at, updated_at FROM volumes ORDER BY name",
+                        created_by, created_at, updated_at, iops, throughput_mibps
+                 FROM volumes ORDER BY name",
             )
             .map_err(db_err)?;
         let rows = stmt
@@ -425,6 +434,8 @@ impl Db {
                     created_by: r.get(9)?,
                     created_at: r.get(10)?,
                     updated_at: r.get(11)?,
+                    iops: r.get(12)?,
+                    throughput_mibps: r.get(13)?,
                 })
             })
             .map_err(db_err)?;
@@ -443,8 +454,8 @@ impl Db {
         self.conn
             .execute(
                 "INSERT INTO volumes (name, size_bytes, class, driver, cloud_id, zone, state, node_id,
-                     error, created_by, created_at, updated_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+                     error, created_by, created_at, updated_at, iops, throughput_mibps)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
                  ON CONFLICT(name) DO UPDATE SET cloud_id = excluded.cloud_id, zone = excluded.zone,
                      state = excluded.state, node_id = excluded.node_id, error = excluded.error,
                      updated_at = excluded.updated_at",
@@ -460,7 +471,9 @@ impl Db {
                     v.error,
                     v.created_by,
                     v.created_at,
-                    v.updated_at
+                    v.updated_at,
+                    v.iops,
+                    v.throughput_mibps
                 ],
             )
             .map_err(db_err)?;
